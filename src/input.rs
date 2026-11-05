@@ -8,6 +8,8 @@ pub enum AppAction {
     Navigate(String),
     ToggleMode,
     ToggleAdBlock,
+    CycleUpscale,
+    ToggleDither,
     HistoryBack,
     HistoryForward,
     Reload,
@@ -100,6 +102,15 @@ impl InputHandler {
             return AppAction::Exit;
         }
 
+        // Alt+u and Alt+d work globally, even when focused inside the URL/search input bar
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Char('u') | KeyCode::Char('U') => return AppAction::CycleUpscale,
+                KeyCode::Char('d') | KeyCode::Char('D') => return AppAction::ToggleDither,
+                _ => {}
+            }
+        }
+
         if self.is_entering_url {
             match key.code {
                 KeyCode::Enter => {
@@ -130,7 +141,9 @@ impl InputHandler {
         } else {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => AppAction::Exit,
-                KeyCode::Char('u') | KeyCode::Char('o') | KeyCode::Char('/') => {
+                KeyCode::Char('u') | KeyCode::Char('U') => AppAction::CycleUpscale,
+                KeyCode::Char('d') | KeyCode::Char('D') => AppAction::ToggleDither,
+                KeyCode::Char('o') | KeyCode::Char('/') => {
                     self.is_entering_url = true;
                     self.url_input_buffer.clear();
                     AppAction::FocusUrlBar
@@ -145,7 +158,7 @@ impl InputHandler {
                 KeyCode::Char('0') => AppAction::ZoomReset,
                 KeyCode::Char('j') | KeyCode::Down => AppAction::Scroll(1),
                 KeyCode::Char('k') | KeyCode::Up => AppAction::Scroll(-1),
-                KeyCode::Char('d') | KeyCode::PageDown | KeyCode::Char(' ') => AppAction::PageScroll(1),
+                KeyCode::PageDown | KeyCode::Char(' ') => AppAction::PageScroll(1),
                 KeyCode::Char('b') | KeyCode::PageUp => AppAction::PageScroll(-1),
                 KeyCode::Char('g') | KeyCode::Home => AppAction::Scroll(-100000),
                 KeyCode::Char('G') | KeyCode::End => AppAction::Scroll(100000),

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use std::io::{self, Write};
+use crate::upscale::{apply_upscale_pipeline, UpscaleMode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {
@@ -48,9 +49,80 @@ impl Color {
     }
 }
 
+/// Returns true if `c` is a zero-width Unicode combining mark, Indic vowel matra / virama / nukta / anusvara,
+/// zero-width joiner, or variation selector that must attach to the previous terminal cell rather than
+/// advancing to a new column (which would otherwise render dotted circles `◌` in Indic/complex scripts).
+#[inline]
+pub fn is_combining_char(c: char) -> bool {
+    let cp = c as u32;
+    if cp < 0x0300 {
+        return false;
+    }
+    // Combining Diacritical Marks & Zero-Width Joiners / Variation Selectors
+    if matches!(
+        cp,
+        0x0300..=0x036F
+            | 0x0483..=0x0489
+            | 0x0591..=0x05BD
+            | 0x05BF
+            | 0x05C1..=0x05C2
+            | 0x05C4..=0x05C5
+            | 0x05C7
+            | 0x0610..=0x061A
+            | 0x064B..=0x065F
+            | 0x0670
+            | 0x06D6..=0x06ED
+            | 0x0E31
+            | 0x0E34..=0x0E3A
+            | 0x0E47..=0x0E4E
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x200B..=0x200F
+            | 0x20D0..=0x20FF
+            | 0xFE00..=0xFE0F
+            | 0xFE20..=0xFE2F
+            | 0xFEFF
+    ) {
+        return true;
+    }
+
+    // All 9 Unicode Indic script blocks (Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam)
+    // share an identical 128-codepoint relative layout within 0x0900..=0x0D7F.
+    if (0x0900..=0x0D7F).contains(&cp) {
+        let offset = cp & 0x7F;
+        if matches!(
+            offset,
+            0x00..=0x03 // Candrabindu, Anusvara, Visarga
+                | 0x3A..=0x3C // Nukta & vowel signs
+                | 0x3E..=0x4F // Dependent vowel matras (aa, i, ii, u, uu, r, e, ai, o, au) & Virama/Halant
+                | 0x51..=0x57 // Vedic tone & length marks
+                | 0x62..=0x63 // Vocalic L/LL vowel signs
+                | 0x70..=0x71 // Gurmukhi Tippi / Addak
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Computes the visual terminal column width of a string (ignoring zero-width combining marks).
+#[inline]
+pub fn display_width(s: &str) -> usize {
+    s.chars().filter(|&c| !is_combining_char(c)).count()
+}
+
+/// Returns true if a string contains Indic or combining characters where a terminal underline
+/// would visually cut through subscript vowel matras or viramas.
+#[inline]
+pub fn has_complex_script(s: &str) -> bool {
+    s.chars().any(|c| (c as u32) >= 0x0900 && is_combining_char(c))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub ch: char,
+    pub comb: [char; 3],
     pub fg: Color,
     pub bg: Color,
     pub bold: bool,
@@ -60,6 +132,7 @@ pub struct Cell {
 impl Cell {
     pub const EMPTY: Cell = Cell {
         ch: ' ',
+        comb: ['\0'; 3],
         fg: Color::WHITE,
         bg: Color::BLACK,
         bold: false,
@@ -68,6 +141,7 @@ impl Cell {
 
     pub const INVALID: Cell = Cell {
         ch: '\0',
+        comb: ['\0'; 3],
         fg: Color::BLACK,
         bg: Color::BLACK,
         bold: false,
@@ -77,10 +151,21 @@ impl Cell {
     pub fn new(ch: char, fg: Color, bg: Color) -> Self {
         Self {
             ch,
+            comb: ['\0'; 3],
             fg,
             bg,
             bold: false,
             underline: false,
+        }
+    }
+
+    #[inline(always)]
+    pub fn push_combining(&mut self, c: char) {
+        for slot in &mut self.comb {
+            if *slot == '\0' {
+                *slot = c;
+                break;
+            }
         }
     }
 }
@@ -297,6 +382,8 @@ pub struct DiffRenderer {
     pub width: u16,
     pub height: u16,
     pub protocol: GraphicsProtocol,
+    pub upscale_mode: UpscaleMode,
+    pub dithering_enabled: bool,
     current: Vec<Cell>,
     previous: Vec<Cell>,
     write_buf: Vec<u8>,
@@ -309,6 +396,8 @@ impl DiffRenderer {
             width,
             height,
             protocol: GraphicsProtocol::auto_detect(),
+            upscale_mode: UpscaleMode::FsrOnly,
+            dithering_enabled: true,
             current: vec![Cell::EMPTY; size],
             previous: vec![Cell::INVALID; size],
             write_buf: Vec::with_capacity(65536),
@@ -331,6 +420,7 @@ impl DiffRenderer {
     pub fn clear(&mut self, bg: Color) {
         let empty = Cell {
             ch: ' ',
+            comb: ['\0'; 3],
             fg: Color::WHITE,
             bg,
             bold: false,
@@ -348,72 +438,126 @@ impl DiffRenderer {
     }
 
     pub fn put_str(&mut self, x: u16, y: u16, s: &str, fg: Color, bg: Color, bold: bool, underline: bool) {
+        if y >= self.height {
+            return;
+        }
         let mut curr_x = x;
+        let mut last_idx: Option<usize> = None;
+
         for ch in s.chars() {
+            if is_combining_char(ch) {
+                if let Some(prev_idx) = last_idx {
+                    self.current[prev_idx].push_combining(ch);
+                }
+                continue;
+            }
             if curr_x >= self.width {
                 break;
             }
-            self.set_cell(
-                curr_x,
-                y,
-                Cell {
-                    ch,
-                    fg,
-                    bg,
-                    bold,
-                    underline,
-                },
-            );
+            let idx = (y as usize) * (self.width as usize) + (curr_x as usize);
+            self.current[idx] = Cell {
+                ch,
+                comb: ['\0'; 3],
+                fg,
+                bg,
+                bold,
+                underline,
+            };
+            last_idx = Some(idx);
             curr_x += 1;
         }
     }
 
-    /// Prints a string directly over existing ANSI cells while eliminating blurry background text bleed
-    /// and enforcing minimum luminance contrast so overlaid terminal characters are always razor-sharp.
+    /// Prints a string directly over existing ANSI cells with uniform background resolution,
+    /// full Unicode combining-character attachment, and guaranteed foreground/background contrast.
+    #[allow(clippy::too_many_arguments)]
     pub fn put_str_with_existing_bg(
         &mut self,
         x: u16,
         y: u16,
         s: &str,
         fg: Color,
-        fallback_bg: Color,
+        explicit_bg: Option<Color>,
         bold: bool,
         underline: bool,
     ) {
-        let mut curr_x = x;
-        for ch in s.chars() {
-            if curr_x >= self.width || y >= self.height {
-                break;
-            }
-            let idx = (y as usize) * (self.width as usize) + (curr_x as usize);
-            if idx < self.current.len() {
-                let cell = &self.current[idx];
-                let clean_bg = if cell.ch == '▀' {
+        if y >= self.height || x >= self.width {
+            return;
+        }
+
+        // Resolve a single uniform background color for the span if CSS didn't specify one,
+        // avoiding patchy per-letter background cells.
+        let uniform_bg = explicit_bg.unwrap_or_else(|| {
+            let sample_idx = (y as usize) * (self.width as usize) + (x as usize);
+            if let Some(cell) = self.current.get(sample_idx) {
+                if cell.ch == '▀' {
                     let lum_fg = cell.fg.luma_fast();
                     let lum_bg = cell.bg.luma_fast();
-                    let text_lum = fg.luma_fast();
-                    if text_lum < 128 {
+                    if fg.luma_fast() < 128 {
                         if lum_fg >= lum_bg { cell.fg } else { cell.bg }
                     } else if lum_fg <= lum_bg {
                         cell.fg
                     } else {
                         cell.bg
                     }
+                } else {
+                    cell.bg
+                }
+            } else {
+                Color::WHITE
+            }
+        });
+
+        let mut curr_x = x;
+        let mut last_idx: Option<usize> = None;
+
+        for ch in s.chars() {
+            if is_combining_char(ch) {
+                if let Some(prev_idx) = last_idx {
+                    self.current[prev_idx].push_combining(ch);
+                }
+                continue;
+            }
+            if curr_x >= self.width {
+                break;
+            }
+            let idx = (y as usize) * (self.width as usize) + (curr_x as usize);
+            if idx < self.current.len() {
+                let cell = &self.current[idx];
+                let clean_bg = if explicit_bg.is_some() {
+                    uniform_bg
+                } else if cell.ch == '▀' {
+                    let lum_fg = cell.fg.luma_fast();
+                    let lum_bg = cell.bg.luma_fast();
+                    let best = if fg.luma_fast() < 128 {
+                        if lum_fg >= lum_bg { cell.fg } else { cell.bg }
+                    } else if lum_fg <= lum_bg {
+                        cell.fg
+                    } else {
+                        cell.bg
+                    };
+                    // Snap near-white background noise to crisp uniform background
+                    if best.luma_fast() > 220 && uniform_bg.luma_fast() > 220 {
+                        uniform_bg
+                    } else {
+                        best
+                    }
+                } else if cell.bg.luma_fast() > 220 && uniform_bg.luma_fast() > 220 {
+                    uniform_bg
                 } else if cell.bg != Color::BLACK || cell.ch == ' ' {
                     cell.bg
                 } else {
-                    fallback_bg
+                    uniform_bg
                 };
 
-                // Guarantee readability if background and foreground have insufficient contrast
                 let bg_lum = clean_bg.luma_fast();
                 let fg_lum = fg.luma_fast();
                 let contrast = bg_lum.abs_diff(fg_lum);
-                let effective_fg = if contrast < 65 {
+                let effective_fg = if contrast < 70 {
                     if bg_lum > 128 {
                         Color::new(18, 20, 26)
                     } else {
-                        Color::new(245, 247, 250)
+                        Color::new(248, 250, 252)
                     }
                 } else {
                     fg
@@ -421,11 +565,13 @@ impl DiffRenderer {
 
                 self.current[idx] = Cell {
                     ch,
+                    comb: ['\0'; 3],
                     fg: effective_fg,
                     bg: clean_bg,
                     bold,
                     underline,
                 };
+                last_idx = Some(idx);
             }
             curr_x += 1;
         }
@@ -446,6 +592,9 @@ impl DiffRenderer {
         }
     }
 
+    /// Center-weighted subpixel sampler with subtle UI border preservation.
+    /// Avoids the 7x7 morphological dilation artifact that turned text & icons into fat dark blocks,
+    /// while preserving faint 1px search-bar borders (#dfe1e5) and crisp icon silhouettes.
     #[inline(always)]
     fn sample_subpixel_box(
         px_buf: &PixelBuffer,
@@ -459,85 +608,246 @@ impl DiffRenderer {
         let w = x1 - x0;
         let h = y1 - y0;
 
-        if w <= 1 && h <= 1 {
-            return px_buf.get_pixel(x0.min(px_buf.width - 1), y0.min(px_buf.height - 1));
-        }
+        let cx = (x0 + w / 2).min(px_buf.width - 1);
+        let cy = (y0 + h / 2).min(px_buf.height - 1);
+        let center = px_buf.get_pixel(cx, cy);
+
         if w <= 2 && h <= 2 {
-            let cx = x0 + w / 2;
-            let cy = y0 + h / 2;
-            return px_buf.get_pixel(cx.min(px_buf.width - 1), cy.min(px_buf.height - 1));
+            return center;
         }
 
-        let cx = x0 + w / 2;
-        let cy = y0 + h / 2;
-        let center = px_buf.get_pixel(cx.min(px_buf.width - 1), cy.min(px_buf.height - 1));
+        // Sample a tight 3x3 cross/grid around the subpixel center so adjacent cells don't bleed/dilate
+        let x_left = (x0 + w / 4).min(px_buf.width - 1);
+        let x_right = (x0 + (w * 3) / 4).min(px_buf.width - 1);
+        let y_top = (y0 + h / 4).min(px_buf.height - 1);
+        let y_bot = (y0 + (h * 3) / 4).min(px_buf.height - 1);
 
-        let step_x = ((w + 3) / 4).max(1);
-        let step_y = ((h + 3) / 4).max(1);
+        let c_tl = px_buf.get_pixel(x_left, y_top);
+        let c_tr = px_buf.get_pixel(x_right, y_top);
+        let c_bl = px_buf.get_pixel(x_left, y_bot);
+        let c_br = px_buf.get_pixel(x_right, y_bot);
 
-        let mut min_lum = 255u32;
-        let mut min_color = center;
-        let mut max_lum = 0u32;
-        let mut max_color = center;
-        let mut sum_r = 0u32;
-        let mut sum_g = 0u32;
-        let mut sum_b = 0u32;
-        let mut count = 0u32;
+        // Center-weighted blend (center weight = 4, 4 inner-quadrant samples = 1 each, total = 8)
+        let avg_r = ((center.r as u32 * 4 + c_tl.r as u32 + c_tr.r as u32 + c_bl.r as u32 + c_br.r as u32) >> 3) as u8;
+        let avg_g = ((center.g as u32 * 4 + c_tl.g as u32 + c_tr.g as u32 + c_bl.g as u32 + c_br.g as u32) >> 3) as u8;
+        let avg_b = ((center.b as u32 * 4 + c_tl.b as u32 + c_tr.b as u32 + c_bl.b as u32 + c_br.b as u32) >> 3) as u8;
+        let blended = Color::new(avg_r, avg_g, avg_b);
+        let avg_lum = blended.luma_fast();
 
+        // Check for thin 1px UI borders (such as Google's #dfe1e5 search box outline) passing through the box
+        let mut min_lum = avg_lum;
+        let mut min_c = blended;
         let mut sy = y0;
+        let step_y = ((h + 2) / 3).max(1);
+        let step_x = ((w + 2) / 3).max(1);
         while sy < y1 {
             let mut sx = x0;
             while sx < x1 {
-                let c = px_buf.get_pixel(sx.min(px_buf.width - 1), sy.min(px_buf.height - 1));
-                let lum = c.luma_fast();
-                if lum < min_lum {
-                    min_lum = lum;
-                    min_color = c;
+                let p = px_buf.get_pixel(sx, sy);
+                let l = p.luma_fast();
+                if l < min_lum {
+                    min_lum = l;
+                    min_c = p;
                 }
-                if lum > max_lum {
-                    max_lum = lum;
-                    max_color = c;
-                }
-                sum_r += c.r as u32;
-                sum_g += c.g as u32;
-                sum_b += c.b as u32;
-                count += 1;
                 sx += step_x;
             }
             sy += step_y;
         }
 
-        if count == 0 {
-            return center;
+        let diff = avg_lum.saturating_sub(min_lum);
+        if avg_lum > 225 && (10..=45).contains(&diff) {
+            // Subtle light-gray UI border on white canvas (e.g. search bar pill border):
+            // gently accentuate so the border remains visible in terminal half-blocks.
+            return Color::new(
+                min_c.r.saturating_sub(14),
+                min_c.g.saturating_sub(14),
+                min_c.b.saturating_sub(12),
+            );
         }
 
-        let avg_r = (sum_r / count) as u8;
-        let avg_g = (sum_g / count) as u8;
-        let avg_b = (sum_b / count) as u8;
-        let avg_lum = (sum_r * 77 + sum_g * 150 + sum_b * 29) >> 8;
-        let avg_lum = avg_lum / count;
+        blended
+    }
+}
 
-        let dark_contrast = avg_lum.saturating_sub(min_lum);
-        let light_contrast = max_lum.saturating_sub(avg_lum);
+/// Standard 4x4 Ordered Bayer threshold matrix (0..15) for deterministic TrueColor half-block dithering.
+pub const BAYER_4X4: [[i16; 4]; 4] = [
+    [ 0,  8,  2, 10],
+    [12,  4, 14,  6],
+    [ 3, 11,  1,  9],
+    [15,  7, 13,  5],
+];
 
-        if dark_contrast >= 35 && dark_contrast >= light_contrast {
-            Color::new(
-                ((min_color.r as u32 * 3 + avg_r as u32 * 2) / 5) as u8,
-                ((min_color.g as u32 * 3 + avg_g as u32 * 2) / 5) as u8,
-                ((min_color.b as u32 * 3 + avg_b as u32 * 2) / 5) as u8,
-            )
-        } else if light_contrast >= 35 {
-            Color::new(
-                ((max_color.r as u32 * 3 + avg_r as u32 * 2) / 5) as u8,
-                ((max_color.g as u32 * 3 + avg_g as u32 * 2) / 5) as u8,
-                ((max_color.b as u32 * 3 + avg_b as u32 * 2) / 5) as u8,
-            )
-        } else {
-            Color::new(avg_r, avg_g, avg_b)
+/// Applies a subtle `[-3..+4]` integer offset based on `BAYER_4X4[y & 3][x & 3]` clamped to `0..=255`.
+/// Preserves pure black `(0,0,0)` and pure white `(255,255,255)` so flat UI backgrounds remain run-length batchable,
+/// and is 100% deterministic per `(x, y)` so static frames never flicker with dirty-cell diffing.
+#[inline(always)]
+pub fn dither_truecolor_cell(c: Color, x: usize, y: usize) -> Color {
+    if (c.r == 255 && c.g == 255 && c.b == 255) || (c.r == 0 && c.g == 0 && c.b == 0) {
+        return c;
+    }
+    let offset = (BAYER_4X4[y & 3][x & 3] >> 1) - 3;
+    Color {
+        r: (c.r as i16 + offset).clamp(0, 255) as u8,
+        g: (c.g as i16 + offset).clamp(0, 255) as u8,
+        b: (c.b as i16 + offset).clamp(0, 255) as u8,
+    }
+}
+
+/// 16-color Sixel palette in Sixel percentage coordinates (0..=100).
+pub const SIXEL_PALETTE_PCT: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (100, 100, 100),
+    (100, 0, 0),
+    (0, 100, 0),
+    (0, 0, 100),
+    (100, 100, 0),
+    (0, 100, 100),
+    (100, 0, 100),
+    (50, 50, 50),
+    (80, 80, 80),
+    (100, 40, 0),
+    (96, 96, 93),
+    (20, 20, 20),
+    (40, 70, 100),
+    (100, 60, 60),
+    (60, 100, 60),
+];
+
+/// 16-color Sixel palette scaled to 8-bit RGB (0..=255) for integer error diffusion.
+pub const SIXEL_PALETTE_RGB: [(i16, i16, i16); 16] = [
+    (0, 0, 0),
+    (255, 255, 255),
+    (255, 0, 0),
+    (0, 255, 0),
+    (0, 0, 255),
+    (255, 255, 0),
+    (0, 255, 255),
+    (255, 0, 255),
+    (128, 128, 128),
+    (204, 204, 204),
+    (255, 102, 0),
+    (245, 245, 237),
+    (51, 51, 51),
+    (102, 179, 255),
+    (255, 153, 153),
+    (153, 255, 153),
+];
+
+#[inline(always)]
+fn nearest_sixel_palette_index(r: i16, g: i16, b: i16) -> u8 {
+    let mut best_idx = 0u8;
+    let mut best_dist = i32::MAX;
+    let mut idx = 0usize;
+    while idx < 16 {
+        let (pr, pg, pb) = SIXEL_PALETTE_RGB[idx];
+        let dr = (r - pr) as i32;
+        let dg = (g - pg) as i32;
+        let db = (b - pb) as i32;
+        // Perceptually weighted integer squared distance (2*dR^2 + 4*dG^2 + 3*dB^2)
+        let dist = (dr * dr) * 2 + (dg * dg) * 4 + (db * db) * 3;
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = idx as u8;
+            if dist == 0 {
+                break;
+            }
+        }
+        idx += 1;
+    }
+    best_idx
+}
+
+/// Runs an in-place serpentine Floyd-Steinberg error-diffusion pass across a `PixelBuffer`
+/// and maps every pixel to its 16-color Sixel palette index (`0..16`).
+/// Uses integer bit-shift weights (`* 7 >> 4`, `* 3 >> 4`, `* 5 >> 4`, `* 1 >> 4`)
+/// with error clamping (`-32..=32`) to prevent color bleeding across sharp UI edges.
+pub fn quantize_sixel_floyd_steinberg(px_buf: &PixelBuffer) -> Vec<u8> {
+    let width = px_buf.width;
+    let height = px_buf.height;
+    let len = width * height;
+    if len == 0 {
+        return Vec::new();
+    }
+
+    let mut work_r = vec![0i16; len];
+    let mut work_g = vec![0i16; len];
+    let mut work_b = vec![0i16; len];
+    for i in 0..len {
+        let c = px_buf.data[i];
+        work_r[i] = c.r as i16;
+        work_g[i] = c.g as i16;
+        work_b[i] = c.b as i16;
+    }
+
+    let mut indices = vec![0u8; len];
+
+    for y in 0..height {
+        let row_off = y * width;
+        let serpentine_rev = (y & 1) == 1;
+
+        for step in 0..width {
+            let x = if serpentine_rev { width - 1 - step } else { step };
+            let idx = row_off + x;
+
+            let old_r = work_r[idx].clamp(0, 255);
+            let old_g = work_g[idx].clamp(0, 255);
+            let old_b = work_b[idx].clamp(0, 255);
+
+            let pal_idx = nearest_sixel_palette_index(old_r, old_g, old_b);
+            indices[idx] = pal_idx;
+
+            let (pr, pg, pb) = SIXEL_PALETTE_RGB[pal_idx as usize];
+            let err_r = (old_r - pr).clamp(-32, 32);
+            let err_g = (old_g - pg).clamp(-32, 32);
+            let err_b = (old_b - pb).clamp(-32, 32);
+
+            // Forward neighbor on current row: * 7 >> 4
+            let has_fwd = if serpentine_rev { x > 0 } else { x + 1 < width };
+            if has_fwd {
+                let fwd_x = if serpentine_rev { x - 1 } else { x + 1 };
+                let n_idx = row_off + fwd_x;
+                work_r[n_idx] += (err_r * 7) >> 4;
+                work_g[n_idx] += (err_g * 7) >> 4;
+                work_b[n_idx] += (err_b * 7) >> 4;
+            }
+
+            // Next row neighbors: bottom-behind (* 3 >> 4), bottom (* 5 >> 4), bottom-forward (* 1 >> 4)
+            if y + 1 < height {
+                let next_row_off = (y + 1) * width;
+
+                let has_bwd = if serpentine_rev { x + 1 < width } else { x > 0 };
+                if has_bwd {
+                    let bwd_x = if serpentine_rev { x + 1 } else { x - 1 };
+                    let n_idx = next_row_off + bwd_x;
+                    work_r[n_idx] += (err_r * 3) >> 4;
+                    work_g[n_idx] += (err_g * 3) >> 4;
+                    work_b[n_idx] += (err_b * 3) >> 4;
+                }
+
+                {
+                    let n_idx = next_row_off + x;
+                    work_r[n_idx] += (err_r * 5) >> 4;
+                    work_g[n_idx] += (err_g * 5) >> 4;
+                    work_b[n_idx] += (err_b * 5) >> 4;
+                }
+
+                if has_fwd {
+                    let fwd_x = if serpentine_rev { x - 1 } else { x + 1 };
+                    let n_idx = next_row_off + fwd_x;
+                    work_r[n_idx] += (err_r * 1) >> 4;
+                    work_g[n_idx] += (err_g * 1) >> 4;
+                    work_b[n_idx] += (err_b * 1) >> 4;
+                }
+            }
         }
     }
 
-    /// Renders a PixelBuffer into the terminal using Unicode half-blocks '▀' (upper half = fg, lower half = bg).
+    indices
+}
+
+impl DiffRenderer {
+    /// Renders a PixelBuffer into the terminal using Unicode half-blocks '▀' (upper half = fg, lower half = bg)
+    /// with the active `UpscaleMode` super-resolution pipeline and optional 4x4 Ordered Bayer dithering.
     pub fn blit_pixel_buffer(&mut self, px_buf: &PixelBuffer, start_y: u16, max_y: u16) {
         let cols = self.width as usize;
         let rows = (max_y.saturating_sub(start_y)) as usize;
@@ -548,26 +858,50 @@ impl DiffRenderer {
             return;
         }
 
+        let upscaled_storage;
+        let active_buf = if self.upscale_mode == UpscaleMode::Off {
+            px_buf
+        } else {
+            let sr_w = (target_w * 2).max(px_buf.width);
+            let sr_h = (target_h * 2).max(px_buf.height);
+            upscaled_storage = apply_upscale_pipeline(px_buf, self.upscale_mode, sr_w, sr_h);
+            &upscaled_storage
+        };
+
+        let dither = self.dithering_enabled;
+
         for row in 0..rows {
             let term_y = start_y + (row as u16);
             if term_y >= self.height {
                 break;
             }
-            let top_y0 = (row * 2 * px_buf.height) / target_h;
-            let top_y1 = ((row * 2 + 1) * px_buf.height) / target_h;
+            let sub_y_top = row * 2;
+            let sub_y_bot = row * 2 + 1;
+            let top_y0 = (sub_y_top * active_buf.height) / target_h;
+            let top_y1 = (sub_y_bot * active_buf.height) / target_h;
             let bot_y0 = top_y1;
-            let bot_y1 = ((row * 2 + 2) * px_buf.height) / target_h;
+            let bot_y1 = ((row * 2 + 2) * active_buf.height) / target_h;
 
             for col in 0..cols {
-                let x0 = (col * px_buf.width) / target_w;
-                let x1 = ((col + 1) * px_buf.width) / target_w;
+                let x0 = (col * active_buf.width) / target_w;
+                let x1 = ((col + 1) * active_buf.width) / target_w;
 
-                let top_color = Self::sample_subpixel_box(px_buf, x0, x1, top_y0, top_y1);
-                let bot_color = Self::sample_subpixel_box(px_buf, x0, x1, bot_y0, bot_y1);
+                let raw_top = Self::sample_subpixel_box(active_buf, x0, x1, top_y0, top_y1);
+                let raw_bot = Self::sample_subpixel_box(active_buf, x0, x1, bot_y0, bot_y1);
+
+                let (top_color, bot_color) = if dither {
+                    (
+                        dither_truecolor_cell(raw_top, col, sub_y_top),
+                        dither_truecolor_cell(raw_bot, col, sub_y_bot),
+                    )
+                } else {
+                    (raw_top, raw_bot)
+                };
 
                 let cell = if top_color == bot_color {
                     Cell {
                         ch: ' ',
+                        comb: ['\0'; 3],
                         fg: Color::WHITE,
                         bg: top_color,
                         bold: false,
@@ -576,6 +910,7 @@ impl DiffRenderer {
                 } else {
                     Cell {
                         ch: '▀',
+                        comb: ['\0'; 3],
                         fg: top_color,
                         bg: bot_color,
                         bold: false,
@@ -593,8 +928,21 @@ impl DiffRenderer {
             return;
         }
 
-        let mut rgba = Vec::with_capacity(px_buf.width * px_buf.height * 4);
-        for c in &px_buf.data {
+        let upscaled_storage;
+        let active_buf = if self.upscale_mode == UpscaleMode::Off {
+            px_buf
+        } else {
+            upscaled_storage = apply_upscale_pipeline(
+                px_buf,
+                self.upscale_mode,
+                px_buf.width * 2,
+                px_buf.height * 2,
+            );
+            &upscaled_storage
+        };
+
+        let mut rgba = Vec::with_capacity(active_buf.width * active_buf.height * 4);
+        for c in &active_buf.data {
             rgba.push(c.r);
             rgba.push(c.g);
             rgba.push(c.b);
@@ -626,9 +974,9 @@ impl DiffRenderer {
 
             if first {
                 out.extend_from_slice(b"\x1b_Ga=T,f=32,s=");
-                push_u16(&mut out, px_buf.width as u16);
+                push_u16(&mut out, active_buf.width as u16);
                 out.extend_from_slice(b",v=");
-                push_u16(&mut out, px_buf.height as u16);
+                push_u16(&mut out, active_buf.height as u16);
                 out.extend_from_slice(b",c=");
                 push_u16(&mut out, cols);
                 out.extend_from_slice(b",r=");
@@ -653,82 +1001,60 @@ impl DiffRenderer {
         let _ = write_stdout_bytes(&out);
     }
 
-    /// Sixel Graphics Protocol generator (6-pixel vertical sliver encoding)
+    /// Sixel Graphics Protocol generator (6-pixel vertical sliver encoding with Serpentine Floyd-Steinberg dithering)
     pub fn blit_sixel(&mut self, px_buf: &PixelBuffer, start_y: u16, _max_y: u16) {
         if px_buf.width == 0 || px_buf.height == 0 {
             return;
         }
 
-        let mut out = Vec::with_capacity(px_buf.width * px_buf.height + 1024);
+        let upscaled_storage;
+        let active_buf = if self.upscale_mode == UpscaleMode::Off {
+            px_buf
+        } else {
+            upscaled_storage = apply_upscale_pipeline(
+                px_buf,
+                self.upscale_mode,
+                px_buf.width * 2,
+                px_buf.height * 2,
+            );
+            &upscaled_storage
+        };
+
+        let mut out = Vec::with_capacity(active_buf.width * active_buf.height + 1024);
 
         out.extend_from_slice(b"\x1b[");
         push_u16(&mut out, start_y + 1);
         out.extend_from_slice(b";1H");
 
         out.extend_from_slice(b"\x1bPq\"1;1;");
-        push_u16(&mut out, px_buf.width as u16);
+        push_u16(&mut out, active_buf.width as u16);
         out.push(b';');
-        push_u16(&mut out, px_buf.height as u16);
+        push_u16(&mut out, active_buf.height as u16);
 
-        let colors = [
-            (0, 0, 0),
-            (100, 100, 100),
-            (100, 0, 0),
-            (0, 100, 0),
-            (0, 0, 100),
-            (100, 100, 0),
-            (0, 100, 100),
-            (100, 0, 100),
-            (50, 50, 50),
-            (80, 80, 80),
-            (100, 40, 0),
-            (96, 96, 93),
-            (20, 20, 20),
-            (40, 70, 100),
-            (100, 60, 60),
-            (60, 100, 60),
-        ];
-
-        for (idx, (r, g, b)) in colors.iter().enumerate() {
+        for (idx, (r, g, b)) in SIXEL_PALETTE_PCT.iter().enumerate() {
             out.push(b'#');
             push_u8(&mut out, idx as u8);
             out.extend_from_slice(b";2;");
-            push_u8(&mut out, *r as u8);
+            push_u8(&mut out, *r);
             out.push(b';');
-            push_u8(&mut out, *g as u8);
+            push_u8(&mut out, *g);
             out.push(b';');
-            push_u8(&mut out, *b as u8);
+            push_u8(&mut out, *b);
         }
 
-        let map_color_to_idx = |c: Color| -> u8 {
-            if c.r > 240 && c.g > 80 && c.g < 140 && c.b < 40 {
-                return 10;
-            }
-            if c.r > 230 && c.g > 230 && c.b > 220 {
-                return 11;
-            }
-            let luma = c.luma_fast();
-            if luma < 30 {
-                0
-            } else if luma > 225 {
-                1
-            } else if c.r > 180 && c.g < 100 && c.b < 100 {
-                2
-            } else if c.g > 160 && c.r < 100 {
-                3
-            } else if c.b > 180 && c.r < 100 {
-                4
-            } else if c.r > 180 && c.g > 180 && c.b < 100 {
-                5
-            } else if c.g > 160 && c.b > 160 {
-                6
-            } else {
-                8
-            }
+        // Run serpentine Floyd-Steinberg error-diffusion pass (or direct nearest quantization if dithering is disabled)
+        let quantized_indices = if self.dithering_enabled {
+            quantize_sixel_floyd_steinberg(active_buf)
+        } else {
+            active_buf
+                .data
+                .iter()
+                .map(|c| nearest_sixel_palette_index(c.r as i16, c.g as i16, c.b as i16))
+                .collect()
         };
 
-        let width = px_buf.width;
-        let height = px_buf.height;
+        let width = active_buf.width;
+        let height = active_buf.height;
         let bands = (height + 5) / 6;
 
         for band in 0..bands {
@@ -742,8 +1068,7 @@ impl DiffRenderer {
                     for bit in 0..6 {
                         let y = start_py + bit;
                         if y < height {
-                            let c = px_buf.get_pixel(x, y);
-                            if map_color_to_idx(c) == col_idx {
+                            if quantized_indices[y * width + x] == col_idx {
                                 mask |= 1 << bit;
                             }
                         }
@@ -865,6 +1190,13 @@ impl DiffRenderer {
                     let mut char_buf = [0u8; 4];
                     let s = c.ch.encode_utf8(&mut char_buf);
                     self.write_buf.extend_from_slice(s.as_bytes());
+                    for &comb_ch in &c.comb {
+                        if comb_ch == '\0' {
+                            break;
+                        }
+                        let cs = comb_ch.encode_utf8(&mut char_buf);
+                        self.write_buf.extend_from_slice(cs.as_bytes());
+                    }
 
                     self.previous[r_idx] = c;
                     x += 1;
@@ -902,11 +1234,19 @@ mod tests {
     }
 
     #[test]
-    fn test_pixel_buffer_scaling() {
-        let mut buf = PixelBuffer::new(100, 100, Color::RED);
-        buf.set_pixel(0, 0, Color::BLUE);
-        assert_eq!(buf.get_pixel(0, 0), Color::BLUE);
-        assert_eq!(buf.get_pixel(1, 1), Color::RED);
+    fn test_indic_combining_clustering() {
+        let mut renderer = DiffRenderer::new(15, 3);
+        // "हिन्दी" has 6 Unicode chars: 'ह', 'ि' (combining), 'न', '्' (combining), 'द', 'ी' (combining)
+        // It should occupy exactly 3 terminal cells, NOT 6!
+        assert_eq!(display_width("हिन्दी"), 3);
+        renderer.put_str(0, 0, "हिन्दी", Color::BLACK, Color::WHITE, false, false);
+        assert_eq!(renderer.current[0].ch, 'ह');
+        assert_eq!(renderer.current[0].comb[0], 'ि');
+        assert_eq!(renderer.current[1].ch, 'न');
+        assert_eq!(renderer.current[1].comb[0], '्');
+        assert_eq!(renderer.current[2].ch, 'द');
+        assert_eq!(renderer.current[2].comb[0], 'ी');
+        assert_eq!(renderer.current[3].ch, ' ');
     }
 
     #[test]
@@ -914,18 +1254,48 @@ mod tests {
         let mut renderer = DiffRenderer::new(10, 5);
         renderer.set_cell(0, 0, Cell {
             ch: '▀',
+            comb: ['\0'; 3],
             fg: Color::BLACK,
             bg: Color::WHITE,
             bold: false,
             underline: false,
         });
 
-        renderer.put_str_with_existing_bg(0, 0, "A", Color::BLACK, Color::LIGHT_GRAY, true, false);
+        renderer.put_str_with_existing_bg(0, 0, "A", Color::BLACK, None, true, false);
 
         let cell = renderer.current[0];
         assert_eq!(cell.ch, 'A');
         assert_eq!(cell.fg, Color::BLACK);
         assert_eq!(cell.bg, Color::WHITE);
         assert!(cell.bold);
+    }
+
+    #[test]
+    fn test_bayer_dither_truecolor_cell() {
+        let mid = Color::new(128, 128, 128);
+        let d0 = dither_truecolor_cell(mid, 0, 0); // BAYER_4X4[0][0] = 0 -> offset -3
+        let d1 = dither_truecolor_cell(mid, 1, 3); // BAYER_4X4[3][1] = 7 -> offset 0
+        let d2 = dither_truecolor_cell(mid, 0, 3); // BAYER_4X4[3][0] = 15 -> offset +4
+        assert_eq!(d0, Color::new(125, 125, 125));
+        assert_eq!(d1, Color::new(128, 128, 128));
+        assert_eq!(d2, Color::new(132, 132, 132));
+
+        // Pure black and white remain untouched for clean run-length batching
+        assert_eq!(dither_truecolor_cell(Color::WHITE, 2, 1), Color::WHITE);
+        assert_eq!(dither_truecolor_cell(Color::BLACK, 3, 2), Color::BLACK);
+    }
+
+    #[test]
+    fn test_sixel_serpentine_floyd_steinberg() {
+        let mut buf = PixelBuffer::new(8, 6);
+        for y in 0..6 {
+            for x in 0..8 {
+                let v = ((x * 28 + y * 10) as u8).min(255);
+                buf.set_pixel(x, y, Color::new(v, v, v));
+            }
+        }
+        let indices = quantize_sixel_floyd_steinberg(&buf);
+        assert_eq!(indices.len(), 48);
+        assert!(indices.iter().all(|&idx| idx < 16));
     }
 }

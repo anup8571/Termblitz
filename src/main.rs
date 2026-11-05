@@ -1,6 +1,7 @@
-mod renderer;
-mod engine;
-mod input;
+pub mod renderer;
+pub mod engine;
+pub mod input;
+pub mod upscale;
 
 use std::env;
 use std::fs;
@@ -16,7 +17,8 @@ use crossterm::{
 
 use engine::{CdpEngine, NativeEngine, RenderMode};
 use input::{resolve_input_to_url, AppAction, InputHandler};
-use renderer::{Color, DiffRenderer, GraphicsProtocol};
+use renderer::{display_width, has_complex_script, is_combining_char, Color, DiffRenderer, GraphicsProtocol};
+use upscale::UpscaleMode;
 
 struct TerminalGuard;
 
@@ -41,12 +43,54 @@ fn get_memory_mb() -> f32 {
     0.0
 }
 
+/// Truncates a string to at most `max_cols` terminal display columns while preserving
+/// any zero-width Unicode combining marks attached to the included base characters.
+fn truncate_by_display_width(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    let mut out = String::with_capacity(s.len().min(max_cols * 4));
+    let mut cols = 0usize;
+    for ch in s.chars() {
+        if is_combining_char(ch) {
+            if cols > 0 {
+                out.push(ch);
+            }
+            continue;
+        }
+        if cols >= max_cols {
+            break;
+        }
+        out.push(ch);
+        cols += 1;
+    }
+    out
+}
+
+/// Strips `https://`, `http://`, and leading `www.` for clean display in narrow mobile status bars.
+fn format_clean_url(url: &str) -> String {
+    let u = url.trim();
+    let without_scheme = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"))
+        .unwrap_or(u);
+    let without_www = without_scheme
+        .strip_prefix("www.")
+        .unwrap_or(without_scheme);
+    let cleaned = without_www.trim_end_matches('/');
+    if cleaned.is_empty() {
+        u.to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
 /// Word-wraps multi-line DOM text overlays within their bounding box column width (`max_width`)
-/// across up to `max_lines` rows so cards, snippets, and side-by-side columns never truncate or collide.
+/// across up to `max_lines` rows using true Unicode terminal column widths (`display_width`).
 fn wrap_overlay_text(text: &str, max_width: usize, max_lines: usize) -> Vec<String> {
     let max_w = max_width.max(1);
-    if max_lines <= 1 || text.chars().count() <= max_w {
-        return vec![text.chars().take(max_w).collect()];
+    if max_lines <= 1 || display_width(text) <= max_w {
+        return vec![truncate_by_display_width(text, max_w)];
     }
 
     let mut lines = Vec::with_capacity(max_lines.min(8));
@@ -54,14 +98,13 @@ fn wrap_overlay_text(text: &str, max_width: usize, max_lines: usize) -> Vec<Stri
     let mut current_len = 0usize;
 
     for word in text.split_whitespace() {
-        let word_len = word.chars().count();
+        let word_len = display_width(word);
         if current_len == 0 {
             if word_len <= max_w {
                 current.push_str(word);
                 current_len = word_len;
             } else {
-                let clipped: String = word.chars().take(max_w).collect();
-                lines.push(clipped);
+                lines.push(truncate_by_display_width(word, max_w));
                 if lines.len() >= max_lines {
                     return lines;
                 }
@@ -79,7 +122,7 @@ fn wrap_overlay_text(text: &str, max_width: usize, max_lines: usize) -> Vec<Stri
                 current.push_str(word);
                 current_len = word_len;
             } else {
-                current.push_str(&word.chars().take(max_w).collect::<String>());
+                current.push_str(&truncate_by_display_width(word, max_w));
                 current_len = max_w;
             }
         }
@@ -90,7 +133,7 @@ fn wrap_overlay_text(text: &str, max_width: usize, max_lines: usize) -> Vec<Stri
     }
 
     if lines.is_empty() {
-        lines.push(text.chars().take(max_w).collect());
+        lines.push(truncate_by_display_width(text, max_w));
     }
     lines
 }
@@ -115,6 +158,23 @@ fn main() -> io::Result<()> {
     let start_in_cdp = args.iter().any(|a| a == "--cdp" || a == "--hybrid");
     let start_in_raw = args.iter().any(|a| a == "--raw" || a == "--cdp-raw");
     let start_in_native = args.iter().any(|a| a == "--native");
+    let no_dither = args.iter().any(|a| a == "--no-dither" || a == "--no-dithering");
+
+    let mut initial_upscale_mode = UpscaleMode::FsrOnly;
+    let mut arg_iter = args.iter().skip(1).peekable();
+    while let Some(arg) = arg_iter.next() {
+        if let Some(val) = arg.strip_prefix("--upscale=") {
+            if let Some(parsed) = UpscaleMode::from_cli_value(val) {
+                initial_upscale_mode = parsed;
+            }
+        } else if arg == "--upscale" {
+            if let Some(next_val) = arg_iter.peek() {
+                if let Some(parsed) = UpscaleMode::from_cli_value(next_val) {
+                    initial_upscale_mode = parsed;
+                }
+            }
+        }
+    }
 
     enable_raw_mode()?;
     let mut out = stdout();
@@ -125,6 +185,8 @@ fn main() -> io::Result<()> {
 
     let (mut cols, mut rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let mut renderer = DiffRenderer::new(cols, rows);
+    renderer.upscale_mode = initial_upscale_mode;
+    renderer.dithering_enabled = !no_dither;
 
     if enable_kitty {
         renderer.protocol = GraphicsProtocol::Kitty;
@@ -135,7 +197,13 @@ fn main() -> io::Result<()> {
     }
 
     let mut native_engine = NativeEngine::new();
+    native_engine.upscale_mode = initial_upscale_mode;
+    native_engine.dithering_enabled = !no_dither;
+
     let mut cdp_engine = CdpEngine::new(9222);
+    cdp_engine.upscale_mode = initial_upscale_mode;
+    cdp_engine.dithering_enabled = !no_dither;
+
     let mut input_handler = InputHandler::new();
 
     let mut mode = if start_in_native || cdp_engine.chromium_bin.is_none() {
@@ -260,6 +328,35 @@ fn main() -> io::Result<()> {
                     } else {
                         "🛡️ Brave Ad & Tracker Shield: DISABLED".to_string()
                     },
+                    Instant::now() + Duration::from_secs(2),
+                ));
+            }
+            AppAction::CycleUpscale => {
+                let next_sr = renderer.upscale_mode.next();
+                renderer.upscale_mode = next_sr;
+                native_engine.upscale_mode = next_sr;
+                cdp_engine.upscale_mode = next_sr;
+                renderer.force_redraw();
+                status_banner = Some((
+                    format!("✨ Super-Resolution [u]: {}", next_sr.name()),
+                    Instant::now() + Duration::from_secs(2),
+                ));
+            }
+            AppAction::ToggleDither => {
+                let next_dither = !renderer.dithering_enabled;
+                renderer.dithering_enabled = next_dither;
+                native_engine.dithering_enabled = next_dither;
+                cdp_engine.dithering_enabled = next_dither;
+                renderer.force_redraw();
+                status_banner = Some((
+                    format!(
+                        "🎨 Dithering [d]: {}",
+                        if next_dither {
+                            "ON (4x4 Bayer + Serpentine Floyd-Steinberg)"
+                        } else {
+                            "OFF"
+                        }
+                    ),
                     Instant::now() + Duration::from_secs(2),
                 ));
             }
@@ -529,36 +626,43 @@ fn main() -> io::Result<()> {
                                 if term_row >= view_start_y && term_row < view_max_y && start_col < cols {
                                     let available_cols = (cols - start_col) as usize;
                                     let is_multiline = box_rows >= 2 && span.px_h >= 24;
+                                    let text_disp_w = display_width(&span.text);
                                     let wrap_w = if is_multiline {
                                         span_cols.min(available_cols).max(8)
                                     } else {
-                                        span_cols.max(span.text.chars().count()).min(available_cols)
+                                        span_cols.max(text_disp_w).min(available_cols)
                                     };
                                     let max_lines = if is_multiline { box_rows.min(6) } else { 1 };
                                     let wrapped_lines = wrap_overlay_text(&span.text, wrap_w, max_lines);
 
                                     let link_fg = if span.is_input {
-                                        Color::new(30, 80, 190)
+                                        Color::new(40, 90, 195)
                                     } else if span.is_link && span.fg.luma_fast() < 40 {
                                         Color::new(26, 86, 219)
                                     } else {
                                         span.fg
                                     };
 
-                                    let fallback_bg = span.bg.unwrap_or(Color::WHITE);
                                     for (line_offset, line_text) in wrapped_lines.iter().enumerate() {
                                         let target_y = term_row + (line_offset as u16);
                                         if target_y >= view_max_y {
                                             break;
                                         }
+                                        // Suppress underline on colored buttons (e.g. "Sign in"), inputs, and Indic scripts
+                                        // where terminal underlines slice through subscript vowel matras.
+                                        let should_underline = span.is_link
+                                            && !span.is_input
+                                            && !has_complex_script(line_text)
+                                            && span.bg.map_or(true, |b| b.luma_fast() > 215);
+
                                         renderer.put_str_with_existing_bg(
                                             start_col,
                                             target_y,
                                             line_text,
                                             link_fg,
-                                            fallback_bg,
+                                            span.bg,
                                             span.bold,
-                                            span.is_link,
+                                            should_underline,
                                         );
                                     }
                                 }
@@ -575,23 +679,33 @@ fn main() -> io::Result<()> {
             }
         }
 
-        // Top 1-line Status & Address bar
+        // Top 1-line Responsive Status & Address Bar
         let bar_bg = Color::new(28, 32, 42);
         let bar_fg = Color::WHITE;
+        let is_compact = cols < 72;
+        let zoom_pct = (cdp_engine.zoom * 100.0).round() as u32;
         let mode_badge = match mode {
-            RenderMode::Native => (" NATIVE ".to_string(), Color::BLACK, Color::GREEN),
+            RenderMode::Native => (
+                if is_compact { " NAT ".to_string() } else { " NATIVE ".to_string() },
+                Color::BLACK,
+                Color::GREEN,
+            ),
             RenderMode::CdpHybrid => {
                 if cdp_engine.get_error().is_some() {
-                    (" CDP-ERR ".to_string(), Color::WHITE, Color::RED)
+                    (" ERR ".to_string(), Color::WHITE, Color::RED)
+                } else if is_compact {
+                    (format!(" HYB {}% ", zoom_pct), Color::BLACK, Color::new(255, 180, 0))
                 } else {
-                    (format!(" HYBRID [{:.0}%] ", cdp_engine.zoom * 100.0), Color::BLACK, Color::new(255, 180, 0))
+                    (format!(" HYBRID [{}%] ", zoom_pct), Color::BLACK, Color::new(255, 180, 0))
                 }
             }
             RenderMode::CdpRaw => {
                 if cdp_engine.get_error().is_some() {
-                    (" CDP-ERR ".to_string(), Color::WHITE, Color::RED)
+                    (" ERR ".to_string(), Color::WHITE, Color::RED)
+                } else if is_compact {
+                    (format!(" RAW {}% ", zoom_pct), Color::WHITE, Color::new(140, 80, 220))
                 } else {
-                    (format!(" RAW [{:.0}%] ", cdp_engine.zoom * 100.0), Color::WHITE, Color::new(140, 80, 220))
+                    (format!(" RAW [{}%] ", zoom_pct), Color::WHITE, Color::new(140, 80, 220))
                 }
             }
         };
@@ -599,10 +713,11 @@ fn main() -> io::Result<()> {
         renderer.put_str(0, 0, &" ".repeat(cols as usize), bar_fg, bar_bg, false, false);
         renderer.put_str(0, 0, &mode_badge.0, mode_badge.1, mode_badge.2, true, false);
 
-        let addr_x = (mode_badge.0.len() + 1) as u16;
+        let addr_x = mode_badge.0.len() as u16;
         let has_active_banner = if let Some((ref msg, expiry)) = status_banner {
             if Instant::now() < expiry {
-                let banner = format!(" {} ", msg);
+                let max_banner_w = (cols.saturating_sub(addr_x)) as usize;
+                let banner = truncate_by_display_width(&format!(" {} ", msg), max_banner_w);
                 renderer.put_str(addr_x, 0, &banner, Color::YELLOW, Color::new(50, 40, 20), true, false);
                 true
             } else {
@@ -612,33 +727,81 @@ fn main() -> io::Result<()> {
             false
         };
 
-        if !has_active_banner {
-            if input_handler.is_entering_url {
-                let prompt = format!("Search / URL: {}█", input_handler.url_input_buffer);
-                renderer.put_str(addr_x, 0, &prompt, Color::CYAN, bar_bg, true, false);
+        if input_handler.is_entering_url {
+            // When typing a URL or search query, give the input field the full remaining width of row 0
+            let avail_w = (cols.saturating_sub(addr_x + 1)) as usize;
+            let prefix = if is_compact { " Go: " } else { " Search / URL: " };
+            let max_input_chars = avail_w.saturating_sub(prefix.len() + 1).max(4);
+            let input_chars: Vec<char> = input_handler.url_input_buffer.chars().collect();
+            let visible_input: String = if input_chars.len() > max_input_chars {
+                input_chars[input_chars.len() - max_input_chars..].iter().collect()
             } else {
-                let url_display = format!(" {} ", native_engine.current_url);
-                renderer.put_str(addr_x, 0, &url_display, Color::WHITE, bar_bg, false, false);
+                input_handler.url_input_buffer.clone()
+            };
+            let prompt = format!("{}{}█", prefix, visible_input);
+            renderer.put_str(addr_x, 0, &prompt, Color::CYAN, bar_bg, true, false);
+        } else {
+            let mem = get_memory_mb();
+            let scroll_pct = if mode.is_cdp() {
+                cdp_engine.get_scroll_pct()
+            } else if native_engine.max_scroll > 0 {
+                (native_engine.scroll_y * 100) / native_engine.max_scroll
+            } else {
+                100
+            };
+            let shield_tag = if cdp_engine.adblock_enabled {
+                if is_compact { "S" } else { "SHIELD" }
+            } else if is_compact {
+                "-"
+            } else {
+                "NO-AD"
+            };
+            let fps_display = if mode.is_cdp() {
+                if cdp_fps > 0.0 { format!("{:0.0}fps", cdp_fps) } else { "idle".to_string() }
+            } else {
+                format!("{:0.0}fps", fps)
+            };
+            let dither_state = if renderer.dithering_enabled { "ON" } else { "OFF" };
+            let sr_badge = format!(
+                "[SR: {} | DITHER: {}]",
+                renderer.upscale_mode.badge_name(),
+                dither_state
+            );
+            let sr_badge_compact = format!(
+                "[SR:{}|D:{}]",
+                renderer.upscale_mode.short_name(),
+                dither_state
+            );
+            let metrics = if is_compact {
+                format!(
+                    " {}|{}|{:0.0}M|{}% ",
+                    sr_badge_compact, shield_tag, mem, scroll_pct
+                )
+            } else {
+                format!(
+                    " {} | {} | {} | {:0.1}MB | {} | {}% ",
+                    sr_badge,
+                    shield_tag,
+                    renderer.protocol.short_name(),
+                    mem,
+                    fps_display,
+                    scroll_pct
+                )
+            };
+            let metrics_len = metrics.len() as u16;
+            let metrics_x = cols.saturating_sub(metrics_len);
+
+            if !has_active_banner && metrics_x > addr_x + 2 {
+                let max_url_w = (metrics_x - addr_x) as usize;
+                let clean_u = format!(" {}", format_clean_url(&native_engine.current_url));
+                let truncated_url = truncate_by_display_width(&clean_u, max_url_w.saturating_sub(1));
+                renderer.put_str(addr_x, 0, &truncated_url, Color::WHITE, bar_bg, false, false);
+            }
+
+            if !has_active_banner {
+                renderer.put_str(metrics_x, 0, &metrics, Color::LIGHT_GRAY, bar_bg, false, false);
             }
         }
-
-        let mem = get_memory_mb();
-        let scroll_pct = if mode.is_cdp() {
-            cdp_engine.get_scroll_pct()
-        } else if native_engine.max_scroll > 0 {
-            (native_engine.scroll_y * 100) / native_engine.max_scroll
-        } else {
-            100
-        };
-        let shield_tag = if cdp_engine.adblock_enabled { "SHIELD" } else { "NO-AD" };
-        let fps_display = if mode.is_cdp() {
-            if cdp_fps > 0.0 { format!("{:0.0}fps", cdp_fps) } else { "idle".to_string() }
-        } else {
-            format!("{:0.0}fps", fps)
-        };
-        let metrics = format!(" {} | {} | {:0.1}MB | {} | {}% ", shield_tag, renderer.protocol.short_name(), mem, fps_display, scroll_pct);
-        let metrics_x = cols.saturating_sub(metrics.len() as u16);
-        renderer.put_str(metrics_x, 0, &metrics, Color::LIGHT_GRAY, bar_bg, false, false);
 
         let _ = renderer.flush();
 

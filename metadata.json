@@ -1,0 +1,6 @@
+{
+  "name": "termblitz",
+  "description": "Visual web browser for Android Termux with gesture commands, integrated ad blocker, and cross-platform terminal support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

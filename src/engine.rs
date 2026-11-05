@@ -7,7 +7,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::renderer::{Color, DiffRenderer, PixelBuffer};
+use crate::renderer::{display_width, Cell, Color, DiffRenderer, PixelBuffer};
+use crate::upscale::UpscaleMode;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RenderMode {
@@ -299,6 +300,8 @@ pub struct NativeEngine {
     pub max_scroll: usize,
     pub adblock_enabled: bool,
     pub ads_blocked: usize,
+    pub upscale_mode: UpscaleMode,
+    pub dithering_enabled: bool,
 }
 
 impl NativeEngine {
@@ -314,6 +317,8 @@ impl NativeEngine {
             max_scroll: 0,
             adblock_enabled: true,
             ads_blocked: 0,
+            upscale_mode: UpscaleMode::FsrOnly,
+            dithering_enabled: true,
         }
     }
 
@@ -555,7 +560,7 @@ impl NativeEngine {
             if word.is_empty() {
                 return;
             }
-            let word_w = word.chars().count();
+            let word_w = display_width(word);
             if *line_len + word_w > max_w && *line_len > 0 {
                 let line_spans = std::mem::take(spans);
                 block.push(RenderedLine {
@@ -964,22 +969,12 @@ impl NativeEngine {
                 let row_bg = line.row_bg.unwrap_or(self.body_bg);
 
                 for x in 0..renderer.width {
-                    renderer.set_cell(
-                        x,
-                        term_y,
-                        crate::renderer::Cell {
-                            ch: ' ',
-                            fg: Color::WHITE,
-                            bg: row_bg,
-                            bold: false,
-                            underline: false,
-                        },
-                    );
+                    renderer.set_cell(x, term_y, Cell::new(' ', Color::WHITE, row_bg));
                 }
 
                 let mut term_x = if line.is_full_width_bg { 0 } else { 1 };
                 for span in &line.spans {
-                    let span_len = span.text.chars().count() as u16;
+                    let span_len = display_width(&span.text) as u16;
                     let span_bg = span.bg.unwrap_or(row_bg);
 
                     if let Some(url) = &span.link_url {
@@ -1004,17 +999,7 @@ impl NativeEngine {
                 }
             } else {
                 for x in 0..renderer.width {
-                    renderer.set_cell(
-                        x,
-                        term_y,
-                        crate::renderer::Cell {
-                            ch: ' ',
-                            fg: Color::WHITE,
-                            bg: self.body_bg,
-                            bold: false,
-                            underline: false,
-                        },
-                    );
+                    renderer.set_cell(x, term_y, Cell::new(' ', Color::WHITE, self.body_bg));
                 }
             }
         }
@@ -1326,13 +1311,22 @@ fn build_page_style_js(hide_text: bool, adblock: bool) -> String {
 fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
     *seq += 1;
     let js = "(function(){\
-        var T=String.fromCharCode(9),N=String.fromCharCode(10),r=[];\
+        var T=String.fromCharCode(9),N=String.fromCharCode(10),r=[],items=[];\
         if(!document.body)return '';\
         var vw=window.innerWidth||360,vh=window.innerHeight||640;\
         var docH=Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0,vh);\
         var maxS=Math.max(1,docH-vh);\
         var pct=Math.min(100,Math.max(0,Math.round(((window.scrollY||0)*100)/maxS)));\
         r.push('META'+T+vw+T+vh+T+pct+T+(location.href||''));\
+        function getBg(el){\
+            var bp=el;\
+            while(bp&&bp!==document.documentElement){\
+                var bc=getComputedStyle(bp).backgroundColor;\
+                if(bc&&bc!=='rgba(0, 0, 0, 0)'&&bc!=='transparent')return bc;\
+                bp=bp.parentElement;\
+            }\
+            return '';\
+        }\
         var skipTags={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,SVG:1,PATH:1,HEAD:1,META:1,TITLE:1,OBJECT:1};\
         var tw=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);\
         var n;\
@@ -1367,19 +1361,37 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             if(w<2||h<2||maxB<0||minT>vh+20||maxR<0||minL>vw+20)continue;\
             var a=p.closest('a');\
             var href=a?(a.href||''):'';\
-            r.push(txt+T+l+T+top+T+w+T+h+T+s.color+T+(s.fontWeight==='bold'||+s.fontWeight>=600?1:0)+T+(a?1:0)+T+s.backgroundColor+T+'0'+T+href);\
-            if(r.length>450)break;\
+            var bg=getBg(p);\
+            items.push({txt:txt,l:l,top:top,w:w,h:h,col:s.color,bold:(s.fontWeight==='bold'||+s.fontWeight>=600?1:0),link:(a?1:0),bg:bg,inp:0,href:href});\
+            if(items.length>450)break;\
         }\
-        var inputs=document.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio]),textarea');\
+        var inputs=document.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]),textarea,[role=searchbox],[role=combobox]');\
         for(var j=0;j<inputs.length;j++){\
             var el=inputs[j];\
             var es=getComputedStyle(el);\
             if(es.display==='none'||es.visibility==='hidden')continue;\
             var erc=el.getBoundingClientRect();\
             if(!erc||erc.width<24||erc.height<10||erc.bottom<0||erc.top>vh)continue;\
-            var val=(el.value||el.placeholder||el.getAttribute('aria-label')||el.getAttribute('title')||'Search or type...').split(T).join(' ').split(N).join(' ').trim();\
-            if(!val)val='Search or type...';\
-            r.push(val+T+(~~erc.left)+T+(~~erc.top)+T+(~~erc.width)+T+(~~erc.height)+T+es.color+T+'0'+T+'0'+T+es.backgroundColor+T+'1'+T+'');\
+            var ity=~~(erc.top+Math.max(0,(erc.height-16)/2));\
+            var matched=false;\
+            for(var k=0;k<items.length;k++){\
+                var it=items[k];\
+                if(it.l>=erc.left-6&&it.l<=erc.right&&it.top>=erc.top-6&&it.top<=erc.bottom){\
+                    it.top=ity;\
+                    it.inp=1;\
+                    if(el.value&&el.value.trim())it.txt=el.value.trim();\
+                    matched=true;\
+                }\
+            }\
+            if(!matched){\
+                var val=(el.value||el.placeholder||el.getAttribute('aria-label')||el.getAttribute('title')||'Search or type...').split(T).join(' ').split(N).join(' ').trim();\
+                if(!val)val='Search or type...';\
+                items.push({txt:val,l:~~(erc.left+8),top:ity,w:~~Math.max(16,erc.width-16),h:18,col:es.color,bold:0,link:0,bg:getBg(el),inp:1,href:''});\
+            }\
+        }\
+        for(var m=0;m<items.length;m++){\
+            var x=items[m];\
+            r.push(x.txt+T+x.l+T+x.top+T+x.w+T+x.h+T+x.col+T+x.bold+T+x.link+T+x.bg+T+x.inp+T+x.href);\
         }\
         return r.join(N);\
     })()";
@@ -1859,6 +1871,8 @@ pub struct CdpEngine {
     pub is_loading: Arc<AtomicBool>,
     pub zoom: f32,
     pub adblock_enabled: bool,
+    pub upscale_mode: UpscaleMode,
+    pub dithering_enabled: bool,
     command_tx: Option<Sender<CdpWorkerCommand>>,
     cols: u16,
     rows: u16,
@@ -1886,6 +1900,8 @@ impl CdpEngine {
             rows: 24,
             zoom: 1.0,
             adblock_enabled: true,
+            upscale_mode: UpscaleMode::FsrOnly,
+            dithering_enabled: true,
         }
     }
 
