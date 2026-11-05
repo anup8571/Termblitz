@@ -25,7 +25,50 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run Neural & Math Diagnostic Tests
-        run: cargo test --verbose
+        shell: bash
+        run: |
+          mkdir -p target
+          # Run tests and capture both console output and exit code
+          cargo test --verbose 2>&1 | tee target/test_output.txt
 
       - name: Compile Release Binary
         run: cargo build --release --verbose
+
+      - name: Generate Detailed CI Summary Report
+        if: always()
+        shell: bash
+        run: |
+          # Calculate binary size if build produced one
+          BIN_SIZE="N/A"
+          if [ -f "target/release/termblitz" ]; then
+            BIN_SIZE=$(ls -lh target/release/termblitz | awk '{print $5}')
+          elif [ -f "target/release/termblitz.exe" ]; then
+            BIN_SIZE=$(ls -lh target/release/termblitz.exe | awk '{print $5}')
+          fi
+
+          # Count test passes and failures
+          TESTS_PASSED=$(grep -c "test .* \.\.\. ok" target/test_output.txt || true)
+          TESTS_FAILED=$(grep -c "test .* \.\.\. FAILED" target/test_output.txt || true)
+
+          # Append structured report to GitHub Actions Step Summary
+          echo "## 🚀 TermBlitz Build & Diagnostic Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Target OS** | \`${{ matrix.os }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Release Binary Size** | \`$BIN_SIZE\` \vert{}" >> $GITHUB_STEP_SUMMARY
+          echo "| **Tests Passed** | ✅ \`$TESTS_PASSED\` \vert{}" >> $GITHUB_STEP_SUMMARY
+          echo "| **Tests Failed** | ❌ \`$TESTS_FAILED\` \vert{}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔬 Diagnostic Test Suite Results" >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          grep -E "test .* \.\.\. (ok|FAILED)" target/test_output.txt >> $GITHUB_STEP_SUMMARY || echo "No test output found." >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "<details><summary><b>View Full Raw Test Log</b></summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          cat target/test_output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
