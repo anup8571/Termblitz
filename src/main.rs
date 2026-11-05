@@ -25,7 +25,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut out = stdout();
-        let _ = out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b_Ga=d,d=A\x1b[0m\x1b[2J\x1b[H");
+        let _ = out.write_all(b"\x1b[?2026l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b_Ga=d,d=A\x1b[0m\x1b[2J\x1b[H");
         let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture, Show);
         let _ = disable_raw_mode();
         let _ = out.flush();
@@ -324,9 +324,21 @@ fn main() -> io::Result<()> {
                 cdp_engine.set_adblock(next_state);
                 status_banner = Some((
                     if next_state {
-                        "🛡️ Brave Ad & Tracker Shield: ENABLED".to_string()
+                        "🛡️ Brave + YouTube Ad-Shield: ENABLED".to_string()
                     } else {
-                        "🛡️ Brave Ad & Tracker Shield: DISABLED".to_string()
+                        "🛡️ Brave + YouTube Ad-Shield: DISABLED".to_string()
+                    },
+                    Instant::now() + Duration::from_secs(2),
+                ));
+            }
+            AppAction::ToggleMute => {
+                let muted = cdp_engine.toggle_mute();
+                renderer.force_redraw();
+                status_banner = Some((
+                    if muted {
+                        "🔇 Browser Audio: MUTED [Alt+m / M]".to_string()
+                    } else {
+                        "🔊 Browser Audio: UNMUTED [Alt+m / M]".to_string()
                     },
                     Instant::now() + Duration::from_secs(2),
                 ));
@@ -556,11 +568,13 @@ fn main() -> io::Result<()> {
 
         match mode {
             RenderMode::Native => {
+                renderer.video_fast_path = false;
                 native_engine.render_to(&mut renderer, view_start_y, view_max_y);
             }
             RenderMode::CdpHybrid | RenderMode::CdpRaw => {
                 let cdp_err = cdp_engine.get_error();
                 if let Some(ref err) = cdp_err {
+                    renderer.video_fast_path = false;
                     let box_w = (cols.saturating_sub(4)).min(70).max(28);
                     let start_x = (cols.saturating_sub(box_w)) / 2;
                     let start_y = (rows.saturating_sub(10)) / 2;
@@ -601,6 +615,8 @@ fn main() -> io::Result<()> {
                     let px_buf = cdp_engine.get_frame();
                     let is_loading = cdp_engine.is_loading();
                     let count = cdp_engine.get_frame_count();
+                    let video_rects = cdp_engine.get_video_rects();
+                    renderer.video_fast_path = !video_rects.is_empty();
 
                     if count == 0 || (is_loading && count < 2) {
                         let msg = " 🌐 Connecting & Loading Visual Web Page... ⏳ ";
@@ -608,16 +624,21 @@ fn main() -> io::Result<()> {
                         let msg_y = rows / 2;
                         renderer.put_str(msg_x, msg_y, msg, Color::CYAN, Color::new(28, 32, 42), true, false);
                     } else if px_buf.width > 0 && px_buf.height > 0 {
-                        // 1. Blit visual background frame (cards, buttons, logos, images)
+                        // 1. Blit visual background frame (cards, buttons, logos, images, or fast-path video)
                         renderer.blit_frame(&px_buf, view_start_y, view_max_y);
 
                         // 2. In Hybrid Mode: Overlay razor-sharp native terminal characters at 1:1 CSS viewport coordinates
+                        // while suppressing stale DOM text overlays inside any actively playing <video> bounding box.
                         if mode == RenderMode::CdpHybrid {
                             let overlays = cdp_engine.get_text_overlays();
                             let (vw, vh) = cdp_engine.get_viewport_dims();
                             let pw = vw.max(1) as f32;
                             let ph = vh.max(1) as f32;
                             let view_rows = (view_max_y.saturating_sub(view_start_y)).max(1) as f32;
+                            let video_term_boxes: Vec<(u16, u16, u16, u16)> = video_rects
+                                .iter()
+                                .map(|vr| vr.to_terminal_bounds(cols, rows, vw, vh))
+                                .collect();
 
                             for span in &overlays {
                                 let start_col = ((span.px_x.max(0) as f32 * cols as f32) / pw)
@@ -657,6 +678,17 @@ fn main() -> io::Result<()> {
                                         if target_y >= view_max_y {
                                             break;
                                         }
+                                        let line_end_col = start_col.saturating_add(display_width(line_text) as u16);
+                                        let inside_video = video_term_boxes.iter().any(|&(vc0, vr0, vc1, vr1)| {
+                                            target_y >= vr0
+                                                && target_y < vr1
+                                                && start_col < vc1
+                                                && line_end_col > vc0
+                                        });
+                                        if inside_video {
+                                            continue;
+                                        }
+
                                         // Suppress underline on colored buttons (e.g. "Sign in"), inputs, and Indic scripts
                                         // where terminal underlines slice through subscript vowel matras.
                                         let should_underline = span.is_link
@@ -758,6 +790,7 @@ fn main() -> io::Result<()> {
             } else {
                 100
             };
+            let audio_icon = if cdp_engine.audio_muted { "🔇" } else { "🔊" };
             let shield_tag = if cdp_engine.adblock_enabled {
                 if is_compact { "S" } else { "SHIELD" }
             } else if is_compact {
@@ -782,15 +815,18 @@ fn main() -> io::Result<()> {
                 format!(" | DITHER: {}]", dither_state)
             };
             let sr_badge = format!("{}{}", sr_part, dither_part);
+            let mute_sep = if is_compact { "|" } else { " | " };
             let metrics = if is_compact {
                 format!(
-                    " {}|{}|{:0.0}M|{}% ",
-                    sr_badge, shield_tag, mem, scroll_pct
+                    " {}{}{}|{}|{:0.0}M|{}% ",
+                    sr_badge, mute_sep, audio_icon, shield_tag, mem, scroll_pct
                 )
             } else {
                 format!(
-                    " {} | {} | {} | {:0.1}MB | {} | {}% ",
+                    " {}{}{} | {} | {} | {:0.1}MB | {} | {}% ",
                     sr_badge,
+                    mute_sep,
+                    audio_icon,
                     shield_tag,
                     renderer.protocol.short_name(),
                     mem,
@@ -798,8 +834,8 @@ fn main() -> io::Result<()> {
                     scroll_pct
                 )
             };
-            let metrics_len = metrics.len() as u16;
-            let metrics_x = cols.saturating_sub(metrics_len);
+            let metrics_cols = display_width(&metrics) as u16;
+            let metrics_x = cols.saturating_sub(metrics_cols);
 
             if !has_active_banner && metrics_x > addr_x + 2 {
                 let max_url_w = (metrics_x - addr_x) as usize;
@@ -810,15 +846,18 @@ fn main() -> io::Result<()> {
 
             if !has_active_banner {
                 let sr_col_start = metrics_x + 1;
-                let sr_col_end = sr_col_start + (sr_part.len() as u16);
-                let dither_col_end = sr_col_end + (dither_part.len() as u16);
-                input_handler.set_status_hit_zones(
+                let sr_col_end = sr_col_start + (display_width(&sr_part) as u16);
+                let dither_col_end = sr_col_end + (display_width(&dither_part) as u16);
+                let mute_col_start = dither_col_end + (display_width(mute_sep) as u16);
+                let mute_col_end = mute_col_start + (display_width(audio_icon) as u16);
+                input_handler.set_all_status_hit_zones(
                     Some((sr_col_start, sr_col_end)),
                     Some((sr_col_end, dither_col_end)),
+                    Some((mute_col_start, mute_col_end)),
                 );
                 renderer.put_str(metrics_x, 0, &metrics, Color::LIGHT_GRAY, bar_bg, false, false);
             } else {
-                input_handler.set_status_hit_zones(None, None);
+                input_handler.set_all_status_hit_zones(None, None, None);
             }
         }
 
@@ -838,7 +877,11 @@ fn main() -> io::Result<()> {
         }
 
         let elapsed = frame_start.elapsed();
-        let target_frame_time = Duration::from_millis(33);
+        let target_frame_time = if renderer.video_fast_path {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(33)
+        };
         if elapsed < target_frame_time {
             std::thread::sleep(target_frame_time - elapsed);
         }

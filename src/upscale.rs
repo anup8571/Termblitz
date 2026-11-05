@@ -1245,6 +1245,13 @@ pub fn apply_terminal_subpixel_rcas(subpixel_buf: &PixelBuffer, mode: UpscaleMod
     fsr_rcas(subpixel_buf, sharpness)
 }
 
+/// Fast-path single-pass subpixel sharpener (`fsr_rcas`) used when an active `<video>` element
+/// is playing in the viewport, bypassing multi-layer CPU convolutions for tear-free video FPS.
+#[inline]
+pub fn apply_video_box_fast_rcas(subpixel_buf: &PixelBuffer) -> PixelBuffer {
+    fsr_rcas(subpixel_buf, 0.82)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

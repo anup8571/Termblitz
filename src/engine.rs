@@ -59,6 +59,63 @@ pub struct TextOverlaySpan {
     pub link_url: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl VideoRect {
+    /// Parses a `VIDEO:x,y,w,h;x2,y2,w2,h2` payload from the CDP metadata header.
+    pub fn parse_list(raw: &str) -> Vec<Self> {
+        let trimmed = raw.trim();
+        let body = trimmed.strip_prefix("VIDEO:").unwrap_or(trimmed);
+        if body.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for item in body.split(';') {
+            let nums: Vec<i32> = item
+                .split(',')
+                .filter_map(|s| s.trim().parse::<i32>().ok())
+                .collect();
+            if nums.len() == 4 && nums[2] > 40 && nums[3] > 40 {
+                out.push(Self {
+                    x: nums[0],
+                    y: nums[1],
+                    w: nums[2],
+                    h: nums[3],
+                });
+            }
+        }
+        out
+    }
+
+    /// Converts this CSS viewport video rectangle into terminal cell bounds `(col_start, row_start, col_end, row_end)`
+    /// where `row` is in full terminal coordinates (`1..rows`, excluding row 0 status bar).
+    pub fn to_terminal_bounds(&self, cols: u16, rows: u16, vw: u32, vh: u32) -> (u16, u16, u16, u16) {
+        let pw = vw.max(1) as f32;
+        let ph = vh.max(1) as f32;
+        let view_start_y = 1u16;
+        let view_rows = (rows.saturating_sub(view_start_y)).max(1) as f32;
+
+        let c0 = ((self.x.max(0) as f32 * cols as f32) / pw).floor().max(0.0) as u16;
+        let c1 = (((self.x.saturating_add(self.w)).max(0) as f32 * cols as f32) / pw)
+            .ceil()
+            .min(cols as f32) as u16;
+        let r0 = view_start_y
+            + ((self.y.max(0) as f32 * view_rows) / ph).floor().max(0.0) as u16;
+        let r1 = view_start_y
+            + (((self.y.saturating_add(self.h)).max(0) as f32 * view_rows) / ph)
+                .ceil()
+                .min(view_rows) as u16;
+        (c0.min(cols), r0.min(rows), c1.min(cols), r1.min(rows))
+    }
+}
+
+
 #[derive(Clone, Debug)]
 pub struct InteractiveLink {
     pub x: u16,
@@ -109,9 +166,14 @@ pub fn is_ad_or_tracker_url(url: &str) -> bool {
     let u = url.to_lowercase();
     const AD_PATTERNS: &[&str] = &[
         "doubleclick.net",
+        "googleads.g.doubleclick.net",
         "googlesyndication.com",
         "googleadservices.com",
         "adservice.google.",
+        "youtube.com/api/stats/ads",
+        "youtube.com/pagead/",
+        "youtube.com/ptracking",
+        "youtube.com/get_midroll_",
         "moatads.com",
         "taboola.com",
         "outbrain.com",
@@ -1122,6 +1184,7 @@ pub enum CdpWorkerCommand {
     SetZoom(f32),
     SetHideText(bool),
     SetAdBlock(bool),
+    SetMuted(bool),
     HistoryBack,
     HistoryForward,
     Stop,
@@ -1278,11 +1341,13 @@ impl WsConnection {
 
 const TEXT_EXTRACT_ID: u64 = 55555;
 
-/// Injects mobile reflow CSS, cosmetic ad-blocking rules, and non-destructive text transparency (`-webkit-text-fill-color: transparent`).
+/// Injects mobile reflow CSS, cosmetic ad-blocking rules, YouTube Ad-Shield auto-skipper, audio mute sync,
+/// and non-destructive text transparency (`-webkit-text-fill-color: transparent`).
 /// Using `-webkit-text-fill-color: transparent` hides Chromium's raster glyphs from the screencast while preserving `getComputedStyle(p).color`!
-fn build_page_style_js(hide_text: bool, adblock: bool) -> String {
+fn build_page_style_js(hide_text: bool, adblock: bool, muted: bool) -> String {
     let raw_flag = if hide_text { "no" } else { "yes" };
     let ad_flag = if adblock { "yes" } else { "no" };
+    let muted_js = if muted { "true" } else { "false" };
     format!(
         "(function(){{\
             var d=document.documentElement;\
@@ -1290,6 +1355,11 @@ fn build_page_style_js(hide_text: bool, adblock: bool) -> String {
             d.style.zoom='1';\
             d.setAttribute('data-termblitz-raw','{}');\
             d.setAttribute('data-termblitz-adblock','{}');\
+            window.__termblitz_muted={};\
+            var mediaEls=document.querySelectorAll('video,audio');\
+            for(var mi=0;mi<mediaEls.length;mi++){{\
+                mediaEls[mi].muted=!!window.__termblitz_muted;\
+            }}\
             var head=document.head||d;\
             var s=document.getElementById('termblitz-core-style');\
             if(!s){{\
@@ -1299,12 +1369,51 @@ fn build_page_style_js(hide_text: bool, adblock: bool) -> String {
                     html,body{{max-width:100vw!important;overflow-x:hidden!important;box-sizing:border-box!important;word-break:break-word!important;-webkit-text-size-adjust:100%!important;}}\
                     img,video,canvas,svg{{max-width:100%!important;height:auto!important;}}\
                     html:not([data-termblitz-raw=yes]) *,html:not([data-termblitz-raw=yes]) *::before,html:not([data-termblitz-raw=yes]) *::after{{-webkit-text-fill-color:transparent!important;text-shadow:none!important;-webkit-text-stroke:0!important;}}\
-                    html[data-termblitz-adblock=yes] ins.adsbygoogle,html[data-termblitz-adblock=yes] [id^=google_ads],html[data-termblitz-adblock=yes] [id^=div-gpt-ad],html[data-termblitz-adblock=yes] [data-text-ad],html[data-termblitz-adblock=yes] [aria-label=Ads],html[data-termblitz-adblock=yes] iframe[src*=doubleclick],html[data-termblitz-adblock=yes] iframe[id*=google_ads]{{display:none!important;}}\
+                    html[data-termblitz-adblock=yes] ins.adsbygoogle,html[data-termblitz-adblock=yes] [id^=google_ads],html[data-termblitz-adblock=yes] [id^=div-gpt-ad],html[data-termblitz-adblock=yes] [data-text-ad],html[data-termblitz-adblock=yes] [aria-label=Ads],html[data-termblitz-adblock=yes] iframe[src*=doubleclick],html[data-termblitz-adblock=yes] iframe[id*=google_ads],html[data-termblitz-adblock=yes] ytd-ad-slot-renderer,html[data-termblitz-adblock=yes] ytd-in-feed-ad-layout-renderer,html[data-termblitz-adblock=yes] ytm-promoted-sparkles-web-renderer,html[data-termblitz-adblock=yes] ytm-companion-ad-renderer,html[data-termblitz-adblock=yes] .ytp-ad-overlay-container,html[data-termblitz-adblock=yes] .ytp-ad-message-container{{display:none!important;}}\
                 ';\
                 head.appendChild(s);\
             }}\
+            if(!window.__termblitz_yt_shield){{\
+                window.__termblitz_yt_shield=true;\
+                var sweepAds=function(){{\
+                    var root=document.documentElement;\
+                    if(!root||root.getAttribute('data-termblitz-adblock')!=='yes')return;\
+                    var adNodes=document.querySelectorAll('ytd-ad-slot-renderer,ytd-in-feed-ad-layout-renderer,ytm-promoted-sparkles-web-renderer,ytm-companion-ad-renderer,.ytp-ad-overlay-container');\
+                    for(var i=0;i<adNodes.length;i++){{\
+                        adNodes[i].style.setProperty('display','none','important');\
+                    }}\
+                    var adPlayer=document.querySelector('.ad-showing,.ad-interrupting');\
+                    var skipBtns=document.querySelectorAll('.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.ytp-skip-ad-button,.videoAdUiSkipButton');\
+                    for(var b=0;b<skipBtns.length;b++){{\
+                        try{{skipBtns[b].click();}}catch(_e){{}}\
+                    }}\
+                    if(adPlayer){{\
+                        var v=adPlayer.querySelector('video')||document.querySelector('video.html5-main-video,video');\
+                        if(v){{\
+                            v.muted=true;\
+                            try{{\
+                                if(isFinite(v.duration)&&v.duration>0){{v.currentTime=v.duration;}}\
+                                else{{v.currentTime=9999;}}\
+                            }}catch(_e){{}}\
+                        }}\
+                    }}else{{\
+                        var vids=document.querySelectorAll('video,audio');\
+                        for(var k=0;k<vids.length;k++){{\
+                            if(vids[k].muted!==!!window.__termblitz_muted){{\
+                                vids[k].muted=!!window.__termblitz_muted;\
+                            }}\
+                        }}\
+                    }}\
+                }};\
+                setInterval(sweepAds,250);\
+                try{{\
+                    var obs=new MutationObserver(sweepAds);\
+                    obs.observe(d,{{childList:true,subtree:true,attributes:true,attributeFilter:['class']}});\
+                }}catch(_e){{}}\
+                sweepAds();\
+            }}\
         }})()",
-        raw_flag, ad_flag
+        raw_flag, ad_flag, muted_js
     )
 }
 
@@ -1317,7 +1426,22 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
         var docH=Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0,vh);\
         var maxS=Math.max(1,docH-vh);\
         var pct=Math.min(100,Math.max(0,Math.round(((window.scrollY||0)*100)/maxS)));\
-        r.push('META'+T+vw+T+vh+T+pct+T+(location.href||''));\
+        var vRects=[];\
+        var vids=document.querySelectorAll('video');\
+        for(var vi=0;vi<vids.length;vi++){\
+            var vel=vids[vi];\
+            var vs=getComputedStyle(vel);\
+            if(vs.display==='none'||vs.visibility==='hidden'||parseFloat(vs.opacity)<0.05)continue;\
+            var vrc=vel.getBoundingClientRect();\
+            if(vrc&&vrc.width>40&&vrc.height>40&&vrc.bottom>0&&vrc.top<vh&&vrc.right>0&&vrc.left<vw){\
+                var playing=(!vel.paused&&!vel.ended&&vel.readyState>=2)||(vel.currentTime>0&&!vel.ended);\
+                if(playing){\
+                    vRects.push((~~vrc.left)+','+(~~vrc.top)+','+(~~vrc.width)+','+(~~vrc.height));\
+                }\
+            }\
+        }\
+        var vHeader=vRects.length?('VIDEO:'+vRects.join(';')):'';\
+        r.push('META'+T+vw+T+vh+T+pct+T+(location.href||'')+T+vHeader);\
         function getBg(el){\
             var bp=el;\
             while(bp&&bp!==document.documentElement){\
@@ -1340,7 +1464,7 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             var s=getComputedStyle(p);\
             if(s.display==='none'||s.visibility==='hidden'||parseFloat(s.opacity)<0.05||parseFloat(s.fontSize)<2)continue;\
             if(s.clip==='rect(1px, 1px, 1px, 1px)'||s.clipPath==='inset(50%)'||((p.offsetWidth<=2||p.offsetHeight<=2)&&s.overflow==='hidden'))continue;\
-            if(p.closest('[aria-hidden=true],[hidden],ins.adsbygoogle,[data-text-ad],[id^=google_ads]'))continue;\
+            if(p.closest('[aria-hidden=true],[hidden],ins.adsbygoogle,[data-text-ad],[id^=google_ads],ytd-ad-slot-renderer,ytm-promoted-sparkles-web-renderer,.ytp-ad-overlay-container'))continue;\
             var rng=document.createRange();\
             rng.selectNodeContents(n);\
             var rects=rng.getClientRects();\
@@ -1409,7 +1533,7 @@ fn configure_cdp_adblock(ws: &mut WsConnection, seq: &mut u64, enabled: bool) {
     *seq += 1;
     if enabled {
         let blocked_cmd = format!(
-            r#"{{"id":{},"method":"Network.setBlockedURLs","params":{{"urls":["*://*.doubleclick.net/*","*://*.googlesyndication.com/*","*://*.googleadservices.com/*","*://*.adservice.google.*/*","*://*.moatads.com/*","*://*.taboola.com/*","*://*.outbrain.com/*","*://*.criteo.com/*","*://*.amazon-adsystem.com/*","*://*.adsafeprotected.com/*","*://*.scorecardresearch.com/*","*://*.quantserve.com/*","*://*.adnxs.com/*","*://*.rubiconproject.com/*","*://*.pubmatic.com/*","*://*.openx.net/*","*://*.popads.net/*","*://*.google-analytics.com/*","*://*.googletagmanager.com/*"]}}}}"#,
+            r#"{{"id":{},"method":"Network.setBlockedURLs","params":{{"urls":["*doubleclick.net*","*googleads.g.doubleclick.net*","*youtube.com/api/stats/ads*","*youtube.com/pagead/*","*youtube.com/ptracking*","*youtube.com/get_midroll_*","*://*.googlesyndication.com/*","*://*.googleadservices.com/*","*://*.adservice.google.*/*","*://*.moatads.com/*","*://*.taboola.com/*","*://*.outbrain.com/*","*://*.criteo.com/*","*://*.amazon-adsystem.com/*","*://*.adsafeprotected.com/*","*://*.scorecardresearch.com/*","*://*.quantserve.com/*","*://*.adnxs.com/*","*://*.rubiconproject.com/*","*://*.pubmatic.com/*","*://*.openx.net/*","*://*.popads.net/*","*://*.google-analytics.com/*","*://*.googletagmanager.com/*"]}}}}"#,
             *seq
         );
         let _ = ws.send_text(&blocked_cmd);
@@ -1430,12 +1554,14 @@ fn spawn_cdp_worker(
     rows: u16,
     shared_buf: Arc<Mutex<PixelBuffer>>,
     shared_overlays: Arc<Mutex<Vec<TextOverlaySpan>>>,
+    shared_video_rects: Arc<Mutex<Vec<VideoRect>>>,
     shared_viewport: Arc<Mutex<(u32, u32)>>,
     shared_scroll_pct: Arc<AtomicUsize>,
     shared_live_url: Arc<Mutex<String>>,
     frame_counter: Arc<AtomicUsize>,
     shared_error: Arc<Mutex<Option<String>>>,
     is_loading: Arc<AtomicBool>,
+    initial_muted: bool,
     command_rx: Receiver<CdpWorkerCommand>,
 ) {
     std::thread::spawn(move || {
@@ -1502,11 +1628,13 @@ fn spawn_cdp_worker(
         let mut curr_zoom: f32 = 1.0;
         let mut curr_hide_text: bool = true;
         let mut curr_adblock: bool = true;
+        let mut curr_muted: bool = initial_muted;
+        let mut video_mode_active: bool = false;
 
         configure_cdp_adblock(&mut ws, &mut seq, curr_adblock);
 
         seq += 1;
-        let preload_js = build_page_style_js(curr_hide_text, curr_adblock);
+        let preload_js = build_page_style_js(curr_hide_text, curr_adblock, curr_muted);
         let preload_src = format!(
             "document.addEventListener('DOMContentLoaded',function(){{{}}});{}",
             preload_js, preload_js
@@ -1554,12 +1682,16 @@ fn spawn_cdp_worker(
         let mut active_until = Instant::now() + Duration::from_secs(3);
 
         loop {
+            let mut coalesced_scroll_delta: i32 = 0;
+
             while let Ok(cmd) = command_rx.try_recv() {
                 match cmd {
                     CdpWorkerCommand::Navigate(new_url) => {
+                        coalesced_scroll_delta = 0;
                         is_loading.store(true, Ordering::Relaxed);
                         frame_counter.store(0, Ordering::Relaxed);
                         shared_overlays.lock().unwrap().clear();
+                        shared_video_rects.lock().unwrap().clear();
                         *shared_live_url.lock().unwrap() = new_url.clone();
                         let (w, h) = compute_viewport_size(curr_cols, curr_rows, curr_zoom);
                         width_px = w;
@@ -1584,7 +1716,7 @@ fn spawn_cdp_worker(
                     CdpWorkerCommand::SetHideText(hide) => {
                         curr_hide_text = hide;
                         seq += 1;
-                        let js = build_page_style_js(curr_hide_text, curr_adblock);
+                        let js = build_page_style_js(curr_hide_text, curr_adblock, curr_muted);
                         let eval_cmd = format!(
                             r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
                             seq,
@@ -1601,7 +1733,7 @@ fn spawn_cdp_worker(
                         curr_adblock = enabled;
                         configure_cdp_adblock(&mut ws, &mut seq, curr_adblock);
                         seq += 1;
-                        let js = build_page_style_js(curr_hide_text, curr_adblock);
+                        let js = build_page_style_js(curr_hide_text, curr_adblock, curr_muted);
                         let eval_cmd = format!(
                             r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
                             seq,
@@ -1609,6 +1741,21 @@ fn spawn_cdp_worker(
                         );
                         let _ = ws.send_text(&eval_cmd);
                         pending_extract = true;
+                    }
+                    CdpWorkerCommand::SetMuted(muted) => {
+                        curr_muted = muted;
+                        seq += 1;
+                        let mute_flag = if curr_muted { "true" } else { "false" };
+                        let js = format!(
+                            "(function(){{window.__termblitz_muted={0};var m=document.querySelectorAll('video,audio');for(var i=0;i<m.length;i++){{m[i].muted={0};}}}})()",
+                            mute_flag
+                        );
+                        let eval_cmd = format!(
+                            r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
+                            seq,
+                            json_escape(&js)
+                        );
+                        let _ = ws.send_text(&eval_cmd);
                     }
                     CdpWorkerCommand::Resize { cols: new_cols, rows: new_rows } => {
                         curr_cols = new_cols;
@@ -1624,27 +1771,20 @@ fn spawn_cdp_worker(
                         );
                         let _ = ws.send_text(&emu);
                         seq += 1;
+                        let quality = if video_mode_active { 65 } else { 85 };
                         let sc = format!(
-                            r#"{{"id":{},"method":"Page.startScreencast","params":{{"format":"jpeg","quality":85,"maxWidth":{},"maxHeight":{},"everyNthFrame":1}}}}"#,
-                            seq, width_px, height_px
+                            r#"{{"id":{},"method":"Page.startScreencast","params":{{"format":"jpeg","quality":{},"maxWidth":{},"maxHeight":{},"everyNthFrame":1}}}}"#,
+                            seq, quality, width_px, height_px
                         );
                         let _ = ws.send_text(&sc);
                         pending_extract = true;
                         active_until = Instant::now() + Duration::from_millis(1000);
                     }
                     CdpWorkerCommand::Scroll(delta) => {
-                        let center_x = width_px / 2;
-                        let center_y = height_px / 2;
-                        seq += 1;
-                        let scroll_msg = format!(
-                            r#"{{"id":{},"method":"Input.dispatchMouseEvent","params":{{"type":"mouseWheel","x":{},"y":{},"deltaX":0,"deltaY":{}}}}}"#,
-                            seq, center_x, center_y, delta * 90
-                        );
-                        let _ = ws.send_text(&scroll_msg);
-                        pending_extract = true;
-                        active_until = Instant::now() + Duration::from_millis(900);
+                        coalesced_scroll_delta = (coalesced_scroll_delta + delta).clamp(-24, 24);
                     }
                     CdpWorkerCommand::Click(col, row) => {
+                        coalesced_scroll_delta = 0;
                         let px_x = (((col as f32 + 0.5) * width_px as f32) / curr_cols.max(1) as f32) as u32;
                         let px_y = ((((row.saturating_sub(1) as f32) + 0.5) * height_px as f32)
                             / (curr_rows.saturating_sub(1)).max(1) as f32) as u32;
@@ -1676,15 +1816,17 @@ fn spawn_cdp_worker(
                         );
                         let _ = ws.send_text(&emu);
                         seq += 1;
+                        let quality = if video_mode_active { 65 } else { 85 };
                         let sc = format!(
-                            r#"{{"id":{},"method":"Page.startScreencast","params":{{"format":"jpeg","quality":85,"maxWidth":{},"maxHeight":{},"everyNthFrame":1}}}}"#,
-                            seq, width_px, height_px
+                            r#"{{"id":{},"method":"Page.startScreencast","params":{{"format":"jpeg","quality":{},"maxWidth":{},"maxHeight":{},"everyNthFrame":1}}}}"#,
+                            seq, quality, width_px, height_px
                         );
                         let _ = ws.send_text(&sc);
                         pending_extract = true;
                         active_until = Instant::now() + Duration::from_millis(1000);
                     }
                     CdpWorkerCommand::HistoryBack => {
+                        coalesced_scroll_delta = 0;
                         seq += 1;
                         let eval_cmd = format!(
                             r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"history.back()"}}}}"#,
@@ -1695,6 +1837,7 @@ fn spawn_cdp_worker(
                         active_until = Instant::now() + Duration::from_secs(2);
                     }
                     CdpWorkerCommand::HistoryForward => {
+                        coalesced_scroll_delta = 0;
                         seq += 1;
                         let eval_cmd = format!(
                             r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"history.forward()"}}}}"#,
@@ -1711,13 +1854,30 @@ fn spawn_cdp_worker(
                 }
             }
 
+            if coalesced_scroll_delta != 0 {
+                let pixel_delta = coalesced_scroll_delta * 72;
+                seq += 1;
+                let scroll_js = format!(
+                    "(function(){{window.scrollBy({{top:{0},left:0,behavior:'instant'}});if(document.scrollingElement){{document.scrollingElement.scrollTop+={0};}}}})()",
+                    pixel_delta
+                );
+                let scroll_cmd = format!(
+                    r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
+                    seq,
+                    json_escape(&scroll_js)
+                );
+                let _ = ws.send_text(&scroll_cmd);
+                pending_extract = true;
+                active_until = Instant::now() + Duration::from_millis(450);
+            }
+
             while let Some(msg) = ws.poll_message() {
                 if msg.contains(r#""Page.loadEventFired""#) || msg.contains(r#""Page.frameNavigated""#) {
                     if msg.contains(r#""Page.loadEventFired""#) {
                         is_loading.store(false, Ordering::Relaxed);
                     }
                     seq += 1;
-                    let setup_js = build_page_style_js(curr_hide_text, curr_adblock);
+                    let setup_js = build_page_style_js(curr_hide_text, curr_adblock, curr_muted);
                     let eval_cmd = format!(
                         r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
                         seq,
@@ -1743,6 +1903,22 @@ fn spawn_cdp_worker(
                                     let vh = parts[2].parse::<u32>().unwrap_or(height_px).max(100);
                                     let pct = parts[3].parse::<usize>().unwrap_or(0);
                                     let url_str = parts[4].trim();
+                                    let parsed_videos = parts
+                                        .get(5)
+                                        .map(|s| VideoRect::parse_list(s))
+                                        .unwrap_or_default();
+                                    let now_video_active = !parsed_videos.is_empty();
+                                    if now_video_active != video_mode_active {
+                                        video_mode_active = now_video_active;
+                                        seq += 1;
+                                        let quality = if video_mode_active { 65 } else { 85 };
+                                        let sc = format!(
+                                            r#"{{"id":{},"method":"Page.startScreencast","params":{{"format":"jpeg","quality":{},"maxWidth":{},"maxHeight":{},"everyNthFrame":1}}}}"#,
+                                            seq, quality, vw, vh
+                                        );
+                                        let _ = ws.send_text(&sc);
+                                    }
+                                    *shared_video_rects.lock().unwrap() = parsed_videos;
                                     *shared_viewport.lock().unwrap() = (vw, vh);
                                     shared_scroll_pct.store(pct, Ordering::Relaxed);
                                     if !url_str.is_empty() && url_str != "about:blank" {
@@ -1839,7 +2015,7 @@ fn spawn_cdp_worker(
             if (pending_extract || now < active_until)
                 && last_text_extract.elapsed() >= Duration::from_millis(90)
             {
-                let setup_js = build_page_style_js(curr_hide_text, curr_adblock);
+                let setup_js = build_page_style_js(curr_hide_text, curr_adblock, curr_muted);
                 seq += 1;
                 let eval_cmd = format!(
                     r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
@@ -1864,6 +2040,7 @@ pub struct CdpEngine {
     pub chromium_bin: Option<String>,
     pub frame_buffer: Arc<Mutex<PixelBuffer>>,
     pub text_overlays: Arc<Mutex<Vec<TextOverlaySpan>>>,
+    pub video_rects: Arc<Mutex<Vec<VideoRect>>>,
     pub viewport_dims: Arc<Mutex<(u32, u32)>>,
     pub scroll_pct: Arc<AtomicUsize>,
     pub live_url: Arc<Mutex<String>>,
@@ -1871,6 +2048,7 @@ pub struct CdpEngine {
     pub is_loading: Arc<AtomicBool>,
     pub zoom: f32,
     pub adblock_enabled: bool,
+    pub audio_muted: bool,
     pub upscale_mode: UpscaleMode,
     pub dithering_enabled: bool,
     command_tx: Option<Sender<CdpWorkerCommand>>,
@@ -1889,6 +2067,7 @@ impl CdpEngine {
             error_message: Arc::new(Mutex::new(None)),
             frame_buffer: Arc::new(Mutex::new(PixelBuffer::new(80, 48, Color::new(246, 246, 239)))),
             text_overlays: Arc::new(Mutex::new(Vec::new())),
+            video_rects: Arc::new(Mutex::new(Vec::new())),
             viewport_dims: Arc::new(Mutex::new((360, 640))),
             scroll_pct: Arc::new(AtomicUsize::new(0)),
             live_url: Arc::new(Mutex::new(String::new())),
@@ -1900,6 +2079,7 @@ impl CdpEngine {
             rows: 24,
             zoom: 1.0,
             adblock_enabled: true,
+            audio_muted: false,
             upscale_mode: UpscaleMode::FsrOnly,
             dithering_enabled: true,
         }
@@ -1907,6 +2087,14 @@ impl CdpEngine {
 
     pub fn get_text_overlays(&self) -> Vec<TextOverlaySpan> {
         self.text_overlays.lock().unwrap().clone()
+    }
+
+    pub fn get_video_rects(&self) -> Vec<VideoRect> {
+        self.video_rects.lock().unwrap().clone()
+    }
+
+    pub fn has_active_video(&self) -> bool {
+        !self.video_rects.lock().unwrap().is_empty()
     }
 
     pub fn get_viewport_dims(&self) -> (u32, u32) {
@@ -1962,6 +2150,18 @@ impl CdpEngine {
         if let Some(ref tx) = self.command_tx {
             let _ = tx.send(CdpWorkerCommand::SetAdBlock(enabled));
         }
+    }
+
+    pub fn set_muted(&mut self, muted: bool) {
+        self.audio_muted = muted;
+        if let Some(ref tx) = self.command_tx {
+            let _ = tx.send(CdpWorkerCommand::SetMuted(muted));
+        }
+    }
+
+    pub fn toggle_mute(&mut self) -> bool {
+        self.set_muted(!self.audio_muted);
+        self.audio_muted
     }
 
     pub fn history_back(&mut self) {
@@ -2153,6 +2353,23 @@ impl CdpEngine {
             let _ = std::fs::remove_file(format!("{}/{}", profile_dir, lock_name));
         }
 
+        let is_termux = std::env::var("PREFIX")
+            .map(|p| p.contains("com.termux"))
+            .unwrap_or(false)
+            || std::path::Path::new("/data/data/com.termux/files/usr").exists();
+
+        // Auto-start PulseAudio daemon quietly in the background on Termux / Linux if installed
+        // so YouTube & HTML5 media audio plays directly through Android speakers.
+        if is_termux || cfg!(target_os = "linux") {
+            let _ = Command::new("pulseaudio")
+                .arg("--start")
+                .arg("--exit-idle-time=-1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+
         let win_arg = format!("--window-size={},{}", window_w, window_h);
         let port_arg = format!("--remote-debugging-port={}", self.port);
         let profile_arg = format!("--user-data-dir={}", profile_dir);
@@ -2192,8 +2409,10 @@ impl CdpEngine {
                 .arg("--disable-component-update")
                 .arg("--disable-background-networking")
                 .arg("--disable-popup-blocking")
-                .arg("--disable-features=DevicePosture,MediaStream,AudioServiceOutOfProcess,Translate,BackForwardCache,VizDisplayCompositor")
-                .arg("--mute-audio")
+                .arg("--autoplay-policy=no-user-gesture-required")
+                .arg("--enable-features=AudioServiceOutOfProcess")
+                .arg("--alsa-output-device=default")
+                .arg("--disable-features=DevicePosture,Translate,BackForwardCache,VizDisplayCompositor")
                 .arg("--no-first-run")
                 .arg("--no-default-browser-check")
                 .arg("--hide-scrollbars")
@@ -2203,6 +2422,10 @@ impl CdpEngine {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
+
+            if is_termux && std::env::var("PULSE_SERVER").is_err() {
+                cmd.env("PULSE_SERVER", "127.0.0.1");
+            }
 
             if let Ok(mut child) = cmd.spawn() {
                 last_pid = Some(child.id());
@@ -2266,12 +2489,14 @@ impl CdpEngine {
                 rows,
                 Arc::clone(&self.frame_buffer),
                 Arc::clone(&self.text_overlays),
+                Arc::clone(&self.video_rects),
                 Arc::clone(&self.viewport_dims),
                 Arc::clone(&self.scroll_pct),
                 Arc::clone(&self.live_url),
                 Arc::clone(&self.frame_counter),
                 Arc::clone(&self.error_message),
                 Arc::clone(&self.is_loading),
+                self.audio_muted,
                 rx,
             );
         }
@@ -2473,4 +2698,36 @@ mod tests {
         assert_eq!(term_row, 17);
         assert_eq!(span_cols, 15);
     }
+
+    #[test]
+    fn test_video_rect_parsing_and_terminal_bounds() {
+        let parsed = VideoRect::parse_list("VIDEO:0,48,360,202;10,10,20,20");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0],
+            VideoRect {
+                x: 0,
+                y: 48,
+                w: 360,
+                h: 202
+            }
+        );
+        let (c0, r0, c1, r1) = parsed[0].to_terminal_bounds(60, 40, 360, 640);
+        assert_eq!(c0, 0);
+        assert_eq!(c1, 60);
+        assert!(r0 >= 1 && r1 > r0 && r1 <= 40);
+    }
+
+    #[test]
+    fn test_youtube_adblock_urls_and_shield_script() {
+        assert!(is_ad_or_tracker_url("https://googleads.g.doubleclick.net/pagead/id"));
+        assert!(is_ad_or_tracker_url("https://www.youtube.com/api/stats/ads?ver=2"));
+        assert!(is_ad_or_tracker_url("https://www.youtube.com/pagead/interaction/"));
+        assert!(is_ad_or_tracker_url("https://www.youtube.com/ptracking?html5=1"));
+        let js = build_page_style_js(true, true, false);
+        assert!(js.contains(".ytp-ad-skip-button"));
+        assert!(js.contains(".ad-showing"));
+        assert!(js.contains("ytd-ad-slot-renderer"));
+    }
 }
+

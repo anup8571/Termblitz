@@ -385,6 +385,7 @@ pub struct DiffRenderer {
     pub protocol: GraphicsProtocol,
     pub upscale_mode: UpscaleMode,
     pub dithering_enabled: bool,
+    pub video_fast_path: bool,
     current: Vec<Cell>,
     previous: Vec<Cell>,
     write_buf: Vec<u8>,
@@ -399,6 +400,7 @@ impl DiffRenderer {
             protocol: GraphicsProtocol::auto_detect(),
             upscale_mode: UpscaleMode::FsrOnly,
             dithering_enabled: true,
+            video_fast_path: false,
             current: vec![Cell::EMPTY; size],
             previous: vec![Cell::INVALID; size],
             write_buf: Vec::with_capacity(65536),
@@ -901,8 +903,11 @@ impl DiffRenderer {
             return;
         }
 
+        // Video-Box Fast-Path: when an active <video> is playing (`self.video_fast_path`),
+        // bypass heavy multi-layer CPU convolutions on the full source frame and apply single-pass
+        // terminal-subpixel RCAS after downsampling to maintain maximum tear-free video FPS.
         let upscaled_storage;
-        let active_buf = if self.upscale_mode == UpscaleMode::Off {
+        let active_buf = if self.upscale_mode == UpscaleMode::Off || self.video_fast_path {
             px_buf
         } else {
             let mut sr_w = (target_w * 2).max(px_buf.width);
@@ -939,9 +944,17 @@ impl DiffRenderer {
         }
 
         // Pass 1b: Run Contrast-Adaptive Sharpening (RCAS) directly on the terminal subpixel grid
-        // so 1px sharpening lobes crisp up half-block (`▀`) edges and small thumbnails after downsampling.
+        // so 1px sharpening lobes crisp up half-block (`▀`) edges, video frames, and thumbnails.
         let rcas_storage;
-        let final_subpixels = if self.upscale_mode == UpscaleMode::Off {
+        let final_subpixels = if self.video_fast_path {
+            let fast_mode = if self.upscale_mode == UpscaleMode::Off {
+                UpscaleMode::FsrOnly
+            } else {
+                self.upscale_mode
+            };
+            rcas_storage = apply_terminal_subpixel_rcas(&subpixel_buf, fast_mode);
+            &rcas_storage
+        } else if self.upscale_mode == UpscaleMode::Off {
             &subpixel_buf
         } else {
             rcas_storage = apply_terminal_subpixel_rcas(&subpixel_buf, self.upscale_mode);
@@ -1017,6 +1030,9 @@ impl DiffRenderer {
         let upscaled_storage;
         let active_buf = if self.upscale_mode == UpscaleMode::Off {
             px_buf
+        } else if self.video_fast_path {
+            upscaled_storage = apply_terminal_subpixel_rcas(px_buf, UpscaleMode::FsrOnly);
+            &upscaled_storage
         } else {
             upscaled_storage = apply_upscale_pipeline(
                 px_buf,
@@ -1043,7 +1059,8 @@ impl DiffRenderer {
         let rows = max_y.saturating_sub(start_y);
 
         let mut out = Vec::with_capacity(total_len + 512);
-
+        // DEC Synchronized Output begin
+        out.extend_from_slice(b"\x1b[?2026h");
         out.extend_from_slice(b"\x1b_Ga=d,d=A\x1b\\");
         out.extend_from_slice(b"\x1b[");
         push_u16(&mut out, start_y + 1);
@@ -1084,6 +1101,8 @@ impl DiffRenderer {
             offset = end;
         }
 
+        // DEC Synchronized Output end
+        out.extend_from_slice(b"\x1b[?2026l");
         let _ = write_stdout_bytes(&out);
     }
 
@@ -1096,6 +1115,9 @@ impl DiffRenderer {
         let upscaled_storage;
         let active_buf = if self.upscale_mode == UpscaleMode::Off {
             px_buf
+        } else if self.video_fast_path {
+            upscaled_storage = apply_terminal_subpixel_rcas(px_buf, UpscaleMode::FsrOnly);
+            &upscaled_storage
         } else {
             upscaled_storage = apply_upscale_pipeline(
                 px_buf,
@@ -1107,7 +1129,8 @@ impl DiffRenderer {
         };
 
         let mut out = Vec::with_capacity(active_buf.width * active_buf.height + 1024);
-
+        // DEC Synchronized Output begin
+        out.extend_from_slice(b"\x1b[?2026h");
         out.extend_from_slice(b"\x1b[");
         push_u16(&mut out, start_y + 1);
         out.extend_from_slice(b";1H");
@@ -1178,12 +1201,15 @@ impl DiffRenderer {
         }
 
         out.extend_from_slice(b"\x1b\\");
+        // DEC Synchronized Output end
+        out.extend_from_slice(b"\x1b[?2026l");
 
         let _ = write_stdout_bytes(&out);
     }
 
-    /// High-performance dirty-cell diffing and run-length batching.
-    pub fn flush(&mut self) -> io::Result<usize> {
+    /// Encodes all dirty cells into `self.write_buf` wrapped in DEC Synchronized Output
+    /// (`\x1b[?2026h` begin synchronized update ... `\x1b[?2026l` end synchronized update).
+    pub fn build_synchronized_frame(&mut self) -> usize {
         self.write_buf.clear();
 
         let width = self.width as usize;
@@ -1197,6 +1223,7 @@ impl DiffRenderer {
 
         let mut dirty_count = 0;
 
+        // Reserve DEC Mode 2026 Synchronized Update header once the first dirty cell is encountered
         for y in 0..height {
             let row_offset = y * width;
             let mut x = 0;
@@ -1211,6 +1238,10 @@ impl DiffRenderer {
                     continue;
                 }
 
+                if dirty_count == 0 {
+                    // Begin DEC Synchronized Output (\x1b[?2026h)
+                    self.write_buf.extend_from_slice(b"\x1b[?2026h");
+                }
                 dirty_count += 1;
 
                 let target_pos = (x as u16 + 1, y as u16 + 1);
@@ -1293,7 +1324,20 @@ impl DiffRenderer {
             }
         }
 
-        write_stdout_bytes(&self.write_buf)?;
+        if dirty_count > 0 {
+            // End DEC Synchronized Output (\x1b[?2026l)
+            self.write_buf.extend_from_slice(b"\x1b[?2026l");
+        }
+
+        dirty_count
+    }
+
+    /// High-performance dirty-cell diffing, run-length batching, and atomic DEC Synchronized Output flush.
+    pub fn flush(&mut self) -> io::Result<usize> {
+        let dirty_count = self.build_synchronized_frame();
+        if dirty_count > 0 {
+            write_stdout_bytes(&self.write_buf)?;
+        }
         Ok(dirty_count)
     }
 }
@@ -1395,5 +1439,32 @@ mod tests {
         let indices = quantize_sixel_floyd_steinberg(&buf);
         assert_eq!(indices.len(), 48);
         assert!(indices.iter().all(|&idx| idx < 16));
+    }
+
+    #[test]
+    fn test_dec_synchronized_output_and_video_fast_path() {
+        let mut renderer = DiffRenderer::new(10, 4);
+        renderer.video_fast_path = true;
+        renderer.upscale_mode = UpscaleMode::MultiPass;
+
+        let mut buf = PixelBuffer::new(20, 12, Color::new(20, 40, 60));
+        buf.set_pixel(5, 5, Color::new(220, 180, 90));
+        renderer.blit_pixel_buffer(&buf, 1, 4);
+
+        let dirty = renderer.build_synchronized_frame();
+        assert!(dirty > 0);
+        assert!(
+            renderer.write_buf.starts_with(b"\x1b[?2026h"),
+            "Frame must begin with DEC Synchronized Update \\x1b[?2026h"
+        );
+        assert!(
+            renderer.write_buf.ends_with(b"\x1b[?2026l"),
+            "Frame must end with DEC Synchronized Update \\x1b[?2026l"
+        );
+
+        // Second build with no changes should emit 0 bytes
+        let dirty_second = renderer.build_synchronized_frame();
+        assert_eq!(dirty_second, 0);
+        assert!(renderer.write_buf.is_empty());
     }
 }

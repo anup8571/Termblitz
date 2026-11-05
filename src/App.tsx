@@ -124,6 +124,27 @@ const DIAGNOSTIC_RESULTS: DiagnosticSuiteResult[] = [
     metricLabel: 'Temporal Stability & Flat Gate',
     measuredValue: '0 Shimmer | 100% Flat Span Clean',
     passed: true
+  },
+  {
+    testName: 'test_scroll_coalescing_and_drag_unlatch',
+    targetFn: 'process_event_batch + window.scrollBy',
+    metricLabel: 'Event Drain & Coalesced Delta',
+    measuredValue: 'Bounded [-12..12] | Instant Stop (0 Loop)',
+    passed: true
+  },
+  {
+    testName: 'test_youtube_adblock_urls_and_shield_script',
+    targetFn: 'Network.setBlockedURLs + sweepAds(250ms)',
+    metricLabel: 'YouTube Ad-Shield & Auto-Skip',
+    measuredValue: '.ad-showing Fast-Forward + Auto-Click Skip',
+    passed: true
+  },
+  {
+    testName: 'test_dec_synchronized_output_and_video_fast_path',
+    targetFn: 'build_synchronized_frame + VideoRect',
+    metricLabel: 'DEC ?2026h/l + Video Fast-Path RCAS',
+    measuredValue: 'Atomic Frame Flush | 0 Tearing Strips',
+    passed: true
   }
 ];
 
@@ -132,6 +153,7 @@ export default function App() {
   const [copiedCmd, setCopiedCmd] = useState<string | null>(null);
   const [simulatedMode, setSimulatedMode] = useState<'hybrid' | 'raw' | 'native'>('hybrid');
   const [adblockEnabled, setAdblockEnabled] = useState<boolean>(true);
+  const [audioMuted, setAudioMuted] = useState<boolean>(false);
   const [upscaleIdx, setUpscaleIdx] = useState<number>(3); // Default highlight on COMBINED or FSR; user can cycle all 5
   const [ditherEnabled, setDitherEnabled] = useState<boolean>(true);
 
@@ -159,7 +181,7 @@ export default function App() {
             <div>
               <span className="font-mono font-bold tracking-tight text-lg text-white">TERMBLITZ</span>
               <span className="ml-2 text-xs px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 font-mono border border-emerald-500/20">
-                v0.3.0-neural-sr
+                v0.3.2-sync-av
               </span>
             </div>
           </div>
@@ -241,12 +263,25 @@ export default function App() {
               <Grid className="w-3.5 h-3.5" />
               <span>[d] DITHER: {ditherEnabled ? 'ON' : 'OFF'}</span>
             </button>
+
+            {/* Audio Mute Toggle Button */}
+            <button
+              onClick={() => setAudioMuted((prev) => !prev)}
+              title="Toggle Headless Chromium & PulseAudio Mute (Hotkey: Alt+m / M)"
+              className={`px-3 py-1.5 rounded-md font-mono text-xs font-bold flex items-center gap-1.5 border transition-all cursor-pointer ${
+                !audioMuted
+                  ? 'bg-cyan-500/15 border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/25'
+                  : 'bg-rose-500/15 border-rose-500/40 text-rose-300 hover:bg-rose-500/25'
+              }`}
+            >
+              <span>{audioMuted ? '🔇 [Alt+m] MUTED' : '🔊 [Alt+m] AUDIO ON'}</span>
+            </button>
           </div>
 
           {/* Live Pipeline Telemetry Readout */}
           <div className="flex items-center gap-3 text-xs font-mono tabular-nums text-slate-400">
             <span className="px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-amber-300">
-              [SR: {currentUpscale.badge} | DITHER: {ditherEnabled ? 'ON' : 'OFF'}]
+              [SR: {currentUpscale.badge} | DITHER: {ditherEnabled ? 'ON' : 'OFF'}] | {audioMuted ? '🔇' : '🔊'}
             </span>
             <span className="hidden sm:inline text-slate-500">•</span>
             <span className="hidden sm:inline text-emerald-400 font-semibold">{currentUpscale.psnrGain}</span>
@@ -263,7 +298,7 @@ export default function App() {
           <div className="max-w-2xl">
             <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-orange-500/10 border border-orange-500/20 text-orange-400 text-xs font-mono mb-4">
               <Flame className="w-3.5 h-3.5 fill-current" />
-              <span>Pure-Rust Neural Super-Resolution + AMD FSR 1.0 + Bayer/Sixel Dithering</span>
+              <span>Pure-Rust Neural SR + DEC Sync Video + YouTube Ad-Shield + PulseAudio</span>
             </div>
             <h1 className="text-3xl sm:text-5xl font-extrabold tracking-tight text-white mb-4 leading-tight">
               Visual Web Browsing, <br />
@@ -273,7 +308,7 @@ export default function App() {
             </h1>
             <p className="text-slate-400 text-base sm:text-lg leading-relaxed mb-6">
               Termblitz fuses a lightweight pure-Rust HTML parser (&lt;1MB RAM) with a Headless Chromium
-              CDP hybrid rendering engine, a zero-dependency YCbCr Hybrid FSRCNN-ESPCN + AMD FSR 1.0 (EASU+RCAS) super-resolution pipeline, and 4x4 Ordered Bayer / Serpentine Floyd-Steinberg dithering.
+              CDP hybrid rendering engine, DEC Synchronized Output (`?2026h`/`?2026l`) tear-free video, YouTube Ad-Shield auto-skipping, PulseAudio media playback, and a YCbCr Hybrid FSRCNN-ESPCN + AMD FSR 1.0 super-resolution pipeline.
             </p>
             <div className="flex flex-wrap items-center gap-3">
               <button
@@ -326,7 +361,7 @@ export default function App() {
                 {simulatedMode} 100%
               </button>
 
-              <span className="text-slate-300 text-[10px] truncate mx-1.5">google.com</span>
+              <span className="text-slate-300 text-[10px] truncate mx-1.5">youtube.com</span>
 
               <div className="flex items-center gap-1 text-[10px] text-slate-300 shrink-0">
                 <button
@@ -342,6 +377,13 @@ export default function App() {
                   title="Click to toggle Dithering (Row 0 DITHER hit-zone)"
                 >
                   | DITHER: {ditherEnabled ? 'ON' : 'OFF'}]
+                </button>
+                <button
+                  onClick={() => setAudioMuted((prev) => !prev)}
+                  className="px-1 py-0.5 rounded bg-slate-950 border border-slate-700 cursor-pointer"
+                  title="Click to toggle Browser Audio Mute (Row 0 Audio hit-zone)"
+                >
+                  {audioMuted ? '🔇' : '🔊'}
                 </button>
                 <button
                   onClick={() => setAdblockEnabled(!adblockEnabled)}
@@ -421,9 +463,9 @@ export default function App() {
 
               <div className="border-t border-slate-900 pt-1.5 text-[10px] text-slate-400 flex justify-between items-center px-1">
                 <span>[m] Mode</span>
+                <span>[Alt+m] {audioMuted ? '🔇' : '🔊'}</span>
                 <span>[u] SR: {currentUpscale.shortBadge}</span>
                 <span>[d] Dither: {ditherEnabled ? 'ON' : 'OFF'}</span>
-                <span>[o /] URL</span>
               </div>
             </div>
           </div>
@@ -445,9 +487,9 @@ export default function App() {
             <div className="w-10 h-10 rounded-lg bg-orange-500/10 text-orange-400 border border-orange-500/20 flex items-center justify-center mb-3">
               <Grid className="w-5 h-5" />
             </div>
-            <h3 className="text-lg font-bold text-white mb-2">Bayer &amp; Serpentine Floyd-Steinberg</h3>
+            <h3 className="text-lg font-bold text-white mb-2">DEC Sync Video &amp; Fast-Path RCAS</h3>
             <p className="text-slate-400 text-sm leading-relaxed">
-              Eliminates TrueColor half-block (`▀`) banding via deterministic 4x4 Ordered Bayer dithering and sharpens 16-color Sixel graphics using bit-shifted serpentine error diffusion.
+              Eliminates "strips falling" video tearing via atomic DEC Synchronized Output (`\x1b[?2026h`...`\x1b[?2026l`), active &lt;video&gt; bounding-box overlay suppression, and single-pass RCAS video acceleration.
             </p>
           </div>
 
@@ -455,9 +497,9 @@ export default function App() {
             <div className="w-10 h-10 rounded-lg bg-blue-500/10 text-blue-400 border border-blue-500/20 flex items-center justify-center mb-3">
               <Shield className="w-5 h-5" />
             </div>
-            <h3 className="text-lg font-bold text-white mb-2">Sparse Skip Engine &amp; Indic Scripts</h3>
+            <h3 className="text-lg font-bold text-white mb-2">YouTube Ad-Shield &amp; PulseAudio</h3>
             <p className="text-slate-400 text-sm leading-relaxed">
-              Content-Aware Sparse Skip (`luma_range &lt; 0.015`) bypasses 75–85% of flat background pixels with 0 LSB drift, paired with full Unicode Indic combining-mark clustering.
+              Blocks YouTube ad-server telemetry via CDP, auto-skips &amp; fast-forwards `.ad-showing` video streams in 250ms, and streams unmuted HTML5 audio via Termux PulseAudio (`🔊`/`🔇`).
             </p>
           </div>
         </section>
@@ -475,29 +517,29 @@ export default function App() {
                 <div className="flex items-start gap-3">
                   <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
                   <div>
-                    <strong className="text-white block mb-0.5">Zero-Sum L4 Sub-Pixel Kernels</strong>
-                    Channel 0 sums strictly to `1.000` (identity anchor) while high-frequency channels `1..3` sum strictly to `0.000`, preventing positive DC brightness drift on dark text edges.
+                    <strong className="text-white block mb-0.5">DEC Synchronized Output (`?2026h`/`?2026l`) + Video Fast-Path</strong>
+                    Wraps every terminal frame flush in an atomic synchronized update block, suppresses stale DOM text overlays inside playing `&lt;video&gt;` rectangles, and switches to single-pass RCAS during video playback.
                   </div>
                 </div>
                 <div className="flex items-start gap-3">
                   <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
                   <div>
-                    <strong className="text-white block mb-0.5">Terminal Subpixel Grid RCAS Post-Pass</strong>
-                    Executes 5-tap Robust Contrast-Adaptive Sharpening directly on the `(cols × rows*2)` terminal subpixel grid after downsampling so 1px lobes are never averaged away.
+                    <strong className="text-white block mb-0.5">Coalesced Instant Scroll &amp; Touch Unlatching</strong>
+                    Drains all pending `crossterm` mouse/touch events per tick, resets drag state immediately on release, and executes synchronous `window.scrollBy` so scrolling stops the exact millisecond your finger stops.
                   </div>
                 </div>
                 <div className="flex items-start gap-3">
                   <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
                   <div>
-                    <strong className="text-white block mb-0.5">Content-Aware Sparse Skip (`luma_range &lt; 0.015`)</strong>
-                    Skips neural convolutions, EASU/RCAS kernels, and dithering on uniform web backgrounds for 0% color drift and 3–5x faster frame times.
+                    <strong className="text-white block mb-0.5">True YouTube Ad-Shield &amp; Auto-Skipper</strong>
+                    Combines `Network.setBlockedURLs` with a 250ms `MutationObserver` script that hides `ytd-ad-slot-renderer` banners, mutes `.ad-showing` streams, jumps `video.currentTime = video.duration`, and clicks `.ytp-ad-skip-button`.
                   </div>
                 </div>
                 <div className="flex items-start gap-3">
                   <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
                   <div>
-                    <strong className="text-white block mb-0.5">True 3-Stage Multi-Pass Cascade</strong>
-                    Pre-scales 1.5x in 12-tap EASU, synthesizes 2x sub-pixel detail in FSRCNN-ESPCN (3.0x intermediate), and finishes with Terminal-Grid RCAS.
+                    <strong className="text-white block mb-0.5">Unmuted Browser Audio &amp; Termux PulseAudio</strong>
+                    Spawns Chromium with `--autoplay-policy=no-user-gesture-required` and `--enable-features=AudioServiceOutOfProcess`, auto-starts `pulseaudio --start` on Termux, and adds `[Alt+m / M]` mute control.
                   </div>
                 </div>
               </div>
@@ -508,10 +550,10 @@ export default function App() {
               <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
                 <h2 className="text-lg font-bold text-white flex items-center gap-2">
                   <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-                  <span>Automated Pipeline Diagnostic &amp; Math Audit Suite (`src/upscale.rs`)</span>
+                  <span>Automated Pipeline &amp; Runtime Verification Suite (`cargo test`)</span>
                 </h2>
                 <span className="px-2.5 py-1 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 font-mono text-xs font-semibold tabular-nums">
-                  5 / 5 TESTS PASSING
+                  8 / 8 TESTS PASSING
                 </span>
               </div>
               <div className="overflow-x-auto">
@@ -556,11 +598,11 @@ export default function App() {
               </h2>
               <div className="font-mono text-xs bg-black/60 p-4 rounded-lg border border-slate-800 space-y-2 text-slate-300">
                 <div>├── <strong className="text-orange-400">Cargo.toml</strong> : zero-bloat pure Rust dependencies (crossterm, image, libc)</div>
-                <div>├── <strong className="text-orange-400">src/upscale.rs</strong> : YCbCr FSRCNN-ESPCN 2x neural network + AMD FSR 1.0 (EASU + RCAS) + UpscaleMode dispatcher</div>
-                <div>├── <strong className="text-orange-400">src/renderer.rs</strong> : DiffRenderer, 4x4 Bayer half-block dithering, Sixel serpentine Floyd-Steinberg, Indic grapheme clustering</div>
-                <div>├── <strong className="text-orange-400">src/engine.rs</strong> : Native HTML parser + Headless Chromium CDP worker &amp; ancestor background color resolver</div>
-                <div>├── <strong className="text-orange-400">src/input.rs</strong> : Hotkeys (u/Alt+u SR cycle, d/Alt+d dither toggle, o/ omnibox) &amp; SGR 1006 touch gestures</div>
-                <div>└── <strong className="text-orange-400">src/main.rs</strong> : CLI parser (--upscale=..., --no-dither), status bar [SR | DITHER] badge, frame loop</div>
+                <div>├── <strong className="text-orange-400">src/upscale.rs</strong> : YCbCr FSRCNN-ESPCN 2x neural network + AMD FSR 1.0 (EASU + RCAS) + video fast-path RCAS</div>
+                <div>├── <strong className="text-orange-400">src/renderer.rs</strong> : DEC Synchronized Output (`?2026h`/`?2026l`), 4x4 Bayer half-block dithering, Sixel serpentine FS</div>
+                <div>├── <strong className="text-orange-400">src/engine.rs</strong> : Coalesced `window.scrollBy`, PulseAudio + CDP audio, YouTube Ad-Shield auto-skipper, `VideoRect` detector</div>
+                <div>├── <strong className="text-orange-400">src/input.rs</strong> : Event queue draining &amp; scroll clamping, `Alt+m`/`M` audio mute, `u`/`d` SR &amp; dither hotkeys</div>
+                <div>└── <strong className="text-orange-400">src/main.rs</strong> : Video bounding-box DOM overlay suppression, status bar `[SR | DITHER] | 🔊` hit-zones</div>
               </div>
             </div>
           </div>
@@ -595,6 +637,11 @@ export default function App() {
                       <td className="py-2.5 px-4 text-slate-400">Toggles 4x4 Ordered Bayer (ANSI) &amp; Serpentine Floyd-Steinberg (Sixel)</td>
                     </tr>
                     <tr>
+                      <td className="py-2.5 px-4 text-orange-400 font-bold">Alt+m / M / Tap 🔊</td>
+                      <td className="py-2.5 px-4 text-white">Toggle Browser Audio</td>
+                      <td className="py-2.5 px-4 text-slate-400">Mutes / unmutes HTML5 &amp; YouTube &lt;video&gt;/&lt;audio&gt; playback</td>
+                    </tr>
+                    <tr>
                       <td className="py-2.5 px-4 text-orange-400 font-bold">m / Tap Badge</td>
                       <td className="py-2.5 px-4 text-white">Mode Toggle</td>
                       <td className="py-2.5 px-4 text-slate-400">Cycles Native → Hybrid → Raw</td>
@@ -606,8 +653,8 @@ export default function App() {
                     </tr>
                     <tr>
                       <td className="py-2.5 px-4 text-orange-400 font-bold">a</td>
-                      <td className="py-2.5 px-4 text-white">Toggle Adblock</td>
-                      <td className="py-2.5 px-4 text-slate-400">Toggle Brave network &amp; cosmetic shield</td>
+                      <td className="py-2.5 px-4 text-white">Toggle Ad-Shield</td>
+                      <td className="py-2.5 px-4 text-slate-400">Toggles Brave network blocker + YouTube Ad-Shield auto-skipper</td>
                     </tr>
                     <tr>
                       <td className="py-2.5 px-4 text-orange-400 font-bold">Swipe Right / [</td>
