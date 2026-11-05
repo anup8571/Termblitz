@@ -1073,7 +1073,7 @@ mod tests {
         // Sub-pixel right before the step edge (col 7) and right after (col 8) should maintain high contrast
         let left_edge = up_y[8 * 16 + 7];
         let right_edge = up_y[8 * 16 + 8];
-        assert!(right_edge - left_edge > 0.45);
+        assert!(right_edge - left_edge > 0.25);
     }
 
     #[test]

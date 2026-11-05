@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::io::{self, Write};
+use std::io;
 use crate::upscale::{apply_upscale_pipeline, UpscaleMode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1287,7 +1287,7 @@ mod tests {
 
     #[test]
     fn test_sixel_serpentine_floyd_steinberg() {
-        let mut buf = PixelBuffer::new(8, 6);
+        let mut buf = PixelBuffer::new(8, 6, Color::BLACK);
         for y in 0..6 {
             for x in 0..8 {
                 let v = ((x * 28 + y * 10) as u8).min(255);
