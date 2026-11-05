@@ -501,6 +501,10 @@ fn main() -> io::Result<()> {
                 if mode == RenderMode::Native {
                     native_engine.load_url(&curr, cols);
                 } else {
+                    if cdp_engine.get_error().is_some() {
+                        cdp_engine.stop();
+                        *cdp_engine.error_message.lock().unwrap() = None;
+                    }
                     cdp_engine.navigate(&curr, cols, rows);
                 }
             }
@@ -537,7 +541,13 @@ fn main() -> io::Result<()> {
 
         let clear_bg = match mode {
             RenderMode::Native => native_engine.body_bg,
-            RenderMode::CdpHybrid | RenderMode::CdpRaw => Color::WHITE,
+            RenderMode::CdpHybrid | RenderMode::CdpRaw => {
+                if cdp_engine.get_error().is_some() {
+                    Color::new(18, 20, 26)
+                } else {
+                    Color::WHITE
+                }
+            }
         };
         renderer.clear(clear_bg);
 
@@ -551,7 +561,7 @@ fn main() -> io::Result<()> {
             RenderMode::CdpHybrid | RenderMode::CdpRaw => {
                 let cdp_err = cdp_engine.get_error();
                 if let Some(ref err) = cdp_err {
-                    let box_w = (cols.saturating_sub(6)).min(70);
+                    let box_w = (cols.saturating_sub(4)).min(70).max(28);
                     let start_x = (cols.saturating_sub(box_w)) / 2;
                     let start_y = (rows.saturating_sub(10)) / 2;
 
@@ -559,34 +569,33 @@ fn main() -> io::Result<()> {
                     let err_fg = Color::WHITE;
                     let err_border = Color::RED;
 
-                    let horiz = "═".repeat((box_w.saturating_sub(2)) as usize);
+                    let inner_w = (box_w.saturating_sub(2)) as usize;
+                    let horiz = "═".repeat(inner_w);
+                    let blank_inner = format!("║{}║", " ".repeat(inner_w));
                     let top_border = format!("╔{}╗", horiz);
+                    let mid_border = format!("╠{}╣", horiz);
                     let bot_border = format!("╚{}╝", horiz);
 
-                    renderer.put_str(start_x, start_y, &top_border, err_border, err_bg, true, false);
-                    renderer.put_str(start_x, start_y + 1, "║ ⚠️  CDP-WEB Engine Notice", err_fg, err_bg, true, false);
-                    renderer.put_str(start_x + box_w - 1, start_y + 1, "║", err_border, err_bg, true, false);
-
-                    let mid_border = format!("╠{}╣", horiz);
-                    renderer.put_str(start_x, start_y + 2, &mid_border, err_border, err_bg, false, false);
-
-                    let lines: Vec<&str> = err.lines().collect();
-                    for (idx, eline) in lines.iter().take(4).enumerate() {
-                        let y = start_y + 3 + (idx as u16);
-                        let pad = " ".repeat((box_w as usize).saturating_sub(eline.chars().count() + 4));
-                        let content = format!("║  {}{}", eline, pad);
-                        renderer.put_str(start_x, y, &content, Color::LIGHT_GRAY, err_bg, false, false);
-                        renderer.put_str(start_x + box_w - 1, y, "║", err_border, err_bg, false, false);
+                    // Pre-fill all interior rows of the error box so there are never uncolored white gaps
+                    for by in 1..9 {
+                        renderer.put_str(start_x, start_y + by, &blank_inner, err_border, err_bg, false, false);
                     }
 
-                    let prompt_y = start_y + 7;
-                    renderer.put_str(start_x, prompt_y, "║  • Press [m] to switch to Native Mode", Color::YELLOW, err_bg, true, false);
-                    renderer.put_str(start_x + box_w - 1, prompt_y, "║", err_border, err_bg, false, false);
+                    renderer.put_str(start_x, start_y, &top_border, err_border, err_bg, true, false);
+                    let title_str = truncate_by_display_width(" ⚠️  CDP-WEB Engine Notice", inner_w);
+                    renderer.put_str(start_x + 1, start_y + 1, &title_str, err_fg, err_bg, true, false);
+                    renderer.put_str(start_x, start_y + 2, &mid_border, err_border, err_bg, false, false);
 
-                    let prompt_y2 = start_y + 8;
-                    renderer.put_str(start_x, prompt_y2, "║  • Press [r] to retry Chromium", Color::CYAN, err_bg, false, false);
-                    renderer.put_str(start_x + box_w - 1, prompt_y2, "║", err_border, err_bg, false, false);
+                    let wrapped_err = wrap_overlay_text(err, inner_w.saturating_sub(2), 4);
+                    for (idx, eline) in wrapped_err.iter().take(4).enumerate() {
+                        let y = start_y + 3 + (idx as u16);
+                        renderer.put_str(start_x + 2, y, eline, Color::LIGHT_GRAY, err_bg, false, false);
+                    }
 
+                    let prompt1 = truncate_by_display_width(" • Press [m] to switch to Native Mode", inner_w);
+                    let prompt2 = truncate_by_display_width(" • Press [r] to retry Chromium", inner_w);
+                    renderer.put_str(start_x + 1, start_y + 7, &prompt1, Color::YELLOW, err_bg, true, false);
+                    renderer.put_str(start_x + 1, start_y + 8, &prompt2, Color::CYAN, err_bg, false, false);
                     renderer.put_str(start_x, start_y + 9, &bot_border, err_border, err_bg, true, false);
                 } else {
                     let px_buf = cdp_engine.get_frame();

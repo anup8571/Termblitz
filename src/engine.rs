@@ -2009,33 +2009,27 @@ impl CdpEngine {
         self.is_loading.load(Ordering::Relaxed)
     }
 
-    /// Automatically searches for headless Chromium across Termux ($PREFIX), Debian/Linux (/usr/bin), macOS, Windows, and $PATH
+    /// Automatically searches for a runnable headless Chromium binary across Termux ($PREFIX),
+    /// Linux (/usr/bin), macOS, Windows, and $PATH, verifying that the binary can actually execute.
     pub fn find_chromium_binary() -> Option<String> {
+        let mut candidates: Vec<String> = Vec::new();
+
         if let Ok(prefix) = std::env::var("PREFIX") {
-            let termux_candidates = [
-                format!("{}/bin/chromium", prefix),
-                format!("{}/bin/chromium-browser", prefix),
-            ];
-            for p in &termux_candidates {
-                if std::path::Path::new(p).exists() {
-                    return Some(p.clone());
-                }
-            }
+            candidates.push(format!("{}/bin/chromium", prefix));
+            candidates.push(format!("{}/bin/chromium-browser", prefix));
+            candidates.push(format!("{}/lib/chromium/chromium", prefix));
         }
 
         let standard_candidates = [
-            "/usr/lib/chromium/chromium",
-            "/data/data/com.termux/files/usr/var/lib/proot-distro/containers/debian/rootfs/usr/lib/chromium/chromium",
             "/usr/bin/chromium",
             "/usr/bin/chromium-browser",
+            "/usr/lib/chromium/chromium",
             "/usr/local/bin/chromium",
             "/usr/local/bin/chromium-browser",
             "/usr/bin/google-chrome",
             "/usr/bin/google-chrome-stable",
             "/snap/bin/chromium",
             "/var/lib/flatpak/exports/bin/org.chromium.Chromium",
-            "/data/data/com.termux/files/usr/var/lib/proot-distro/containers/debian/rootfs/usr/bin/chromium",
-            "/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/debian/usr/bin/chromium",
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/Applications/Chromium.app/Contents/MacOS/Chromium",
             "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
@@ -2044,11 +2038,8 @@ impl CdpEngine {
             "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
             "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
         ];
-
         for p in &standard_candidates {
-            if std::path::Path::new(p).exists() {
-                return Some(p.to_string());
-            }
+            candidates.push((*p).to_string());
         }
 
         let binary_names = [
@@ -2067,16 +2058,38 @@ impl CdpEngine {
                 for name in &binary_names {
                     let full_path = dir.join(name);
                     if full_path.is_file() {
-                        return Some(full_path.to_string_lossy().to_string());
+                        candidates.push(full_path.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+
+        for cand in &candidates {
+            if std::path::Path::new(cand).exists() {
+                if let Ok(res) = Command::new(cand)
+                    .arg("--version")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output()
+                {
+                    if res.status.success() {
+                        return Some(cand.clone());
                     }
                 }
             }
         }
 
         for name in &binary_names {
-            if let Ok(res) = Command::new(name).arg("--version").output() {
+            if let Ok(res) = Command::new(name)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+            {
                 if res.status.success() {
-                    return Some(name.to_string());
+                    return Some((*name).to_string());
                 }
             }
         }
@@ -2084,104 +2097,147 @@ impl CdpEngine {
         None
     }
 
+    fn probe_cdp_port(port: u16) -> bool {
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+            stream.set_read_timeout(Some(Duration::from_millis(400))).ok();
+            stream.set_write_timeout(Some(Duration::from_millis(400))).ok();
+            let _ = stream.write_all(
+                b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            );
+            let mut resp = [0u8; 128];
+            if let Ok(n) = stream.read(&mut resp) {
+                if n > 0 && String::from_utf8_lossy(&resp[..n]).contains("200") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn ensure_browser_running(&mut self, window_w: u16, window_h: u16) -> Result<(), String> {
-        if self.process.is_some() {
+        // 1. If a existing DevTools server is already responsive on `self.port`, reuse it immediately
+        if Self::probe_cdp_port(self.port) {
+            self.is_connected = true;
+            *self.error_message.lock().unwrap() = None;
             return Ok(());
         }
 
-        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", self.port)) {
-            stream.set_read_timeout(Some(Duration::from_millis(300))).ok();
-            stream.set_write_timeout(Some(Duration::from_millis(300))).ok();
-            let _ = stream.write_all(b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-            let mut resp = [0u8; 64];
-            if let Ok(n) = stream.read(&mut resp) {
-                if n > 0 && String::from_utf8_lossy(&resp).contains("200") {
-                    self.is_connected = true;
-                    return Ok(());
-                }
-            }
+        // 2. If we had a previous process handle but port is not responding, clean it up so retry works
+        if self.process.is_some() {
+            self.stop();
         }
 
         let bin = match &self.chromium_bin {
             Some(b) => b.clone(),
             None => {
-                let err = "Chromium binary not found on system.\n\nInstall via: apt install -y chromium\nOr press [m] for Native Mode.".to_string();
+                let err = "Chromium binary not found on system. Install via: pkg install x11-repo && pkg install chromium".to_string();
                 *self.error_message.lock().unwrap() = Some(err.clone());
                 return Err(err);
             }
         };
 
+        // 3. Prepare a Termux-safe isolated profile directory ($TMPDIR on Android Termux, /tmp on Linux)
+        // and remove stale SingletonLock files that cause Chromium to exit immediately.
+        let tmp_base = std::env::var("TMPDIR")
+            .or_else(|_| std::env::var("TEMP"))
+            .unwrap_or_else(|_| {
+                if std::path::Path::new("/data/data/com.termux/files/usr/tmp").exists() {
+                    "/data/data/com.termux/files/usr/tmp".to_string()
+                } else {
+                    "/tmp".to_string()
+                }
+            });
+        let profile_dir = format!("{}/termblitz-cdp-profile-{}", tmp_base.trim_end_matches('/'), self.port);
+        let _ = std::fs::create_dir_all(&profile_dir);
+        for lock_name in &["SingletonLock", "SingletonCookie", "SingletonSocket"] {
+            let _ = std::fs::remove_file(format!("{}/{}", profile_dir, lock_name));
+        }
+
         let win_arg = format!("--window-size={},{}", window_w, window_h);
+        let port_arg = format!("--remote-debugging-port={}", self.port);
+        let profile_arg = format!("--user-data-dir={}", profile_dir);
 
-        let child = Command::new(&bin)
-            .arg("--headless")
-            .arg(format!("--remote-debugging-port={}", self.port))
-            .arg("--no-sandbox")
-            .arg("--no-zygote")
-            .arg("--disable-gpu")
-            .arg("--disable-software-rasterizer")
-            .arg("--disable-dev-shm-usage")
-            .arg("--disable-logging")
-            .arg("--log-level=3")
-            .arg("--silent-debugger-extension-api")
-            .arg("--disable-breakpad")
-            .arg("--disable-component-update")
-            .arg("--disable-background-networking")
-            .arg("--disable-popup-blocking")
-            .arg("--disable-features=DevicePosture,MediaStream,AudioServiceOutOfProcess,Translate,BackForwardCache")
-            .arg("--mute-audio")
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .arg("--hide-scrollbars")
-            .arg(&win_arg)
-            .arg("about:blank")
-            .env("CHROME_LOG_FILE", "/dev/null")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        // Try standard headless with isolated Termux profile first, then --headless=new, then
+        // fallback to `--single-process --in-process-gpu` for Android kernels with strict seccomp.
+        let attempts: &[&[&str]] = &[
+            &["--headless", "--disable-gpu"],
+            &["--headless=new", "--disable-gpu"],
+            &["--headless", "--single-process", "--in-process-gpu", "--disable-gpu"],
+        ];
 
-        match child {
-            Ok(c) => {
-                self.process = Some(c);
-                *self.error_message.lock().unwrap() = None;
+        let mut last_pid: Option<u32> = None;
+
+        for extra_flags in attempts {
+            for lock_name in &["SingletonLock", "SingletonCookie", "SingletonSocket"] {
+                let _ = std::fs::remove_file(format!("{}/{}", profile_dir, lock_name));
+            }
+            let mut cmd = Command::new(&bin);
+            for &flag in *extra_flags {
+                cmd.arg(flag);
+            }
+            cmd.arg(&port_arg)
+                .arg("--remote-debugging-address=127.0.0.1")
+                .arg("--remote-allow-origins=*")
+                .arg(&profile_arg)
+                .arg("--no-sandbox")
+                .arg("--disable-setuid-sandbox")
+                .arg("--no-zygote")
+                .arg("--disable-software-rasterizer")
+                .arg("--disable-dev-shm-usage")
+                .arg("--disable-logging")
+                .arg("--log-level=3")
+                .arg("--silent-debugger-extension-api")
+                .arg("--disable-breakpad")
+                .arg("--disable-crash-reporter")
+                .arg("--disable-component-update")
+                .arg("--disable-background-networking")
+                .arg("--disable-popup-blocking")
+                .arg("--disable-features=DevicePosture,MediaStream,AudioServiceOutOfProcess,Translate,BackForwardCache,VizDisplayCompositor")
+                .arg("--mute-audio")
+                .arg("--no-first-run")
+                .arg("--no-default-browser-check")
+                .arg("--hide-scrollbars")
+                .arg(&win_arg)
+                .arg("about:blank")
+                .env("CHROME_LOG_FILE", "/dev/null")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+
+            if let Ok(mut child) = cmd.spawn() {
+                last_pid = Some(child.id());
 
                 let mut ready = false;
-                for _ in 0..40 {
-                    std::thread::sleep(Duration::from_millis(150));
-                    if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", self.port)) {
-                        stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
-                        stream.set_write_timeout(Some(Duration::from_millis(500))).ok();
-                        let _ = stream.write_all(b"GET /json/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-                        let mut resp = [0u8; 64];
-                        if let Ok(n) = stream.read(&mut resp) {
-                            if n > 0 && String::from_utf8_lossy(&resp).contains("200") {
-                                ready = true;
-                                break;
-                            }
-                        }
+                for _ in 0..45 {
+                    std::thread::sleep(Duration::from_millis(120));
+                    if Self::probe_cdp_port(self.port) {
+                        ready = true;
+                        break;
+                    }
+                    // If the child process crashed/exited early, break immediately and try next launch profile
+                    if let Ok(Some(_status)) = child.try_wait() {
+                        break;
                     }
                 }
 
                 if ready {
+                    self.process = Some(child);
                     self.is_connected = true;
-                    Ok(())
+                    *self.error_message.lock().unwrap() = None;
+                    return Ok(());
                 } else {
-                    let err = format!(
-                        "Chromium started (PID: {:?}) but failed to bind port {}",
-                        self.process.as_ref().map(|p| p.id()),
-                        self.port
-                    );
-                    *self.error_message.lock().unwrap() = Some(err.clone());
-                    Err(err)
+                    let _ = child.kill();
+                    let _ = child.wait();
                 }
             }
-            Err(e) => {
-                let err = format!("Failed to spawn {}: {}", bin, e);
-                *self.error_message.lock().unwrap() = Some(err.clone());
-                Err(err)
-            }
         }
+
+        let err = format!(
+            "Chromium started (PID: {:?}) but failed to bind port {}",
+            last_pid, self.port
+        );
+        *self.error_message.lock().unwrap() = Some(err.clone());
+        Err(err)
     }
 
     pub fn navigate(&mut self, url: &str, cols: u16, rows: u16) {
