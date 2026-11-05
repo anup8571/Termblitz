@@ -62,6 +62,8 @@ pub fn resolve_input_to_url(raw_input: &str) -> String {
 pub struct InputHandler {
     pub is_entering_url: bool,
     pub url_input_buffer: String,
+    pub sr_hit_range: Option<(u16, u16)>,
+    pub dither_hit_range: Option<(u16, u16)>,
     drag_start: Option<(u16, u16)>,
     last_drag_y: Option<u16>,
     has_dragged: bool,
@@ -72,10 +74,17 @@ impl InputHandler {
         Self {
             is_entering_url: false,
             url_input_buffer: String::new(),
+            sr_hit_range: None,
+            dither_hit_range: None,
             drag_start: None,
             last_drag_y: None,
             has_dragged: false,
         }
+    }
+
+    pub fn set_status_hit_zones(&mut self, sr_range: Option<(u16, u16)>, dither_range: Option<(u16, u16)>) {
+        self.sr_hit_range = sr_range;
+        self.dither_hit_range = dither_range;
     }
 
     pub fn poll_action(&mut self, timeout: Duration) -> AppAction {
@@ -217,11 +226,19 @@ impl InputHandler {
                         if mouse.row == 0 {
                             if mouse.column < 14 {
                                 return AppAction::ToggleMode;
-                            } else {
-                                self.is_entering_url = true;
-                                self.url_input_buffer.clear();
-                                return AppAction::FocusUrlBar;
+                            } else if let Some((sr_start, sr_end)) = self.sr_hit_range {
+                                if mouse.column >= sr_start && mouse.column < sr_end {
+                                    return AppAction::CycleUpscale;
+                                }
                             }
+                            if let Some((d_start, d_end)) = self.dither_hit_range {
+                                if mouse.column >= d_start && mouse.column < d_end {
+                                    return AppAction::ToggleDither;
+                                }
+                            }
+                            self.is_entering_url = true;
+                            self.url_input_buffer.clear();
+                            return AppAction::FocusUrlBar;
                         } else {
                             return AppAction::Click(mouse.column, mouse.row);
                         }

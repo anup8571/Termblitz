@@ -762,20 +762,21 @@ fn main() -> io::Result<()> {
                 format!("{:0.0}fps", fps)
             };
             let dither_state = if renderer.dithering_enabled { "ON" } else { "OFF" };
-            let sr_badge = format!(
-                "[SR: {} | DITHER: {}]",
-                renderer.upscale_mode.badge_name(),
-                dither_state
-            );
-            let sr_badge_compact = format!(
-                "[SR:{}|D:{}]",
-                renderer.upscale_mode.short_name(),
-                dither_state
-            );
+            let sr_part = if is_compact {
+                format!("[SR:{}", renderer.upscale_mode.short_name())
+            } else {
+                format!("[SR: {}", renderer.upscale_mode.badge_name())
+            };
+            let dither_part = if is_compact {
+                format!("|D:{}]", dither_state)
+            } else {
+                format!(" | DITHER: {}]", dither_state)
+            };
+            let sr_badge = format!("{}{}", sr_part, dither_part);
             let metrics = if is_compact {
                 format!(
                     " {}|{}|{:0.0}M|{}% ",
-                    sr_badge_compact, shield_tag, mem, scroll_pct
+                    sr_badge, shield_tag, mem, scroll_pct
                 )
             } else {
                 format!(
@@ -799,7 +800,16 @@ fn main() -> io::Result<()> {
             }
 
             if !has_active_banner {
+                let sr_col_start = metrics_x + 1;
+                let sr_col_end = sr_col_start + (sr_part.len() as u16);
+                let dither_col_end = sr_col_end + (dither_part.len() as u16);
+                input_handler.set_status_hit_zones(
+                    Some((sr_col_start, sr_col_end)),
+                    Some((sr_col_end, dither_col_end)),
+                );
                 renderer.put_str(metrics_x, 0, &metrics, Color::LIGHT_GRAY, bar_bg, false, false);
+            } else {
+                input_handler.set_status_hit_zones(None, None);
             }
         }
 

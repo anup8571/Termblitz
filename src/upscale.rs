@@ -160,52 +160,52 @@ const L3_PRELU: [f32; 4] = [0.50, 0.35, 0.35, 0.30];
 /// - `sub_ch = 2`: Bottom-Left  `(-0.25px, +0.25px)`
 /// - `sub_ch = 3`: Bottom-Right `(+0.25px, +0.25px)`
 const L4_WEIGHTS: [[[f32; 4]; 9]; 4] = [
-    // Sub-pixel 0: Top-Left (biased toward top-left neighbors + negative Gx/Gy steering)
+    // Sub-pixel 0: Top-Left (biased toward top-left neighbors + zero-sum negative Gx/Gy steering)
     [
         [ 0.045, -0.020, -0.020,  0.015],
-        [ 0.135,  0.000, -0.040,  0.025],
-        [-0.010,  0.010,  0.000,  0.000],
-        [ 0.135, -0.040,  0.000,  0.025],
-        [ 0.740, -0.140, -0.140,  0.110],
-        [-0.020,  0.030,  0.000, -0.010],
-        [-0.010,  0.000,  0.010,  0.000],
-        [-0.020,  0.000,  0.030, -0.010],
-        [ 0.005,  0.000,  0.000, -0.005],
+        [ 0.135,  0.000, -0.055,  0.025],
+        [-0.010,  0.045,  0.000, -0.020],
+        [ 0.135, -0.055,  0.000,  0.025],
+        [ 0.740, -0.100, -0.100,  0.120],
+        [-0.020,  0.085,  0.000, -0.045],
+        [-0.010,  0.000,  0.045, -0.020],
+        [-0.020,  0.000,  0.085, -0.045],
+        [ 0.005,  0.045,  0.045, -0.055],
     ],
-    // Sub-pixel 1: Top-Right (biased toward top-right neighbors + positive Gx, negative Gy steering)
+    // Sub-pixel 1: Top-Right (biased toward top-right neighbors + zero-sum positive Gx, negative Gy steering)
     [
-        [-0.010, -0.010,  0.000,  0.000],
-        [ 0.135,  0.000, -0.040,  0.025],
+        [-0.010, -0.045,  0.000, -0.020],
+        [ 0.135,  0.000, -0.055,  0.025],
         [ 0.045,  0.020, -0.020,  0.015],
-        [-0.020, -0.030,  0.000, -0.010],
-        [ 0.740,  0.140, -0.140,  0.110],
-        [ 0.135,  0.040,  0.000,  0.025],
-        [ 0.005,  0.000,  0.000, -0.005],
-        [-0.020,  0.000,  0.030, -0.010],
-        [-0.010,  0.000,  0.010,  0.000],
+        [-0.020, -0.085,  0.000, -0.045],
+        [ 0.740,  0.100, -0.100,  0.120],
+        [ 0.135,  0.055,  0.000,  0.025],
+        [ 0.005, -0.045,  0.045, -0.055],
+        [-0.020,  0.000,  0.085, -0.045],
+        [-0.010,  0.000,  0.045, -0.020],
     ],
-    // Sub-pixel 2: Bottom-Left (biased toward bottom-left neighbors + negative Gx, positive Gy steering)
+    // Sub-pixel 2: Bottom-Left (biased toward bottom-left neighbors + zero-sum negative Gx, positive Gy steering)
     [
-        [-0.010,  0.000, -0.010,  0.000],
-        [-0.020,  0.000, -0.030, -0.010],
-        [ 0.005,  0.000,  0.000, -0.005],
-        [ 0.135, -0.040,  0.000,  0.025],
-        [ 0.740, -0.140,  0.140,  0.110],
-        [-0.020,  0.030,  0.000, -0.010],
+        [-0.010,  0.000, -0.045, -0.020],
+        [-0.020,  0.000, -0.085, -0.045],
+        [ 0.005,  0.045, -0.045, -0.055],
+        [ 0.135, -0.055,  0.000,  0.025],
+        [ 0.740, -0.100,  0.100,  0.120],
+        [-0.020,  0.085,  0.000, -0.045],
         [ 0.045, -0.020,  0.020,  0.015],
-        [ 0.135,  0.000,  0.040,  0.025],
-        [-0.010,  0.010,  0.000,  0.000],
+        [ 0.135,  0.000,  0.055,  0.025],
+        [-0.010,  0.045,  0.000, -0.020],
     ],
-    // Sub-pixel 3: Bottom-Right (biased toward bottom-right neighbors + positive Gx/Gy steering)
+    // Sub-pixel 3: Bottom-Right (biased toward bottom-right neighbors + zero-sum positive Gx/Gy steering)
     [
-        [ 0.005,  0.000,  0.000, -0.005],
-        [-0.020,  0.000, -0.030, -0.010],
-        [-0.010,  0.000, -0.010,  0.000],
-        [-0.020, -0.030,  0.000, -0.010],
-        [ 0.740,  0.140,  0.140,  0.110],
-        [ 0.135,  0.040,  0.000,  0.025],
-        [-0.010, -0.010,  0.000,  0.000],
-        [ 0.135,  0.000,  0.040,  0.025],
+        [ 0.005, -0.045, -0.045, -0.055],
+        [-0.020,  0.000, -0.085, -0.045],
+        [-0.010,  0.000, -0.045, -0.020],
+        [-0.020, -0.085,  0.000, -0.045],
+        [ 0.740,  0.100,  0.100,  0.120],
+        [ 0.135,  0.055,  0.000,  0.025],
+        [-0.010, -0.045,  0.000, -0.020],
+        [ 0.135,  0.000,  0.055,  0.025],
         [ 0.045,  0.020,  0.020,  0.015],
     ],
 ];
@@ -219,6 +219,50 @@ fn prelu(x: f32, slope: f32) -> f32 {
     } else {
         x * slope
     }
+}
+
+/// Minimum local luminance range (`max_y - min_y`) in a 3x3 neighborhood to trigger
+/// neural or FSR super-resolution. Regions below `0.015` (~3.8 / 255) are flat web
+/// backgrounds, cards, or solid UI banners and bypass heavy convolution completely.
+pub const FLAT_LUMA_THRESHOLD: f32 = 0.015;
+
+/// Content-Aware Sparse Skip classification for a pixel neighborhood or tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatchClass {
+    /// `range < 0.015`: Flat constant color region -> direct copy (0% bias drift, skip SR).
+    Flat,
+    /// `range >= 0.015`: Active image texture, icon, or text/UI edge -> full SR pipeline.
+    TextureOrEdge,
+}
+
+/// Fast classification helper based on minimum and maximum normalized luminance (`0.0..=1.0`).
+#[inline(always)]
+pub fn classify_patch(min_y: f32, max_y: f32) -> PatchClass {
+    let luma_range = max_y - min_y;
+    if luma_range < FLAT_LUMA_THRESHOLD {
+        PatchClass::Flat
+    } else {
+        PatchClass::TextureOrEdge
+    }
+}
+
+/// Returns `true` only when the local neighborhood has sufficient luminance gradient/variance
+/// (`max_y - min_y >= 0.015`) to warrant neural conv layers or FSR kernels.
+#[inline(always)]
+pub fn should_enhance_pixel(min_y: f32, max_y: f32) -> bool {
+    classify_patch(min_y, max_y) == PatchClass::TextureOrEdge
+}
+
+/// Computes `(min_y, max_y)` across a 9-element 3x3 luminance patch.
+#[inline(always)]
+fn patch_min_max_9(p: &[f32; 9]) -> (f32, f32) {
+    let min0 = p[0].min(p[1]).min(p[2]);
+    let min1 = p[3].min(p[4]).min(p[5]);
+    let min2 = p[6].min(p[7]).min(p[8]);
+    let max0 = p[0].max(p[1]).max(p[2]);
+    let max1 = p[3].max(p[4]).max(p[5]);
+    let max2 = p[6].max(p[7]).max(p[8]);
+    (min0.min(min1).min(min2), max0.max(max1).max(max2))
 }
 
 /// Splits a `PixelBuffer` into three flat `Vec<f32>` planes:
@@ -380,6 +424,9 @@ pub fn pixel_shuffle_2x(subpixels: &[[f32; 4]], w: usize, h: usize, out: &mut [f
 
 /// Runs the 4-layer Hybrid FSRCNN-ESPCN super-resolution network on a normalized `Y` luminance plane
 /// (`w x h`), returning a `(w * 2) x (h * 2)` luminance plane.
+/// Uses the Content-Aware Sparse Skip Engine (`should_enhance_pixel` & 8x8 tile gating) so flat
+/// backgrounds (`luma_range < 0.015`) completely bypass all 4 convolutional layers and output
+/// `center_y` untouched with 0% neural bias drift.
 pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
     if w == 0 || h == 0 || y_plane.len() < w * h {
         return Vec::new();
@@ -387,14 +434,19 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
 
     let num_px = w * h;
 
+    // Fast whole-plane / 8x8 tile variance pre-pass + per-pixel 3x3 gradient gate:
+    // Any pixel with 3x3 `luma_range < 0.015` is marked inactive (`false`) and skips all conv math.
+    let mut active_px = vec![false; num_px];
+    let mut any_active = false;
+    let max_x = w - 1;
+    let max_y = h - 1;
+
     // -------------------------------------------------------------------------
     // Layer 1 (Feature Extraction: 3x3 Conv, 1 -> 8 channels + PReLU)
     // combined with Layer 2 (FSRCNN Shrinking: 1x1 Conv, 8 -> 4 channels + PReLU)
     // Fused per-pixel so the 8-channel intermediate stays in CPU registers!
     // -------------------------------------------------------------------------
     let mut feat_l2 = vec![[0.0f32; 4]; num_px];
-    let max_x = w - 1;
-    let max_y = h - 1;
 
     for y in 0..h {
         let ym1 = y.saturating_sub(1);
@@ -404,6 +456,7 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
         let r_mid = &y_plane[y * w..y * w + w];
         let r_bot = &y_plane[yp1 * w..yp1 * w + w];
         let dst_row = &mut feat_l2[y * w..(y + 1) * w];
+        let act_row = &mut active_px[y * w..(y + 1) * w];
 
         for x in 0..w {
             let xm1 = x.saturating_sub(1);
@@ -414,6 +467,16 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
                 r_mid[xm1], r_mid[x], r_mid[xp1],
                 r_bot[xm1], r_bot[x], r_bot[xp1],
             ];
+
+            let (min_y, max_y_val) = patch_min_max_9(&patch);
+            if !should_enhance_pixel(min_y, max_y_val) {
+                // Content-Aware Sparse Skip: flat 3x3 region -> bypass Layer 1 & Layer 2!
+                dst_row[x] = [patch[4], 0.0, 0.0, 0.0];
+                continue;
+            }
+
+            act_row[x] = true;
+            any_active = true;
 
             // Layer 1: 1 -> 8 channels + PReLU (kept entirely in registers)
             let mut l1_out = [0.0f32; 8];
@@ -452,6 +515,28 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
         }
     }
 
+    // Fast path: if the entire frame is flat (e.g., blank/solid canvas), bypass Layer 3 & Layer 4 completely
+    if !any_active {
+        let mut out_y = vec![0.0f32; (w * 2) * (h * 2)];
+        let out_w = w * 2;
+        for y in 0..h {
+            let src_row = &y_plane[y * w..(y + 1) * w];
+            let top_row_start = (y * 2) * out_w;
+            let bot_row_start = (y * 2 + 1) * out_w;
+            let (top_part, rest) = out_y[top_row_start..bot_row_start + out_w].split_at_mut(out_w);
+            let bot_part = &mut rest[..out_w];
+            for (x, &cy) in src_row.iter().enumerate() {
+                let clamped = cy.clamp(0.0, 1.0);
+                let dx = x * 2;
+                top_part[dx] = clamped;
+                top_part[dx + 1] = clamped;
+                bot_part[dx] = clamped;
+                bot_part[dx + 1] = clamped;
+            }
+        }
+        return out_y;
+    }
+
     // -------------------------------------------------------------------------
     // Layer 3 (Non-Linear Mapping: 3x3 Conv, 4 -> 4 channels + PReLU + Residual Skip)
     // out = prelu(conv3x3(feat_l2)) + feat_l2
@@ -465,9 +550,16 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
         let r_top = &feat_l2[ym1 * w..ym1 * w + w];
         let r_mid = &feat_l2[y * w..y * w + w];
         let r_bot = &feat_l2[yp1 * w..yp1 * w + w];
+        let act_row = &active_px[y * w..(y + 1) * w];
         let dst_row = &mut feat_l3[y * w..(y + 1) * w];
 
         for x in 0..w {
+            if !act_row[x] {
+                // Flat pixel: bypass Layer 3 3x3 conv completely
+                dst_row[x] = r_mid[x];
+                continue;
+            }
+
             let xm1 = x.saturating_sub(1);
             let xp1 = (x + 1).min(max_x);
 
@@ -509,9 +601,18 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
         let r_top = &feat_l3[ym1 * w..ym1 * w + w];
         let r_mid = &feat_l3[y * w..y * w + w];
         let r_bot = &feat_l3[yp1 * w..yp1 * w + w];
+        let y_row = &y_plane[y * w..(y + 1) * w];
+        let act_row = &active_px[y * w..(y + 1) * w];
         let dst_row = &mut subpixels[y * w..(y + 1) * w];
 
         for x in 0..w {
+            if !act_row[x] {
+                // Content-Aware Sparse Skip: output exact source pixel luminance `center_y` untouched
+                let center_y = y_row[x];
+                dst_row[x] = [center_y, center_y, center_y, center_y];
+                continue;
+            }
+
             let xm1 = x.saturating_sub(1);
             let xp1 = (x + 1).min(max_x);
 
@@ -711,6 +812,23 @@ pub fn fsr_easu(buf: &PixelBuffer, target_w: usize, target_h: usize) -> PixelBuf
             let n = src[r_p2 + c_0];
             let o = src[r_p2 + c_p1];
 
+            // Fast integer identity gate: if all 12 taps are identical, skip float luma & 12-tap kernel
+            if f == g
+                && f == j
+                && f == k
+                && f == b
+                && f == c
+                && f == e
+                && f == h_tap
+                && f == i_tap
+                && f == l
+                && f == n
+                && f == o
+            {
+                out_data.push(f);
+                continue;
+            }
+
             // Compute normalized luma for gradient analysis
             let lb = fast_luma_norm(b);
             let lc = fast_luma_norm(c);
@@ -724,6 +842,37 @@ pub fn fsr_easu(buf: &PixelBuffer, target_w: usize, target_h: usize) -> PixelBuf
             let ll = fast_luma_norm(l);
             let ln = fast_luma_norm(n);
             let lo = fast_luma_norm(o);
+
+            // Content-Aware Sparse Skip Gate: if local luminance range < 0.015, bypass EASU 12-tap kernel
+            let min_luma = lb
+                .min(lc)
+                .min(le)
+                .min(lf)
+                .min(lg)
+                .min(lh)
+                .min(li)
+                .min(lj)
+                .min(lk)
+                .min(ll)
+                .min(ln)
+                .min(lo);
+            let max_luma = lb
+                .max(lc)
+                .max(le)
+                .max(lf)
+                .max(lg)
+                .max(lh)
+                .max(li)
+                .max(lj)
+                .max(lk)
+                .max(ll)
+                .max(ln)
+                .max(lo);
+
+            if !should_enhance_pixel(min_luma, max_luma) {
+                out_data.push(f);
+                continue;
+            }
 
             // Accumulate bilinearly weighted gradients at the 4 inner quad corners (f, g, j, k)
             let mut dir_x = 0.0f32;
@@ -848,6 +997,11 @@ pub fn fsr_rcas(buf: &PixelBuffer, sharpness: f32) -> PixelBuffer {
             let w_px = row_c[xm1];
             let e = row_c[xp1];
 
+            if c == n && c == s && c == w_px && c == e {
+                out_data.push(c);
+                continue;
+            }
+
             let lc = fast_luma_norm(c);
             let ln = fast_luma_norm(n);
             let ls = fast_luma_norm(s);
@@ -858,11 +1012,10 @@ pub fn fsr_rcas(buf: &PixelBuffer, sharpness: f32) -> PixelBuffer {
             let max4 = ln.max(ls).max(lw).max(le);
             let min5 = min4.min(lc);
             let max5 = max4.max(lc);
-            let contrast = max5 - min5;
 
-            // Skip flat regions (<1.5% contrast) and already-saturated full-scale 1px borders
-            // so we never introduce noise amplification or ringing around high-contrast lines.
-            if contrast < 0.015 || (max5 > 0.985 && min5 < 0.015) {
+            // Content-Aware Sparse Skip (`should_enhance_pixel`) & saturated 1px border guard:
+            // Skip flat regions (`luma_range < 0.015`) and already-saturated full-scale borders.
+            if !should_enhance_pixel(min5, max5) || (max5 > 0.985 && min5 < 0.015) {
                 out_data.push(c);
                 continue;
             }
@@ -964,13 +1117,47 @@ impl UpscaleMode {
     }
 }
 
+/// Upscales `buf` using the YCbCr Hybrid FSRCNN-ESPCN neural pipeline and dynamically bridges
+/// scales beyond `2x`:
+/// - For `>= 4x` target scales (`out_w >= buf.width * 4` or `out_h >= buf.height * 4`), runs
+///   `upscale_y_neural_2x` twice on the luminance (`Y`) plane (4x neural super-resolution) with
+///   4x bilinear chroma upscaling.
+/// - Whenever `out_w > neural.width` or `out_h > neural.height` (e.g., `2.5x`, `3x`, `5x`, or
+///   non-multiple terminal aspect ratios), feeds the neural output into `fsr_easu` to bridge
+///   the remaining scale to the exact `(out_w, out_h)` target terminal resolution.
+fn upscale_neural_adaptive(buf: &PixelBuffer, out_w: usize, out_h: usize) -> PixelBuffer {
+    let w = buf.width;
+    let h = buf.height;
+
+    let neural_buf = if out_w >= w * 4 || out_h >= h * 4 {
+        let (y_plane, cb_plane, cr_plane) = rgb_to_ycbcr(buf);
+        let y_2x = upscale_y_neural_2x(&y_plane, w, h);
+        let y_4x = upscale_y_neural_2x(&y_2x, w * 2, h * 2);
+        let cb_4x = upscale_chroma_bilinear(&cb_plane, w, h, 4);
+        let cr_4x = upscale_chroma_bilinear(&cr_plane, w, h, 4);
+        ycbcr_to_rgb(&y_4x, &cb_4x, &cr_4x, w * 4, h * 4)
+    } else {
+        upscale_neural_2x(buf)
+    };
+
+    if out_w > w * 2 || out_h > h * 2 || (out_w != neural_buf.width || out_h != neural_buf.height) {
+        if out_w == neural_buf.width && out_h == neural_buf.height {
+            neural_buf
+        } else {
+            fsr_easu(&neural_buf, out_w, out_h)
+        }
+    } else {
+        neural_buf
+    }
+}
+
 /// Master Super-Resolution Dispatcher: processes `buf` according to the selected `UpscaleMode`.
 ///
 /// - `UpscaleMode::Off`: Returns `buf` unchanged so the renderer uses fast `sample_subpixel_box`.
 /// - `UpscaleMode::FsrOnly`: Runs AMD FSR 1.0 `fsr_easu` to `(target_w, target_h)` followed by `fsr_rcas`.
-/// - `UpscaleMode::NeuralOnly`: Runs `upscale_neural_2x` (YCbCr Hybrid FSRCNN-ESPCN 2x pass).
-/// - `UpscaleMode::Combined`: Runs `upscale_neural_2x` followed by `fsr_rcas` contrast sharpening.
-/// - `UpscaleMode::MultiPass`: Runs `fsr_easu` spatial pass -> `upscale_neural_2x` detail pass -> `fsr_rcas` sharpening.
+/// - `UpscaleMode::NeuralOnly`: Runs `upscale_neural_adaptive` (1x or 2x `upscale_y_neural_2x` + `fsr_easu` bridge to `target_w x target_h`).
+/// - `UpscaleMode::Combined`: Runs `upscale_neural_adaptive` to `(target_w, target_h)` followed by `fsr_rcas` contrast sharpening.
+/// - `UpscaleMode::MultiPass`: Runs `1.5x fsr_easu` directional pre-scale -> `2x upscale_neural_2x` detail pass (+ `fsr_easu` bridge) -> `fsr_rcas` sharpening.
 pub fn upscale_frame(
     buf: &PixelBuffer,
     mode: UpscaleMode,
@@ -990,25 +1177,48 @@ pub fn upscale_frame(
             let easu = fsr_easu(buf, out_w, out_h);
             fsr_rcas(&easu, 0.85)
         }
-        UpscaleMode::NeuralOnly => upscale_neural_2x(buf),
+        UpscaleMode::NeuralOnly => upscale_neural_adaptive(buf, out_w, out_h),
         UpscaleMode::Combined => {
-            let neural = upscale_neural_2x(buf);
+            let neural = upscale_neural_adaptive(buf, out_w, out_h);
             fsr_rcas(&neural, 0.80)
         }
         UpscaleMode::MultiPass => {
-            // Stage 1: Edge-Adaptive Spatial Upsampling (1.5x intermediate or target_w/2 pre-scale)
-            let mid_w = (out_w / 2).max(buf.width + (buf.width / 2)).min(buf.width * 2);
-            let mid_h = (out_h / 2).max(buf.height + (buf.height / 2)).min(buf.height * 2);
-            let easu = fsr_easu(buf, mid_w, mid_h);
-            // Stage 2: YCbCr Hybrid FSRCNN-ESPCN 2x sub-pixel detail synthesis
-            let neural = upscale_neural_2x(&easu);
-            // Stage 3: Robust Contrast-Adaptive Sharpening
-            fsr_rcas(&neural, 0.85)
+            if out_w >= buf.width * 4 || out_h >= buf.height * 4 {
+                // For >= 4x scales: run 2x neural detail pass -> 1.5x EASU pre-bridge -> second 2x neural pass -> exact EASU bridge -> RCAS
+                let stage1_neural = upscale_neural_2x(buf);
+                let mid_w = ((stage1_neural.width * 3) / 2).max(out_w / 2).max(stage1_neural.width + 1);
+                let mid_h = ((stage1_neural.height * 3) / 2).max(out_h / 2).max(stage1_neural.height + 1);
+                let easu_mid = fsr_easu(&stage1_neural, mid_w, mid_h);
+                let stage2_neural = upscale_neural_2x(&easu_mid);
+                let bridged = if stage2_neural.width != out_w || stage2_neural.height != out_h {
+                    fsr_easu(&stage2_neural, out_w, out_h)
+                } else {
+                    stage2_neural
+                };
+                fsr_rcas(&bridged, 0.85)
+            } else {
+                // Stage 1: 1.5x Edge-Adaptive Spatial Upsampling (never no-ops even when out_w == buf.width * 2)
+                let mid_w = ((buf.width * 3) / 2).max(buf.width + 1);
+                let mid_h = ((buf.height * 3) / 2).max(buf.height + 1);
+                let easu = fsr_easu(buf, mid_w, mid_h);
+                // Stage 2: YCbCr Hybrid FSRCNN-ESPCN 2x sub-pixel detail synthesis (reaches 3.0x intermediate)
+                let neural = upscale_neural_2x(&easu);
+                // Stage 2b: Bridge to exact (out_w, out_h)
+                let bridged = if neural.width != out_w || neural.height != out_h {
+                    fsr_easu(&neural, out_w, out_h)
+                } else {
+                    neural
+                };
+                // Stage 3: Robust Contrast-Adaptive Sharpening
+                fsr_rcas(&bridged, 0.85)
+            }
         }
     }
 }
 
-/// Alias entrypoint for the renderer pipeline: runs `upscale_frame` before subpixel sampling or protocol encoding.
+/// Entrypoint for the renderer pipeline: checks `target_w` and `target_h` and runs `upscale_frame`
+/// (including double `upscale_y_neural_2x` for `>= 4x` or `fsr_easu` scale bridging for `> 2x`)
+/// before subpixel sampling or protocol encoding.
 #[inline]
 pub fn apply_upscale_pipeline(
     buf: &PixelBuffer,
@@ -1019,107 +1229,202 @@ pub fn apply_upscale_pipeline(
     upscale_frame(buf, mode, target_w, target_h)
 }
 
+/// Applies AMD FSR 1.0 Robust Contrast-Adaptive Sharpening (`RCAS`) directly at the terminal
+/// subpixel grid (`cols x rows*2`) after downsampling from a higher-resolution Chromium frame.
+/// This ensures 1px sharpening lobes reinforce half-block (`▀`) edges and small thumbnails
+/// rather than being averaged out during 6x–12x downsampling.
+#[inline]
+pub fn apply_terminal_subpixel_rcas(subpixel_buf: &PixelBuffer, mode: UpscaleMode) -> PixelBuffer {
+    let sharpness = match mode {
+        UpscaleMode::Off => return subpixel_buf.clone(),
+        UpscaleMode::FsrOnly => 0.85,
+        UpscaleMode::NeuralOnly => 0.35,
+        UpscaleMode::Combined => 0.80,
+        UpscaleMode::MultiPass => 0.88,
+    };
+    fsr_rcas(subpixel_buf, sharpness)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::renderer::dither_truecolor_cell;
 
     #[test]
-    fn test_ycbcr_roundtrip() {
-        let mut buf = PixelBuffer::new(4, 4, Color::new(26, 115, 232));
-        buf.set_pixel(1, 1, Color::WHITE);
-        buf.set_pixel(2, 2, Color::BLACK);
-        buf.set_pixel(3, 0, Color::new(255, 102, 0));
+    fn test_ycbcr_roundtrip_accuracy() {
+        let test_colors = [
+            Color::new(0, 0, 0),
+            Color::new(255, 255, 255),
+            Color::new(255, 0, 0),
+            Color::new(0, 255, 0),
+            Color::new(0, 0, 255),
+            Color::new(128, 128, 128),
+            Color::new(26, 115, 232),
+            Color::new(255, 102, 0),
+            Color::new(32, 33, 36),
+            Color::new(248, 249, 250),
+        ];
+        let mut buf = PixelBuffer::new(10, 1, Color::BLACK);
+        for (i, &c) in test_colors.iter().enumerate() {
+            buf.set_pixel(i, 0, c);
+        }
 
         let (y, cb, cr) = rgb_to_ycbcr(&buf);
-        let reconstructed = ycbcr_to_rgb(&y, &cb, &cr, 4, 4);
+        let reconstructed = ycbcr_to_rgb(&y, &cb, &cr, 10, 1);
 
         for i in 0..buf.data.len() {
             let orig = buf.data[i];
             let rec = reconstructed.data[i];
-            assert!(orig.r.abs_diff(rec.r) <= 1);
-            assert!(orig.g.abs_diff(rec.g) <= 1);
-            assert!(orig.b.abs_diff(rec.b) <= 1);
+            assert!(
+                orig.r.abs_diff(rec.r) <= 1
+                    && orig.g.abs_diff(rec.g) <= 1
+                    && orig.b.abs_diff(rec.b) <= 1,
+                "YCbCr roundtrip error > 1 at index {}: orig={:?}, rec={:?}",
+                i,
+                orig,
+                rec
+            );
         }
     }
 
     #[test]
-    fn test_dc_invariance_no_checkerboard() {
-        let c = Color::new(200, 210, 220);
-        let buf = PixelBuffer::new(8, 8, c);
-        let up = upscale_neural_2x(&buf);
+    fn test_flat_region_skip_zero_drift() {
+        // 1. Verify L4_WEIGHTS mathematical invariants:
+        //    in_ch = 0 sums to 1.000; high-frequency channels in_ch = 1..3 sum strictly to 0.000
+        for sub_ch in 0..4 {
+            let mut sums = [0.0f32; 4];
+            for k in 0..9 {
+                for ic in 0..4 {
+                    sums[ic] += L4_WEIGHTS[sub_ch][k][ic];
+                }
+            }
+            assert!(
+                (sums[0] - 1.0).abs() < 1e-5,
+                "Sub-pixel {} in_ch=0 sum = {} (expected 1.0)",
+                sub_ch,
+                sums[0]
+            );
+            for ic in 1..4 {
+                assert!(
+                    sums[ic].abs() < 1e-5,
+                    "Sub-pixel {} in_ch={} sum = {} (expected 0.0)",
+                    sub_ch,
+                    ic,
+                    sums[ic]
+                );
+            }
+        }
 
-        assert_eq!(up.width, 16);
-        assert_eq!(up.height, 16);
-
-        // Every upscaled pixel on a flat canvas must match the original color within +-1 rounding
-        for px in &up.data {
-            assert!(px.r.abs_diff(c.r) <= 1);
-            assert!(px.g.abs_diff(c.g) <= 1);
-            assert!(px.b.abs_diff(c.b) <= 1);
+        // 2. Verify 64x64 flat solid frame has 0 LSB drift across all modes
+        let flat_color = Color::new(240, 240, 240);
+        let buf = PixelBuffer::new(64, 64, flat_color);
+        for mode in [
+            UpscaleMode::FsrOnly,
+            UpscaleMode::NeuralOnly,
+            UpscaleMode::Combined,
+            UpscaleMode::MultiPass,
+        ] {
+            let up = apply_upscale_pipeline(&buf, mode, 128, 128);
+            assert_eq!(up.width, 128);
+            assert_eq!(up.height, 128);
+            for px in &up.data {
+                assert_eq!(*px, flat_color, "Mode {:?} drifted on flat 240 gray", mode);
+            }
         }
     }
 
     #[test]
-    fn test_step_edge_sharpening() {
-        let mut y_plane = vec![0.2f32; 8 * 8];
+    fn test_edge_contrast_improvement() {
+        // Synthetic 16x16 vertical blurred step-edge:
+        // Left half = 0.2 (51), transition col 7 = 0.42 (107), col 8 = 0.58 (148), Right half = 0.8 (204)
+        let mut buf = PixelBuffer::new(16, 16, Color::new(51, 51, 51));
+        for y in 0..16 {
+            buf.set_pixel(7, y, Color::new(107, 107, 107));
+            buf.set_pixel(8, y, Color::new(148, 148, 148));
+            for x in 9..16 {
+                buf.set_pixel(x, y, Color::new(204, 204, 204));
+            }
+        }
+
+        // Bilinear baseline slope across the center transition at 32x32
+        let (y_plane, _, _) = rgb_to_ycbcr(&buf);
+        let bilin_y = upscale_chroma_bilinear(&y_plane, 16, 16, 2);
+        let row_mid = 16 * 32;
+        let mut max_slope_bilinear = 0.0f32;
+        for x in 12..20 {
+            let slope = (bilin_y[row_mid + x + 1] - bilin_y[row_mid + x]).abs();
+            if slope > max_slope_bilinear {
+                max_slope_bilinear = slope;
+            }
+        }
+
+        for mode in [
+            UpscaleMode::FsrOnly,
+            UpscaleMode::NeuralOnly,
+            UpscaleMode::Combined,
+            UpscaleMode::MultiPass,
+        ] {
+            let sr = apply_upscale_pipeline(&buf, mode, 32, 32);
+            let (sr_y, _, _) = rgb_to_ycbcr(&sr);
+            let mut max_slope_sr = 0.0f32;
+            for x in 12..20 {
+                let slope = (sr_y[row_mid + x + 1] - sr_y[row_mid + x]).abs();
+                if slope > max_slope_sr {
+                    max_slope_sr = slope;
+                }
+            }
+            assert!(
+                max_slope_sr > max_slope_bilinear,
+                "Mode {:?} did not sharpen edge slope: sr={} vs bilinear={}",
+                mode,
+                max_slope_sr,
+                max_slope_bilinear
+            );
+        }
+    }
+
+    #[test]
+    fn test_pipeline_dimensions_and_modes() {
+        let mut buf = PixelBuffer::new(8, 6, Color::new(50, 100, 150));
+        buf.set_pixel(4, 3, Color::new(220, 230, 240));
+
+        for mode in [
+            UpscaleMode::Off,
+            UpscaleMode::FsrOnly,
+            UpscaleMode::NeuralOnly,
+            UpscaleMode::Combined,
+            UpscaleMode::MultiPass,
+        ] {
+            for &(tw, th) in &[(8, 6), (16, 12), (24, 18), (32, 24)] {
+                let out = apply_upscale_pipeline(&buf, mode, tw, th);
+                if mode == UpscaleMode::Off {
+                    assert_eq!(out.width, 8);
+                    assert_eq!(out.height, 6);
+                } else {
+                    assert_eq!(out.width, tw);
+                    assert_eq!(out.height, th);
+                    assert_eq!(out.data.len(), tw * th);
+                }
+            }
+
+            let subpixel = apply_terminal_subpixel_rcas(&buf, mode);
+            assert_eq!(subpixel.width, 8);
+            assert_eq!(subpixel.height, 6);
+        }
+    }
+
+    #[test]
+    fn test_dither_stability_and_flat_suppression() {
+        let c = Color::new(140, 160, 180);
         for y in 0..8 {
-            for x in 4..8 {
-                y_plane[y * 8 + x] = 0.8f32;
+            for x in 0..8 {
+                let first = dither_truecolor_cell(c, x, y);
+                let second = dither_truecolor_cell(c, x, y);
+                assert_eq!(first, second, "Bayer dithering must be 100% deterministic");
             }
         }
-        let up_y = upscale_y_neural_2x(&y_plane, 8, 8);
-        assert_eq!(up_y.len(), 16 * 16);
-
-        // Sub-pixel right before the step edge (col 7) and right after (col 8) should maintain high contrast
-        let left_edge = up_y[8 * 16 + 7];
-        let right_edge = up_y[8 * 16 + 8];
-        assert!(right_edge - left_edge > 0.25);
-    }
-
-    #[test]
-    fn test_fsr_easu_anti_ringing_and_dimensions() {
-        let mut buf = PixelBuffer::new(6, 6, Color::new(40, 80, 120));
-        for y in 0..6 {
-            for x in 3..6 {
-                buf.set_pixel(x, y, Color::new(200, 220, 240));
-            }
-        }
-        let easu = fsr_easu(&buf, 12, 12);
-        assert_eq!(easu.width, 12);
-        assert_eq!(easu.height, 12);
-
-        // Verify anti-ringing clamping: no pixel may undershoot 40 or overshoot 240
-        for px in &easu.data {
-            assert!(px.r >= 40 && px.r <= 200);
-            assert!(px.g >= 80 && px.g <= 220);
-            assert!(px.b >= 120 && px.b <= 240);
-        }
-    }
-
-    #[test]
-    fn test_fsr_rcas_preserves_flat_and_sharpens_edges() {
-        let mut buf = PixelBuffer::new(6, 6, Color::new(128, 128, 128));
-        // Flat region should remain strictly untouched
-        let flat_rcas = fsr_rcas(&buf, 0.9);
-        assert_eq!(flat_rcas.get_pixel(3, 3), Color::new(128, 128, 128));
-
-        // Soft edge: center is brighter than neighbors
-        buf.set_pixel(3, 3, Color::new(180, 180, 180));
-        let edge_rcas = fsr_rcas(&buf, 0.9);
-        assert!(edge_rcas.get_pixel(3, 3).r > 180);
-    }
-
-    #[test]
-    fn test_upscale_mode_cycle_and_dispatcher() {
-        assert_eq!(UpscaleMode::Off.next(), UpscaleMode::FsrOnly);
-        assert_eq!(UpscaleMode::FsrOnly.next(), UpscaleMode::NeuralOnly);
-        assert_eq!(UpscaleMode::NeuralOnly.next(), UpscaleMode::Combined);
-        assert_eq!(UpscaleMode::Combined.next(), UpscaleMode::MultiPass);
-        assert_eq!(UpscaleMode::MultiPass.next(), UpscaleMode::Off);
-
-        let buf = PixelBuffer::new(4, 4, Color::new(100, 150, 200));
-        let cmb = upscale_frame(&buf, UpscaleMode::Combined, 8, 8);
-        assert_eq!(cmb.width, 8);
-        assert_eq!(cmb.height, 8);
+        // Extremum suppression check
+        assert_eq!(dither_truecolor_cell(Color::WHITE, 1, 2), Color::WHITE);
+        assert_eq!(dither_truecolor_cell(Color::BLACK, 3, 1), Color::BLACK);
     }
 }

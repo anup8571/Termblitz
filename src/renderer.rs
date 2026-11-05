@@ -1,6 +1,6 @@
 #![allow(dead_code)]
-use std::io;
-use crate::upscale::{apply_upscale_pipeline, UpscaleMode};
+use std::io::{self, Write};
+use crate::upscale::{apply_terminal_subpixel_rcas, apply_upscale_pipeline, UpscaleMode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {
@@ -677,12 +677,20 @@ pub const BAYER_4X4: [[i16; 4]; 4] = [
     [15,  7, 13,  5],
 ];
 
+/// Returns `true` if a color is near-pure white (`r > 248 && g > 248 && b > 248`)
+/// or near-pure black (`r < 7 && g < 7 && b < 7`).
+#[inline(always)]
+pub fn is_near_extremum_rgb(c: Color) -> bool {
+    (c.r > 248 && c.g > 248 && c.b > 248) || (c.r < 7 && c.g < 7 && c.b < 7)
+}
+
 /// Applies a subtle `[-3..+4]` integer offset based on `BAYER_4X4[y & 3][x & 3]` clamped to `0..=255`.
-/// Preserves pure black `(0,0,0)` and pure white `(255,255,255)` so flat UI backgrounds remain run-length batchable,
-/// and is 100% deterministic per `(x, y)` so static frames never flicker with dirty-cell diffing.
+/// Suppresses dithering on near-pure white (`r,g,b > 248`) and near-pure black (`r,g,b < 7`)
+/// so flat UI backgrounds remain clean and run-length batchable, and is 100% deterministic
+/// per `(x, y)` so static frames never flicker with dirty-cell diffing.
 #[inline(always)]
 pub fn dither_truecolor_cell(c: Color, x: usize, y: usize) -> Color {
-    if (c.r == 255 && c.g == 255 && c.b == 255) || (c.r == 0 && c.g == 0 && c.b == 0) {
+    if is_near_extremum_rgb(c) {
         return c;
     }
     let offset = (BAYER_4X4[y & 3][x & 3] >> 1) - 3;
@@ -779,15 +787,48 @@ pub fn quantize_sixel_floyd_steinberg(px_buf: &PixelBuffer) -> Vec<u8> {
         work_b[i] = c.b as i16;
     }
 
-    let mut indices = vec![0u8; len];
+        let mut indices = vec![0u8; len];
+    let max_x = width - 1;
+    let max_y = height - 1;
 
     for y in 0..height {
         let row_off = y * width;
+        let ym1_off = y.saturating_sub(1) * width;
+        let yp1_off = (y + 1).min(max_y) * width;
         let serpentine_rev = (y & 1) == 1;
 
         for step in 0..width {
             let x = if serpentine_rev { width - 1 - step } else { step };
             let idx = row_off + x;
+            let src_c = px_buf.data[idx];
+
+            // Flat-Region Dither Suppression:
+            // If pixel is near-pure white (`>248`), near-pure black (`<7`), or has zero color gradient
+            // relative to its immediate 4-connected neighbors, bypass error diffusion completely.
+            if src_c.r > 248 && src_c.g > 248 && src_c.b > 248 {
+                indices[idx] = 1; // Clean Sixel White
+                continue;
+            }
+            if src_c.r < 7 && src_c.g < 7 && src_c.b < 7 {
+                indices[idx] = 0; // Clean Sixel Black
+                continue;
+            }
+
+            let xm1 = x.saturating_sub(1);
+            let xp1 = (x + 1).min(max_x);
+            let c_left = px_buf.data[row_off + xm1];
+            let c_right = px_buf.data[row_off + xp1];
+            let c_up = px_buf.data[ym1_off + x];
+            let c_down = px_buf.data[yp1_off + x];
+
+            if src_c == c_left && src_c == c_right && src_c == c_up && src_c == c_down {
+                indices[idx] = nearest_sixel_palette_index(
+                    src_c.r as i16,
+                    src_c.g as i16,
+                    src_c.b as i16,
+                );
+                continue;
+            }
 
             let old_r = work_r[idx].clamp(0, 255);
             let old_g = work_g[idx].clamp(0, 255);
@@ -847,7 +888,8 @@ pub fn quantize_sixel_floyd_steinberg(px_buf: &PixelBuffer) -> Vec<u8> {
 
 impl DiffRenderer {
     /// Renders a PixelBuffer into the terminal using Unicode half-blocks '▀' (upper half = fg, lower half = bg)
-    /// with the active `UpscaleMode` super-resolution pipeline and optional 4x4 Ordered Bayer dithering.
+    /// with the active `UpscaleMode` super-resolution pipeline, post-downsample terminal-grid RCAS sharpening,
+    /// and flat-region-suppressed 4x4 Ordered Bayer dithering.
     pub fn blit_pixel_buffer(&mut self, px_buf: &PixelBuffer, start_y: u16, max_y: u16) {
         let cols = self.width as usize;
         let rows = (max_y.saturating_sub(start_y)) as usize;
@@ -862,19 +904,21 @@ impl DiffRenderer {
         let active_buf = if self.upscale_mode == UpscaleMode::Off {
             px_buf
         } else {
-            let sr_w = (target_w * 2).max(px_buf.width);
-            let sr_h = (target_h * 2).max(px_buf.height);
+            let mut sr_w = (target_w * 2).max(px_buf.width);
+            let mut sr_h = (target_h * 2).max(px_buf.height);
+            // Ensure EASU directional 12-tap reconstruction never no-ops when Chromium's
+            // buffer is already larger than 2x the terminal half-block grid
+            if sr_w == px_buf.width && sr_h == px_buf.height {
+                sr_w = ((px_buf.width * 3) / 2).max(px_buf.width + 1);
+                sr_h = ((px_buf.height * 3) / 2).max(px_buf.height + 1);
+            }
             upscaled_storage = apply_upscale_pipeline(px_buf, self.upscale_mode, sr_w, sr_h);
             &upscaled_storage
         };
 
-        let dither = self.dithering_enabled;
-
+        // Pass 1: Downsample/map `active_buf` to the exact terminal subpixel grid `(target_w x target_h)`
+        let mut subpixel_buf = PixelBuffer::new(target_w, target_h, Color::BLACK);
         for row in 0..rows {
-            let term_y = start_y + (row as u16);
-            if term_y >= self.height {
-                break;
-            }
             let sub_y_top = row * 2;
             let sub_y_bot = row * 2 + 1;
             let top_y0 = (sub_y_top * active_buf.height) / target_h;
@@ -888,8 +932,49 @@ impl DiffRenderer {
 
                 let raw_top = Self::sample_subpixel_box(active_buf, x0, x1, top_y0, top_y1);
                 let raw_bot = Self::sample_subpixel_box(active_buf, x0, x1, bot_y0, bot_y1);
+                subpixel_buf.set_pixel(col, sub_y_top, raw_top);
+                subpixel_buf.set_pixel(col, sub_y_bot, raw_bot);
+            }
+        }
 
-                let (top_color, bot_color) = if dither {
+        // Pass 1b: Run Contrast-Adaptive Sharpening (RCAS) directly on the terminal subpixel grid
+        // so 1px sharpening lobes crisp up half-block (`▀`) edges and small thumbnails after downsampling.
+        let rcas_storage;
+        let final_subpixels = if self.upscale_mode == UpscaleMode::Off {
+            &subpixel_buf
+        } else {
+            rcas_storage = apply_terminal_subpixel_rcas(&subpixel_buf, self.upscale_mode);
+            &rcas_storage
+        };
+
+        let dither = self.dithering_enabled;
+        let max_col = cols.saturating_sub(1);
+
+        // Pass 2: Apply 4x4 Ordered Bayer dithering only on cells with active color gradients/textures.
+        // Flat constant backgrounds (`raw_top == raw_bot` and zero neighbor gradient) emit exact clean RGB.
+        for row in 0..rows {
+            let term_y = start_y + (row as u16);
+            if term_y >= self.height {
+                break;
+            }
+            let sub_y_top = row * 2;
+            let sub_y_bot = row * 2 + 1;
+
+            for col in 0..cols {
+                let raw_top = final_subpixels.get_pixel(col, sub_y_top);
+                let raw_bot = final_subpixels.get_pixel(col, sub_y_bot);
+                let left_top = final_subpixels.get_pixel(col.saturating_sub(1), sub_y_top);
+                let left_bot = final_subpixels.get_pixel(col.saturating_sub(1), sub_y_bot);
+                let right_top = final_subpixels.get_pixel((col + 1).min(max_col), sub_y_top);
+                let right_bot = final_subpixels.get_pixel((col + 1).min(max_col), sub_y_bot);
+
+                let is_flat_cell = raw_top == raw_bot
+                    && raw_top == left_top
+                    && raw_bot == left_bot
+                    && raw_top == right_top
+                    && raw_bot == right_bot;
+
+                let (top_color, bot_color) = if dither && !is_flat_cell {
                     (
                         dither_truecolor_cell(raw_top, col, sub_y_top),
                         dither_truecolor_cell(raw_bot, col, sub_y_bot),
@@ -1280,9 +1365,21 @@ mod tests {
         assert_eq!(d1, Color::new(128, 128, 128));
         assert_eq!(d2, Color::new(132, 132, 132));
 
-        // Pure black and white remain untouched for clean run-length batching
+        // Near-white (>248) and near-black (<7) remain untouched for clean run-length batching
         assert_eq!(dither_truecolor_cell(Color::WHITE, 2, 1), Color::WHITE);
+        assert_eq!(dither_truecolor_cell(Color::new(250, 251, 249), 0, 0), Color::new(250, 251, 249));
         assert_eq!(dither_truecolor_cell(Color::BLACK, 3, 2), Color::BLACK);
+        assert_eq!(dither_truecolor_cell(Color::new(4, 5, 6), 0, 3), Color::new(4, 5, 6));
+
+        // Flat constant background in blit_pixel_buffer must emit clean space cells without Bayer noise
+        let mut renderer = DiffRenderer::new(8, 4);
+        let flat_banner = Color::new(32, 96, 192);
+        let flat_buf = PixelBuffer::new(16, 16, flat_banner);
+        renderer.blit_pixel_buffer(&flat_buf, 1, 4);
+        for cell in &renderer.current[8..] {
+            assert_eq!(cell.ch, ' ');
+            assert_eq!(cell.bg, flat_banner);
+        }
     }
 
     #[test]
