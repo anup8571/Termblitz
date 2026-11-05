@@ -7,6 +7,9 @@ pub enum AppAction {
     PageScroll(i32),
     Navigate(String),
     ToggleMode,
+    ToggleAdBlock,
+    HistoryBack,
+    HistoryForward,
     Reload,
     ZoomIn,
     ZoomOut,
@@ -15,6 +18,43 @@ pub enum AppAction {
     FocusUrlBar,
     Exit,
     None,
+}
+
+fn url_encode_query(q: &str) -> String {
+    let mut out = String::with_capacity(q.len() * 2);
+    for b in q.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push( char::from_digit((b >> 4) as u32, 16).unwrap_or('0').to_ascii_uppercase() );
+                out.push( char::from_digit((b & 0x0F) as u32, 16).unwrap_or('0').to_ascii_uppercase() );
+            }
+        }
+    }
+    out
+}
+
+pub fn resolve_input_to_url(raw_input: &str) -> String {
+    let trimmed = raw_input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("about:")
+    {
+        return trimmed.to_string();
+    }
+    // Treat as search query if it contains spaces or has no domain dot (unless localhost)
+    if trimmed.contains(' ') || (!trimmed.contains('.') && !trimmed.starts_with("localhost")) {
+        format!("https://www.google.com/search?q={}", url_encode_query(trimmed))
+    } else {
+        format!("https://{}", trimmed)
+    }
 }
 
 pub struct InputHandler {
@@ -54,7 +94,6 @@ impl InputHandler {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> AppAction {
-        // Universal Ctrl+C / Ctrl+D exit
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('d'))
         {
@@ -65,16 +104,12 @@ impl InputHandler {
             match key.code {
                 KeyCode::Enter => {
                     self.is_entering_url = false;
-                    let url = std::mem::take(&mut self.url_input_buffer);
-                    if url.is_empty() {
+                    let raw = std::mem::take(&mut self.url_input_buffer);
+                    let target = resolve_input_to_url(&raw);
+                    if target.is_empty() {
                         AppAction::None
-                    } else if !url.starts_with("http://")
-                        && !url.starts_with("https://")
-                        && !url.starts_with("about:")
-                    {
-                        AppAction::Navigate(format!("https://{}", url))
                     } else {
-                        AppAction::Navigate(url)
+                        AppAction::Navigate(target)
                     }
                 }
                 KeyCode::Esc => {
@@ -95,12 +130,15 @@ impl InputHandler {
         } else {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => AppAction::Exit,
-                KeyCode::Char('u') | KeyCode::Char('o') => {
+                KeyCode::Char('u') | KeyCode::Char('o') | KeyCode::Char('/') => {
                     self.is_entering_url = true;
                     self.url_input_buffer.clear();
                     AppAction::FocusUrlBar
                 }
                 KeyCode::Char('m') | KeyCode::F(2) => AppAction::ToggleMode,
+                KeyCode::Char('a') => AppAction::ToggleAdBlock,
+                KeyCode::Char('[') | KeyCode::Char('H') => AppAction::HistoryBack,
+                KeyCode::Char(']') | KeyCode::Char('L') => AppAction::HistoryForward,
                 KeyCode::Char('r') => AppAction::Reload,
                 KeyCode::Char('+') | KeyCode::Char('=') => AppAction::ZoomIn,
                 KeyCode::Char('-') | KeyCode::Char('_') => AppAction::ZoomOut,
@@ -109,14 +147,14 @@ impl InputHandler {
                 KeyCode::Char('k') | KeyCode::Up => AppAction::Scroll(-1),
                 KeyCode::Char('d') | KeyCode::PageDown | KeyCode::Char(' ') => AppAction::PageScroll(1),
                 KeyCode::Char('b') | KeyCode::PageUp => AppAction::PageScroll(-1),
-                KeyCode::Char('g') | KeyCode::Home => AppAction::Scroll(-100000), // Jump to top
-                KeyCode::Char('G') | KeyCode::End => AppAction::Scroll(100000),   // Jump to bottom
+                KeyCode::Char('g') | KeyCode::Home => AppAction::Scroll(-100000),
+                KeyCode::Char('G') | KeyCode::End => AppAction::Scroll(100000),
                 _ => AppAction::None,
             }
         }
     }
 
-    /// Universal SGR 1006 mouse and touch event handling (desktop mouse + mobile touch drag/swipe)
+    /// Universal SGR 1006 mouse and touch gesture handling (vertical drag scroll, horizontal swipe back/forward, top-bar touch)
     fn handle_mouse(&mut self, mouse: MouseEvent) -> AppAction {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -126,10 +164,16 @@ impl InputHandler {
                 AppAction::None
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some((sx, sy)) = self.drag_start {
+                    let dx = (mouse.column as i32 - sx as i32).abs();
+                    let dy = (mouse.row as i32 - sy as i32).abs();
+                    if dx > 2 || dy > 1 {
+                        self.has_dragged = true;
+                    }
+                }
                 if let Some(last_y) = self.last_drag_y {
                     let diff = (last_y as i32) - (mouse.row as i32);
                     if diff != 0 {
-                        self.has_dragged = true;
                         self.last_drag_y = Some(mouse.row);
                         return AppAction::Scroll(diff);
                     }
@@ -139,24 +183,37 @@ impl InputHandler {
             MouseEventKind::Up(MouseButton::Left) => {
                 let start = self.drag_start.take();
                 self.last_drag_y = None;
+                let dragged = self.has_dragged;
+                self.has_dragged = false;
 
-                // If user tapped without dragging, trigger Click
-                if !self.has_dragged {
-                    if let Some((sx, sy)) = start {
-                        let dist_x = (mouse.column as i32 - sx as i32).abs();
-                        let dist_y = (mouse.row as i32 - sy as i32).abs();
-                        if dist_x <= 1 && dist_y <= 1 {
-                            if mouse.row == 0 {
+                if let Some((sx, sy)) = start {
+                    let dx = mouse.column as i32 - sx as i32;
+                    let dy = mouse.row as i32 - sy as i32;
+
+                    // Horizontal swipe gesture (Swipe Right = Back, Swipe Left = Forward)
+                    if dragged && dx.abs() >= 10 && dx.abs() > dy.abs() * 2 {
+                        if dx > 0 {
+                            return AppAction::HistoryBack;
+                        } else {
+                            return AppAction::HistoryForward;
+                        }
+                    }
+
+                    // Single tap (without drag)
+                    if !dragged && dx.abs() <= 2 && dy.abs() <= 1 {
+                        if mouse.row == 0 {
+                            if mouse.column < 14 {
+                                return AppAction::ToggleMode;
+                            } else {
                                 self.is_entering_url = true;
                                 self.url_input_buffer.clear();
                                 return AppAction::FocusUrlBar;
-                            } else {
-                                return AppAction::Click(mouse.column, mouse.row);
                             }
+                        } else {
+                            return AppAction::Click(mouse.column, mouse.row);
                         }
                     }
                 }
-                self.has_dragged = false;
                 AppAction::None
             }
             MouseEventKind::ScrollDown => AppAction::Scroll(3),

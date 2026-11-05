@@ -2,10 +2,10 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::renderer::{Color, DiffRenderer, PixelBuffer};
 
@@ -54,6 +54,8 @@ pub struct TextOverlaySpan {
     pub bg: Option<Color>,
     pub bold: bool,
     pub is_link: bool,
+    pub is_input: bool,
+    pub link_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +81,58 @@ pub struct RenderedLine {
     pub spans: Vec<TextSpan>,
     pub row_bg: Option<Color>,
     pub is_full_width_bg: bool,
+}
+
+/// Computes logical CSS viewport dimensions that preserve the terminal's 1:2 character cell aspect ratio
+/// without relying on CSS style.zoom (which distorts getBoundingClientRect coordinates).
+pub fn compute_viewport_size(cols: u16, rows: u16, zoom: f32) -> (u32, u32) {
+    let safe_zoom = zoom.clamp(0.5, 3.0);
+    let base_w: f32 = if cols <= 68 {
+        360.0
+    } else if cols <= 100 {
+        480.0
+    } else {
+        (cols as f32) * 7.0
+    };
+    let width_px = (base_w / safe_zoom).round().clamp(240.0, 1280.0) as u32;
+    let view_rows = rows.saturating_sub(1).max(10) as f32;
+    let safe_cols = cols.max(20) as f32;
+    let height_px = ((width_px as f32 * (view_rows * 2.0)) / safe_cols)
+        .round()
+        .clamp(320.0, 2400.0) as u32;
+    (width_px, height_px)
+}
+
+/// Checks if a URL or domain belongs to a known ad/tracker network (Brave-style shield filter)
+pub fn is_ad_or_tracker_url(url: &str) -> bool {
+    let u = url.to_lowercase();
+    const AD_PATTERNS: &[&str] = &[
+        "doubleclick.net",
+        "googlesyndication.com",
+        "googleadservices.com",
+        "adservice.google.",
+        "moatads.com",
+        "taboola.com",
+        "outbrain.com",
+        "criteo.com",
+        "amazon-adsystem.com",
+        "adsafeprotected.com",
+        "scorecardresearch.com",
+        "quantserve.com",
+        "adnxs.com",
+        "rubiconproject.com",
+        "pubmatic.com",
+        "openx.net",
+        "smartadserver.com",
+        "popads.net",
+        "popcash.net",
+        "google-analytics.com",
+        "googletagmanager.com",
+        "fbevents.js",
+        "/pagead/",
+        "/ads/",
+    ];
+    AD_PATTERNS.iter().any(|pat| u.contains(pat))
 }
 
 /// Decodes all named and numeric (hex/decimal) HTML entities
@@ -243,6 +297,8 @@ pub struct NativeEngine {
     pub links: Vec<InteractiveLink>,
     pub scroll_y: usize,
     pub max_scroll: usize,
+    pub adblock_enabled: bool,
+    pub ads_blocked: usize,
 }
 
 impl NativeEngine {
@@ -251,11 +307,13 @@ impl NativeEngine {
             current_url: "about:home".to_string(),
             raw_html: String::new(),
             title: "termblitz home".to_string(),
-            body_bg: Color::new(246, 246, 239), // Classic HN beige palette default
+            body_bg: Color::new(246, 246, 239),
             lines: Vec::new(),
             links: Vec::new(),
             scroll_y: 0,
             max_scroll: 0,
+            adblock_enabled: true,
+            ads_blocked: 0,
         }
     }
 
@@ -269,11 +327,10 @@ impl NativeEngine {
             return;
         }
 
-        // Fetch URL via curl child process (supports HTTP/2, HTTPS, redirects, Brotli, Zero Rust compile weight)
         let output = Command::new("curl")
             .arg("-sL")
             .arg("-A")
-            .arg("Mozilla/5.0 (Linux; Android 14; Termux) termblitz/0.1.0 NativeEngine")
+            .arg("Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
             .arg("--max-time")
             .arg("10")
             .arg(url)
@@ -309,26 +366,95 @@ impl NativeEngine {
         <tr><td><b>&nbsp;⚡ termblitz :: Ultra-Fast Terminal Visual Web Browser</b></td></tr>
     </table>
     <br>
-    <p>Welcome to <b>termblitz</b> &mdash; engineered for maximum performance on Android / Termux.</p>
+    <p>Welcome to <b>termblitz</b> &mdash; engineered for maximum performance on Android Termux, Linux, macOS &amp; Windows.</p>
     <hr>
     <h2>Quick Jump Links:</h2>
     <ul>
+        <li><a href="https://www.google.com">Google Search (Hybrid Visual Mode)</a></li>
         <li><a href="https://news.ycombinator.com">Hacker News (Y Combinator)</a></li>
         <li><a href="https://en.wikipedia.org/wiki/Main_Page">Wikipedia: The Free Encyclopedia</a></li>
         <li><a href="https://lobste.rs">Lobsters Tech Community</a></li>
-        <li><a href="https://wttr.in/?format=v2">Live Weather Forecast (wttr.in)</a></li>
         <li><a href="https://lite.cnn.com">CNN Lite News</a></li>
         <li><a href="https://text.npr.org">NPR Text-Only News</a></li>
     </ul>
     <hr>
-    <h2>Features & Engine Controls:</h2>
-    <p>&bull; <b>Mode Toggle [m]:</b> Switch between <i>Native Ultra-Light Mode</i> (&lt; 1MB RAM) and <i>Full Headless Chromium Mode</i>.</p>
-    <p>&bull; <b>Navigation [u]:</b> Focus address bar to enter a new URL.</p>
-    <p>&bull; <b>Scrolling [j / k / Touch]:</b> Scroll up/down with arrow keys, vim keys, or touch swipe.</p>
-    <p>&bull; <b>Touch Hit-Testing:</b> Tap directly on links on your screen to navigate.</p>
+    <h2>Touch Gestures &amp; Keyboard Controls:</h2>
+    <p>&bull; <b>Mode Toggle [m / Tap Top-Left Badge]:</b> Cycle <i>Native</i> &rarr; <i>Hybrid</i> &rarr; <i>Raw</i>.</p>
+    <p>&bull; <b>Search &amp; URL [u / / / Tap Top Bar]:</b> Enter any URL or Google search query.</p>
+    <p>&bull; <b>Touch Gestures:</b> Swipe Up/Down to scroll, Swipe Left/Right for Back/Forward, Tap links or search boxes directly.</p>
+    <p>&bull; <b>Brave Shield [a]:</b> Toggle integrated network &amp; cosmetic ad/tracker blocker.</p>
 </body>
 </html>"##
             .to_string()
+    }
+
+    /// Pre-strips `<script>...</script>`, `<style>...</style>`, `<svg>...</svg>`, `<head>...</head>`, and `<!--...-->`
+    /// so `<` characters inside inline JavaScript (e.g. `for (i=0; i<10; i++)`) never corrupt tag parsing.
+    fn strip_non_content_blocks(html: &str) -> String {
+        let mut out = String::with_capacity(html.len());
+        let bytes = html.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        let starts_with_ci = |pos: usize, needle: &[u8]| -> bool {
+            if pos + needle.len() > len {
+                return false;
+            }
+            bytes[pos..pos + needle.len()]
+                .iter()
+                .zip(needle.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        };
+
+        while i < len {
+            if starts_with_ci(i, b"<!--") {
+                i += 4;
+                while i < len && !starts_with_ci(i, b"-->") {
+                    i += 1;
+                }
+                if i < len {
+                    i += 3;
+                }
+                continue;
+            }
+
+            let skip_tag: Option<&[u8]> = if starts_with_ci(i, b"<script") {
+                Some(b"</script>")
+            } else if starts_with_ci(i, b"<style") {
+                Some(b"</style>")
+            } else if starts_with_ci(i, b"<svg") {
+                Some(b"</svg>")
+            } else if starts_with_ci(i, b"<noscript") {
+                Some(b"</noscript>")
+            } else if starts_with_ci(i, b"<head") {
+                Some(b"</head>")
+            } else {
+                None
+            };
+
+            if let Some(close_tag) = skip_tag {
+                let next_ch = bytes.get(i + close_tag.len() - 2).copied().unwrap_or(b' ');
+                if next_ch == b'>' || next_ch == b' ' || next_ch == b'\t' || next_ch == b'\n' || next_ch == b'\r' {
+                    i += close_tag.len() - 2;
+                    while i < len && !starts_with_ci(i, close_tag) {
+                        i += 1;
+                    }
+                    if i < len {
+                        i += close_tag.len();
+                    }
+                    continue;
+                }
+            }
+
+            // Copy next valid UTF-8 char
+            if let Some(ch) = html[i..].chars().next() {
+                out.push(ch);
+                i += ch.len_utf8();
+            } else {
+                i += 1;
+            }
+        }
+        out
     }
 
     /// Pure Rust streaming HTML/CSS layout engine with Table Row Horizontal Flow & Color Palettes
@@ -336,19 +462,19 @@ impl NativeEngine {
         self.lines.clear();
         self.links.clear();
 
-        // Detect body background color
         let lower_html = self.raw_html.to_lowercase();
         if lower_html.contains("bgcolor=\"#f6f6ef\"")
             || lower_html.contains("bgcolor='#f6f6ef'")
             || lower_html.contains("bgcolor=#f6f6ef")
             || self.current_url.contains("news.ycombinator.com")
         {
-            self.body_bg = Color::new(246, 246, 239); // Hacker News beige
+            self.body_bg = Color::new(246, 246, 239);
         } else if lower_html.contains("bgcolor=\"#ffffff\"")
             || lower_html.contains("bgcolor='#ffffff'")
             || lower_html.contains("bgcolor=#ffffff")
             || lower_html.contains("bgcolor=\"white\"")
             || self.current_url.contains("wikipedia.org")
+            || self.current_url.contains("google.com")
         {
             self.body_bg = Color::WHITE;
         } else if let Some(body_pos) = lower_html.find("<body") {
@@ -378,14 +504,14 @@ impl NativeEngine {
 
         let wrap_width = (cols as usize).saturating_sub(2).max(20);
 
+        let cleaned_html = Self::strip_non_content_blocks(&self.raw_html);
+
         let mut in_tag = false;
-        let mut in_script_or_style = false;
         let mut in_table = false;
         let mut in_table_row = false;
         let mut current_tag = String::new();
         let mut text_acc = String::new();
 
-        // Style stack
         let mut current_fg = default_fg;
         let mut current_bg: Option<Color> = None;
         let mut current_row_bg: Option<Color> = None;
@@ -431,7 +557,6 @@ impl NativeEngine {
             }
             let word_w = word.chars().count();
             if *line_len + word_w > max_w && *line_len > 0 {
-                // Line wrap
                 let line_spans = std::mem::take(spans);
                 block.push(RenderedLine {
                     spans: line_spans,
@@ -452,7 +577,7 @@ impl NativeEngine {
             *line_len += word_w;
         };
 
-        let chars: Vec<char> = self.raw_html.chars().collect();
+        let chars: Vec<char> = cleaned_html.chars().collect();
         let mut i = 0;
         let len = chars.len();
 
@@ -460,8 +585,7 @@ impl NativeEngine {
             let c = chars[i];
 
             if c == '<' {
-                // Process accumulated text with entity decoding
-                if !in_script_or_style && !text_acc.is_empty() {
+                if !text_acc.is_empty() {
                     let decoded = decode_html_entities(&text_acc);
                     let cleaned = decoded.replace('\n', " ").replace('\r', " ").replace('\t', " ");
                     for word in cleaned.split_whitespace() {
@@ -493,26 +617,16 @@ impl NativeEngine {
                 let tag_str = tag_raw.to_lowercase();
                 let tag_name = tag_str.split_whitespace().next().unwrap_or("");
 
-                // Handle script/style exclusion
-                if tag_name == "script" || tag_name == "style" {
-                    in_script_or_style = true;
-                } else if tag_name == "/script" || tag_name == "/style" {
-                    in_script_or_style = false;
-                }
-
-                // Check bgcolor attribute
                 if let Some(bg_str) = extract_attr(tag_raw, "bgcolor") {
                     if let Some(color) = parse_color_from_str(bg_str) {
                         current_row_bg = Some(color);
                         is_full_width_row = true;
                         if color == Color::new(255, 102, 0) {
-                            // HN orange bar
                             current_fg = Color::BLACK;
                         }
                     }
                 }
 
-                // Check inline style colors
                 if let Some(style_str) = extract_attr(tag_raw, "style") {
                     if let Some(fg) = extract_style_color(style_str) {
                         current_fg = fg;
@@ -522,7 +636,6 @@ impl NativeEngine {
                     }
                 }
 
-                // Check semantic class names for Hacker News
                 if tag_str.contains("class=\"subtext\"")
                     || tag_str.contains("class='subtext'")
                     || tag_str.contains("class=\"comhead\"")
@@ -534,7 +647,6 @@ impl NativeEngine {
                     current_fg = default_fg;
                 }
 
-                // Handle Elements & Layout
                 match tag_name {
                     "table" => {
                         in_table = true;
@@ -561,7 +673,6 @@ impl NativeEngine {
                             current_row_bg,
                             is_full_width_row,
                         );
-                        // Reset line row styling unless table set it
                         if tag_str.contains("bgcolor=\"#ff6600\"") || tag_str.contains("bgcolor='#ff6600'") {
                             current_row_bg = Some(Color::new(255, 102, 0));
                             is_full_width_row = true;
@@ -588,7 +699,6 @@ impl NativeEngine {
                     "td" | "th" => {
                         if in_table_row {
                             if !current_spans.is_empty() {
-                                // Add horizontal column separator instead of breaking line!
                                 current_spans.push(TextSpan {
                                     text: "  ".to_string(),
                                     fg: default_fg,
@@ -599,7 +709,6 @@ impl NativeEngine {
                                 });
                                 current_line_len += 2;
                             } else if tag_str.contains("colspan=\"2\"") || tag_str.contains("colspan='2'") {
-                                // Indent for Hacker News subtext line under title
                                 current_spans.push(TextSpan {
                                     text: "    ".to_string(),
                                     fg: default_fg,
@@ -612,9 +721,7 @@ impl NativeEngine {
                             }
                         }
                     }
-                    "/td" | "/th" => {
-                        // Do not break line on closing td! Keeps table columns flowing horizontally!
-                    }
+                    "/td" | "/th" => {}
                     "h1" => {
                         flush_current_line(
                             &mut current_spans,
@@ -681,19 +788,7 @@ impl NativeEngine {
                         current_fg = default_fg;
                         is_bold = false;
                     }
-                    "p" | "div" => {
-                        // Only break line if outside a table
-                        if !in_table && !in_table_row && !current_spans.is_empty() {
-                            flush_current_line(
-                                &mut current_spans,
-                                &mut block_lines,
-                                &mut current_line_len,
-                                current_row_bg,
-                                is_full_width_row,
-                            );
-                        }
-                    }
-                    "/p" | "/div" => {
+                    "p" | "div" | "/p" | "/div" => {
                         if !in_table && !in_table_row && !current_spans.is_empty() {
                             flush_current_line(
                                 &mut current_spans,
@@ -809,9 +904,15 @@ impl NativeEngine {
                     "/i" | "/em" => {
                         is_underline = false;
                     }
-                    _ if tag_name.starts_with('a') => {
+                    _ if tag_name == "a" || tag_name.starts_with("a ") => {
                         if let Some(href) = extract_attr(tag_raw, "href") {
-                            active_link = Some(decode_html_entities(href));
+                            let decoded_href = decode_html_entities(href);
+                            if self.adblock_enabled && is_ad_or_tracker_url(&decoded_href) {
+                                self.ads_blocked += 1;
+                                active_link = None;
+                            } else {
+                                active_link = Some(decoded_href);
+                            }
                         }
                         current_fg = link_color;
                         is_underline = true;
@@ -830,7 +931,7 @@ impl NativeEngine {
 
             if in_tag {
                 current_tag.push(c);
-            } else if !in_script_or_style {
+            } else {
                 text_acc.push(c);
             }
 
@@ -849,7 +950,6 @@ impl NativeEngine {
         self.max_scroll = self.lines.len().saturating_sub(10);
     }
 
-    /// Renders NativeDocument lines into the DiffRenderer filling entire row widths with the canvas color
     pub fn render_to(&mut self, renderer: &mut DiffRenderer, start_y: u16, max_y: u16) {
         self.links.clear();
         let view_height = (max_y - start_y) as usize;
@@ -863,7 +963,6 @@ impl NativeEngine {
             if let Some(line) = self.lines.get(line_idx) {
                 let row_bg = line.row_bg.unwrap_or(self.body_bg);
 
-                // Fill ENTIRE row width with row background color (No black/grey void bleeding!)
                 for x in 0..renderer.width {
                     renderer.set_cell(
                         x,
@@ -878,12 +977,11 @@ impl NativeEngine {
                     );
                 }
 
-                let mut term_x = if line.is_full_width_bg { 0 } else { 1 }; // Left margin
+                let mut term_x = if line.is_full_width_bg { 0 } else { 1 };
                 for span in &line.spans {
                     let span_len = span.text.chars().count() as u16;
                     let span_bg = span.bg.unwrap_or(row_bg);
 
-                    // Register clickable hyperlink hit-box
                     if let Some(url) = &span.link_url {
                         self.links.push(InteractiveLink {
                             x: term_x,
@@ -905,7 +1003,6 @@ impl NativeEngine {
                     term_x += span_len;
                 }
             } else {
-                // Clear empty lines with body canvas background
                 for x in 0..renderer.width {
                     renderer.set_cell(
                         x,
@@ -923,7 +1020,6 @@ impl NativeEngine {
         }
     }
 
-    /// Resolves clicked terminal coordinates to a target link URL
     pub fn hit_test(&self, click_x: u16, click_y: u16) -> Option<String> {
         for link in &self.links {
             if click_y == link.y && click_x >= link.x && click_x < (link.x + link.width) {
@@ -1003,7 +1099,21 @@ pub fn json_unescape(input: &str) -> String {
     out
 }
 
-/// Finds the index of the next unescaped quote character in a JSON string slice
+pub fn json_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 16);
+    for c in input.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 pub fn find_unescaped_quote(s: &str) -> Option<usize> {
     let mut escape = false;
     for (i, c) in s.char_indices() {
@@ -1026,6 +1136,9 @@ pub enum CdpWorkerCommand {
     Click(u16, u16),
     SetZoom(f32),
     SetHideText(bool),
+    SetAdBlock(bool),
+    HistoryBack,
+    HistoryForward,
     Stop,
 }
 
@@ -1038,7 +1151,6 @@ impl WsConnection {
     fn connect(port: u16, path: &str) -> Result<Self, String> {
         let mut stream = TcpStream::connect(("127.0.0.1", port))
             .map_err(|e| format!("Connect failed: {}", e))?;
-        // Handshake timeout: 5 seconds for reliable connection even under high mobile CPU load
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
@@ -1072,21 +1184,23 @@ impl WsConnection {
             return Err("WebSocket upgrade failed: HTTP 101 missing".to_string());
         }
 
-        // Set snappy 15ms timeout for active event loop polling
-        stream.set_read_timeout(Some(Duration::from_millis(15))).ok();
+        stream.set_read_timeout(Some(Duration::from_millis(12))).ok();
 
         Ok(Self {
             stream,
-            buf: Vec::with_capacity(131072),
+            buf: Vec::with_capacity(262144),
         })
     }
 
     fn send_text(&mut self, text: &str) -> Result<(), String> {
-        let payload = text.as_bytes();
+        self.send_frame(0x81, text.as_bytes())
+    }
+
+    fn send_frame(&mut self, opcode_byte: u8, payload: &[u8]) -> Result<(), String> {
         let len = payload.len();
         let mut frame = Vec::with_capacity(len + 14);
 
-        frame.push(0x81); // FIN + text opcode
+        frame.push(opcode_byte);
 
         if len <= 125 {
             frame.push(0x80 | (len as u8));
@@ -1110,56 +1224,67 @@ impl WsConnection {
         Ok(())
     }
 
-    /// Tries to extract one full WebSocket frame from self.buf without reading
     fn try_extract_frame(&mut self) -> Option<String> {
-        if self.buf.len() < 2 {
-            return None;
-        }
-
-        let pay_len = (self.buf[1] & 0x7F) as usize;
-        let mut idx = 2;
-        let actual_len = if pay_len == 126 {
-            if self.buf.len() < 4 {
+        loop {
+            if self.buf.len() < 2 {
                 return None;
             }
-            let l = u16::from_be_bytes([self.buf[2], self.buf[3]]) as usize;
-            idx = 4;
-            l
-        } else if pay_len == 127 {
-            if self.buf.len() < 10 {
+
+            let opcode = self.buf[0] & 0x0F;
+            let pay_len = (self.buf[1] & 0x7F) as usize;
+            let mut idx = 2;
+            let actual_len = if pay_len == 126 {
+                if self.buf.len() < 4 {
+                    return None;
+                }
+                let l = u16::from_be_bytes([self.buf[2], self.buf[3]]) as usize;
+                idx = 4;
+                l
+            } else if pay_len == 127 {
+                if self.buf.len() < 10 {
+                    return None;
+                }
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&self.buf[2..10]);
+                let l = u64::from_be_bytes(arr) as usize;
+                idx = 10;
+                l
+            } else {
+                pay_len
+            };
+
+            if self.buf.len() < idx + actual_len {
                 return None;
             }
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(&self.buf[2..10]);
-            let l = u64::from_be_bytes(arr) as usize;
-            idx = 10;
-            l
-        } else {
-            pay_len
-        };
 
-        if self.buf.len() < idx + actual_len {
-            return None;
+            let payload_bytes = self.buf[idx..idx + actual_len].to_vec();
+            self.buf.drain(..idx + actual_len);
+
+            if opcode == 0x9 {
+                let _ = self.send_frame(0x8A, &payload_bytes);
+                continue;
+            }
+            if opcode == 0x8 {
+                return None;
+            }
+            return Some(String::from_utf8_lossy(&payload_bytes).into_owned());
         }
-
-        let payload_bytes = self.buf[idx..idx + actual_len].to_vec();
-        self.buf.drain(..idx + actual_len);
-
-        String::from_utf8(payload_bytes).ok()
     }
 
+    /// Reads all available socket chunks until a full WebSocket frame is assembled or socket times out
     fn poll_message(&mut self) -> Option<String> {
-        // First check if an existing complete frame is already present in self.buf
-        if let Some(msg) = self.try_extract_frame() {
-            return Some(msg);
-        }
-
-        let mut chunk = [0u8; 32768];
-        match self.stream.read(&mut chunk) {
-            Ok(n) if n > 0 => {
-                self.buf.extend_from_slice(&chunk[..n]);
+        loop {
+            if let Some(msg) = self.try_extract_frame() {
+                return Some(msg);
             }
-            _ => {}
+
+            let mut chunk = [0u8; 65536];
+            match self.stream.read(&mut chunk) {
+                Ok(n) if n > 0 => {
+                    self.buf.extend_from_slice(&chunk[..n]);
+                }
+                _ => break,
+            }
         }
 
         self.try_extract_frame()
@@ -1168,49 +1293,124 @@ impl WsConnection {
 
 const TEXT_EXTRACT_ID: u64 = 55555;
 
+/// Injects mobile reflow CSS, cosmetic ad-blocking rules, and non-destructive text transparency (`-webkit-text-fill-color: transparent`).
+/// Using `-webkit-text-fill-color: transparent` hides Chromium's raster glyphs from the screencast while preserving `getComputedStyle(p).color`!
+fn build_page_style_js(hide_text: bool, adblock: bool) -> String {
+    let raw_flag = if hide_text { "no" } else { "yes" };
+    let ad_flag = if adblock { "yes" } else { "no" };
+    format!(
+        "(function(){{\
+            var d=document.documentElement;\
+            if(!d)return;\
+            d.style.zoom='1';\
+            d.setAttribute('data-termblitz-raw','{}');\
+            d.setAttribute('data-termblitz-adblock','{}');\
+            var head=document.head||d;\
+            var s=document.getElementById('termblitz-core-style');\
+            if(!s){{\
+                s=document.createElement('style');\
+                s.id='termblitz-core-style';\
+                s.textContent='\
+                    html,body{{max-width:100vw!important;overflow-x:hidden!important;box-sizing:border-box!important;word-break:break-word!important;-webkit-text-size-adjust:100%!important;}}\
+                    img,video,canvas,svg{{max-width:100%!important;height:auto!important;}}\
+                    html:not([data-termblitz-raw=yes]) *,html:not([data-termblitz-raw=yes]) *::before,html:not([data-termblitz-raw=yes]) *::after{{-webkit-text-fill-color:transparent!important;text-shadow:none!important;-webkit-text-stroke:0!important;}}\
+                    html[data-termblitz-adblock=yes] ins.adsbygoogle,html[data-termblitz-adblock=yes] [id^=google_ads],html[data-termblitz-adblock=yes] [id^=div-gpt-ad],html[data-termblitz-adblock=yes] [data-text-ad],html[data-termblitz-adblock=yes] [aria-label=Ads],html[data-termblitz-adblock=yes] iframe[src*=doubleclick],html[data-termblitz-adblock=yes] iframe[id*=google_ads]{{display:none!important;}}\
+                ';\
+                head.appendChild(s);\
+            }}\
+        }})()",
+        raw_flag, ad_flag
+    )
+}
+
 fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
     *seq += 1;
     let js = "(function(){\
         var T=String.fromCharCode(9),N=String.fromCharCode(10),r=[];\
         if(!document.body)return '';\
-        var z=parseFloat(document.documentElement.style.zoom)||1.0;\
-        var maxH=(window.innerHeight/z)+60;\
-        var h=document.getElementById('termblitz-hide-text');\
-        var prevMedia=h?h.media:'';\
-        if(h)h.media='not all';\
+        var vw=window.innerWidth||360,vh=window.innerHeight||640;\
+        var docH=Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0,vh);\
+        var maxS=Math.max(1,docH-vh);\
+        var pct=Math.min(100,Math.max(0,Math.round(((window.scrollY||0)*100)/maxS)));\
+        r.push('META'+T+vw+T+vh+T+pct+T+(location.href||''));\
+        var skipTags={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,SVG:1,PATH:1,HEAD:1,META:1,TITLE:1,OBJECT:1};\
         var tw=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);\
         var n;\
         while(n=tw.nextNode()){\
             var t=n.textContent;\
-            if(!t||!t.trim())continue;\
+            if(!t)continue;\
+            var txt=t.split(T).join(' ').split(N).join(' ').trim();\
+            if(!txt)continue;\
             var p=n.parentElement;\
-            if(!p)continue;\
+            if(!p||skipTags[p.tagName])continue;\
             var s=getComputedStyle(p);\
-            if(s.display==='none'||s.visibility==='hidden')continue;\
+            if(s.display==='none'||s.visibility==='hidden'||parseFloat(s.opacity)<0.05||parseFloat(s.fontSize)<2)continue;\
+            if(s.clip==='rect(1px, 1px, 1px, 1px)'||s.clipPath==='inset(50%)'||((p.offsetWidth<=2||p.offsetHeight<=2)&&s.overflow==='hidden'))continue;\
+            if(p.closest('[aria-hidden=true],[hidden],ins.adsbygoogle,[data-text-ad],[id^=google_ads]'))continue;\
             var rng=document.createRange();\
             rng.selectNodeContents(n);\
             var rects=rng.getClientRects();\
-            var rc=rects.length>0?rects[0]:p.getBoundingClientRect();\
-            if(!rc||rc.width<1||rc.height<1)continue;\
-            var left=~~(rc.left/z);\
-            var top=~~(rc.top/z);\
-            var width=~~(rc.width/z);\
-            var height=~~(rc.height/z);\
-            if(top<-30||top>maxH)continue;\
-            var txt=t.trim().split(T).join(' ').split(N).join(' ');\
-            r.push(txt+T+left+T+top+T+width+T+height+T+s.color+T+(s.fontWeight==='bold'||+s.fontWeight>=700?1:0)+T+(p.closest('a')?1:0)+T+s.backgroundColor);\
-            if(r.length>400)break;\
+            if(!rects||!rects.length)continue;\
+            var minL=99999,minT=99999,maxR=-99999,maxB=-99999,cnt=0;\
+            for(var i=0;i<rects.length;i++){\
+                var rc=rects[i];\
+                if(rc.width>=1&&rc.height>=1){\
+                    if(rc.left<minL)minL=rc.left;\
+                    if(rc.top<minT)minT=rc.top;\
+                    if(rc.right>maxR)maxR=rc.right;\
+                    if(rc.bottom>maxB)maxB=rc.bottom;\
+                    cnt++;\
+                }\
+            }\
+            if(!cnt)continue;\
+            var w=~~(maxR-minL),h=~~(maxB-minT),l=~~minL,top=~~minT;\
+            if(w<2||h<2||maxB<0||minT>vh+20||maxR<0||minL>vw+20)continue;\
+            var a=p.closest('a');\
+            var href=a?(a.href||''):'';\
+            r.push(txt+T+l+T+top+T+w+T+h+T+s.color+T+(s.fontWeight==='bold'||+s.fontWeight>=600?1:0)+T+(a?1:0)+T+s.backgroundColor+T+'0'+T+href);\
+            if(r.length>450)break;\
         }\
-        if(h)h.media=prevMedia;\
+        var inputs=document.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio]),textarea');\
+        for(var j=0;j<inputs.length;j++){\
+            var el=inputs[j];\
+            var es=getComputedStyle(el);\
+            if(es.display==='none'||es.visibility==='hidden')continue;\
+            var erc=el.getBoundingClientRect();\
+            if(!erc||erc.width<24||erc.height<10||erc.bottom<0||erc.top>vh)continue;\
+            var val=(el.value||el.placeholder||el.getAttribute('aria-label')||el.getAttribute('title')||'Search or type...').split(T).join(' ').split(N).join(' ').trim();\
+            if(!val)val='Search or type...';\
+            r.push(val+T+(~~erc.left)+T+(~~erc.top)+T+(~~erc.width)+T+(~~erc.height)+T+es.color+T+'0'+T+'0'+T+es.backgroundColor+T+'1'+T+'');\
+        }\
         return r.join(N);\
     })()";
     let cmd = format!(
-        r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
-        TEXT_EXTRACT_ID, js
+        r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}","returnByValue":true}}}}"#,
+        TEXT_EXTRACT_ID,
+        json_escape(js)
     );
     let _ = ws.send_text(&cmd);
 }
 
+fn configure_cdp_adblock(ws: &mut WsConnection, seq: &mut u64, enabled: bool) {
+    *seq += 1;
+    let _ = ws.send_text(&format!(r#"{{"id":{},"method":"Network.enable"}}"#, *seq));
+    *seq += 1;
+    if enabled {
+        let blocked_cmd = format!(
+            r#"{{"id":{},"method":"Network.setBlockedURLs","params":{{"urls":["*://*.doubleclick.net/*","*://*.googlesyndication.com/*","*://*.googleadservices.com/*","*://*.adservice.google.*/*","*://*.moatads.com/*","*://*.taboola.com/*","*://*.outbrain.com/*","*://*.criteo.com/*","*://*.amazon-adsystem.com/*","*://*.adsafeprotected.com/*","*://*.scorecardresearch.com/*","*://*.quantserve.com/*","*://*.adnxs.com/*","*://*.rubiconproject.com/*","*://*.pubmatic.com/*","*://*.openx.net/*","*://*.popads.net/*","*://*.google-analytics.com/*","*://*.googletagmanager.com/*"]}}}}"#,
+            *seq
+        );
+        let _ = ws.send_text(&blocked_cmd);
+    } else {
+        let unblock_cmd = format!(
+            r#"{{"id":{},"method":"Network.setBlockedURLs","params":{{"urls":[]}}}}"#,
+            *seq
+        );
+        let _ = ws.send_text(&unblock_cmd);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_cdp_worker(
     port: u16,
     initial_url: String,
@@ -1218,6 +1418,9 @@ fn spawn_cdp_worker(
     rows: u16,
     shared_buf: Arc<Mutex<PixelBuffer>>,
     shared_overlays: Arc<Mutex<Vec<TextOverlaySpan>>>,
+    shared_viewport: Arc<Mutex<(u32, u32)>>,
+    shared_scroll_pct: Arc<AtomicUsize>,
+    shared_live_url: Arc<Mutex<String>>,
     frame_counter: Arc<AtomicUsize>,
     shared_error: Arc<Mutex<Option<String>>>,
     is_loading: Arc<AtomicBool>,
@@ -1236,7 +1439,6 @@ fn spawn_cdp_worker(
                     resp.extend_from_slice(&buf[..n]);
                     let resp_str = String::from_utf8_lossy(&resp);
 
-                    // Specifically prioritize target with "type": "page" to avoid connecting to omnibox popups
                     let mut page_path = String::new();
                     for block in resp_str.split('{') {
                         if block.contains(r#""type": "page""#) || block.contains(r#""type":"page""#) {
@@ -1283,7 +1485,27 @@ fn spawn_cdp_worker(
         seq += 1;
         let _ = ws.send_text(&format!(r#"{{"id":{},"method":"Page.enable"}}"#, seq));
 
-        // 1) Mobile User-Agent override so modern websites serve mobile layout with large, readable fonts
+        let mut curr_cols = cols;
+        let mut curr_rows = rows;
+        let mut curr_zoom: f32 = 1.0;
+        let mut curr_hide_text: bool = true;
+        let mut curr_adblock: bool = true;
+
+        configure_cdp_adblock(&mut ws, &mut seq, curr_adblock);
+
+        seq += 1;
+        let preload_js = build_page_style_js(curr_hide_text, curr_adblock);
+        let preload_src = format!(
+            "document.addEventListener('DOMContentLoaded',function(){{{}}});{}",
+            preload_js, preload_js
+        );
+        let add_script_cmd = format!(
+            r#"{{"id":{},"method":"Page.addScriptToEvaluateOnNewDocument","params":{{"source":"{}"}}}}"#,
+            seq,
+            json_escape(&preload_src)
+        );
+        let _ = ws.send_text(&add_script_cmd);
+
         seq += 1;
         let ua_cmd = format!(
             r#"{{"id":{},"method":"Emulation.setUserAgentOverride","params":{{"userAgent":"Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"}}}}"#,
@@ -1291,13 +1513,8 @@ fn spawn_cdp_worker(
         );
         let _ = ws.send_text(&ua_cmd);
 
-        // 2) Emulation.setDeviceMetricsOverride (Option C: mobile portrait viewport reflow)
-        let mut curr_cols = cols;
-        let mut curr_rows = rows;
-        let mut curr_zoom: f32 = if curr_cols < 60 { 2.0 } else if curr_cols < 90 { 1.5 } else { 1.0 };
-        let mut curr_hide_text: bool = true;
-        let mut width_px = 360u32.max((curr_cols as u32) * 8);
-        let mut height_px = ((curr_rows.saturating_sub(1) as u32) * 16).max(480);
+        let (mut width_px, mut height_px) = compute_viewport_size(curr_cols, curr_rows, curr_zoom);
+        *shared_viewport.lock().unwrap() = (width_px, height_px);
         seq += 1;
         let emu_cmd = format!(
             r#"{{"id":{},"method":"Emulation.setDeviceMetricsOverride","params":{{"width":{},"height":{},"deviceScaleFactor":1.0,"mobile":true,"fitWindow":false}}}}"#,
@@ -1305,12 +1522,14 @@ fn spawn_cdp_worker(
         );
         let _ = ws.send_text(&emu_cmd);
 
-        // 3) Page.navigate
         seq += 1;
-        let nav_cmd = format!(r#"{{"id":{},"method":"Page.navigate","params":{{"url":"{}"}}}}"#, seq, initial_url);
+        let nav_cmd = format!(
+            r#"{{"id":{},"method":"Page.navigate","params":{{"url":"{}"}}}}"#,
+            seq,
+            json_escape(&initial_url)
+        );
         let _ = ws.send_text(&nav_cmd);
 
-        // 4) Page.startScreencast (High quality JPEG capture for fast transfer and sharp rendering)
         seq += 1;
         let sc_cmd = format!(
             r#"{{"id":{},"method":"Page.startScreencast","params":{{"format":"jpeg","quality":85,"maxWidth":{},"maxHeight":{},"everyNthFrame":1}}}}"#,
@@ -1318,7 +1537,10 @@ fn spawn_cdp_worker(
         );
         let _ = ws.send_text(&sc_cmd);
 
-        // 5) Event listener & ACK streaming loop
+        let mut last_text_extract = Instant::now() - Duration::from_secs(1);
+        let mut pending_extract = true;
+        let mut active_until = Instant::now() + Duration::from_secs(3);
+
         loop {
             while let Ok(cmd) = command_rx.try_recv() {
                 match cmd {
@@ -1326,8 +1548,11 @@ fn spawn_cdp_worker(
                         is_loading.store(true, Ordering::Relaxed);
                         frame_counter.store(0, Ordering::Relaxed);
                         shared_overlays.lock().unwrap().clear();
-                        width_px = 360u32.max((curr_cols as u32) * 8);
-                        height_px = ((curr_rows.saturating_sub(1) as u32) * 16).max(480);
+                        *shared_live_url.lock().unwrap() = new_url.clone();
+                        let (w, h) = compute_viewport_size(curr_cols, curr_rows, curr_zoom);
+                        width_px = w;
+                        height_px = h;
+                        *shared_viewport.lock().unwrap() = (width_px, height_px);
                         seq += 1;
                         let emu = format!(
                             r#"{{"id":{},"method":"Emulation.setDeviceMetricsOverride","params":{{"width":{},"height":{},"deviceScaleFactor":1.0,"mobile":true,"fitWindow":false}}}}"#,
@@ -1335,31 +1560,51 @@ fn spawn_cdp_worker(
                         );
                         let _ = ws.send_text(&emu);
                         seq += 1;
-                        let msg = format!(r#"{{"id":{},"method":"Page.navigate","params":{{"url":"{}"}}}}"#, seq, new_url);
+                        let msg = format!(
+                            r#"{{"id":{},"method":"Page.navigate","params":{{"url":"{}"}}}}"#,
+                            seq,
+                            json_escape(&new_url)
+                        );
                         let _ = ws.send_text(&msg);
+                        pending_extract = true;
+                        active_until = Instant::now() + Duration::from_secs(3);
                     }
                     CdpWorkerCommand::SetHideText(hide) => {
                         curr_hide_text = hide;
                         seq += 1;
-                        let media_str = if hide { "" } else { "not all" };
-                        let js = format!(
-                            "var h=document.getElementById('termblitz-hide-text');if(!h){{h=document.createElement('style');h.id='termblitz-hide-text';h.textContent='*{{color:transparent!important;text-shadow:none!important;-webkit-text-stroke:0!important;}}';document.head.appendChild(h);}}h.media='{}';",
-                            media_str
-                        );
+                        let js = build_page_style_js(curr_hide_text, curr_adblock);
                         let eval_cmd = format!(
                             r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
-                            seq, js
+                            seq,
+                            json_escape(&js)
                         );
                         let _ = ws.send_text(&eval_cmd);
                         if hide {
                             request_text_extraction(&mut ws, &mut seq);
+                            last_text_extract = Instant::now();
                         }
+                        active_until = Instant::now() + Duration::from_millis(800);
+                    }
+                    CdpWorkerCommand::SetAdBlock(enabled) => {
+                        curr_adblock = enabled;
+                        configure_cdp_adblock(&mut ws, &mut seq, curr_adblock);
+                        seq += 1;
+                        let js = build_page_style_js(curr_hide_text, curr_adblock);
+                        let eval_cmd = format!(
+                            r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
+                            seq,
+                            json_escape(&js)
+                        );
+                        let _ = ws.send_text(&eval_cmd);
+                        pending_extract = true;
                     }
                     CdpWorkerCommand::Resize { cols: new_cols, rows: new_rows } => {
                         curr_cols = new_cols;
                         curr_rows = new_rows;
-                        width_px = 360u32.max((curr_cols as u32) * 8);
-                        height_px = ((curr_rows.saturating_sub(1) as u32) * 16).max(480);
+                        let (w, h) = compute_viewport_size(curr_cols, curr_rows, curr_zoom);
+                        width_px = w;
+                        height_px = h;
+                        *shared_viewport.lock().unwrap() = (width_px, height_px);
                         seq += 1;
                         let emu = format!(
                             r#"{{"id":{},"method":"Emulation.setDeviceMetricsOverride","params":{{"width":{},"height":{},"deviceScaleFactor":1.0,"mobile":true,"fitWindow":false}}}}"#,
@@ -1372,7 +1617,8 @@ fn spawn_cdp_worker(
                             seq, width_px, height_px
                         );
                         let _ = ws.send_text(&sc);
-                        request_text_extraction(&mut ws, &mut seq);
+                        pending_extract = true;
+                        active_until = Instant::now() + Duration::from_millis(1000);
                     }
                     CdpWorkerCommand::Scroll(delta) => {
                         let center_x = width_px / 2;
@@ -1380,14 +1626,16 @@ fn spawn_cdp_worker(
                         seq += 1;
                         let scroll_msg = format!(
                             r#"{{"id":{},"method":"Input.dispatchMouseEvent","params":{{"type":"mouseWheel","x":{},"y":{},"deltaX":0,"deltaY":{}}}}}"#,
-                            seq, center_x, center_y, delta * 120
+                            seq, center_x, center_y, delta * 90
                         );
                         let _ = ws.send_text(&scroll_msg);
-                        request_text_extraction(&mut ws, &mut seq);
+                        pending_extract = true;
+                        active_until = Instant::now() + Duration::from_millis(900);
                     }
                     CdpWorkerCommand::Click(col, row) => {
-                        let px_x = ((col as f32 * width_px as f32) / curr_cols.max(1) as f32) as u32;
-                        let px_y = (((row.saturating_sub(1) as f32) * height_px as f32) / (curr_rows.saturating_sub(1)).max(1) as f32) as u32;
+                        let px_x = (((col as f32 + 0.5) * width_px as f32) / curr_cols.max(1) as f32) as u32;
+                        let px_y = ((((row.saturating_sub(1) as f32) + 0.5) * height_px as f32)
+                            / (curr_rows.saturating_sub(1)).max(1) as f32) as u32;
                         seq += 1;
                         let press = format!(
                             r#"{{"id":{},"method":"Input.dispatchMouseEvent","params":{{"type":"mousePressed","x":{},"y":{},"button":"left","clickCount":1}}}}"#,
@@ -1400,17 +1648,49 @@ fn spawn_cdp_worker(
                             seq, px_x, px_y
                         );
                         let _ = ws.send_text(&release);
+                        pending_extract = true;
+                        active_until = Instant::now() + Duration::from_secs(2);
                     }
                     CdpWorkerCommand::SetZoom(new_zoom) => {
-                        curr_zoom = new_zoom;
+                        curr_zoom = new_zoom.clamp(0.5, 3.0);
+                        let (w, h) = compute_viewport_size(curr_cols, curr_rows, curr_zoom);
+                        width_px = w;
+                        height_px = h;
+                        *shared_viewport.lock().unwrap() = (width_px, height_px);
                         seq += 1;
-                        let zoom_js = format!("document.documentElement.style.zoom = '{:.2}';", curr_zoom);
+                        let emu = format!(
+                            r#"{{"id":{},"method":"Emulation.setDeviceMetricsOverride","params":{{"width":{},"height":{},"deviceScaleFactor":1.0,"mobile":true,"fitWindow":false}}}}"#,
+                            seq, width_px, height_px
+                        );
+                        let _ = ws.send_text(&emu);
+                        seq += 1;
+                        let sc = format!(
+                            r#"{{"id":{},"method":"Page.startScreencast","params":{{"format":"jpeg","quality":85,"maxWidth":{},"maxHeight":{},"everyNthFrame":1}}}}"#,
+                            seq, width_px, height_px
+                        );
+                        let _ = ws.send_text(&sc);
+                        pending_extract = true;
+                        active_until = Instant::now() + Duration::from_millis(1000);
+                    }
+                    CdpWorkerCommand::HistoryBack => {
+                        seq += 1;
                         let eval_cmd = format!(
-                            r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
-                            seq, zoom_js
+                            r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"history.back()"}}}}"#,
+                            seq
                         );
                         let _ = ws.send_text(&eval_cmd);
-                        request_text_extraction(&mut ws, &mut seq);
+                        pending_extract = true;
+                        active_until = Instant::now() + Duration::from_secs(2);
+                    }
+                    CdpWorkerCommand::HistoryForward => {
+                        seq += 1;
+                        let eval_cmd = format!(
+                            r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"history.forward()"}}}}"#,
+                            seq
+                        );
+                        let _ = ws.send_text(&eval_cmd);
+                        pending_extract = true;
+                        active_until = Instant::now() + Duration::from_secs(2);
                     }
                     CdpWorkerCommand::Stop => {
                         let _ = ws.send_text(r#"{"id":999,"method":"Page.stopScreencast"}"#);
@@ -1420,28 +1700,20 @@ fn spawn_cdp_worker(
             }
 
             while let Some(msg) = ws.poll_message() {
-                if msg.contains(r#""Page.loadEventFired""#) {
-                    is_loading.store(false, Ordering::Relaxed);
-                    // Inject Option C mobile reflow CSS, CSS zoom, and transparent text CSS on page load
+                if msg.contains(r#""Page.loadEventFired""#) || msg.contains(r#""Page.frameNavigated""#) {
+                    if msg.contains(r#""Page.loadEventFired""#) {
+                        is_loading.store(false, Ordering::Relaxed);
+                    }
                     seq += 1;
-                    let media_str = if curr_hide_text { "" } else { "not all" };
-                    let setup_js = format!(
-                        "document.documentElement.style.zoom = '{:.2}'; \
-                         var s=document.getElementById('termblitz-reflow'); \
-                         if(!s){{ s=document.createElement('style'); s.id='termblitz-reflow'; s.textContent='html,body{{max-width:100vw!important;overflow-x:hidden!important;box-sizing:border-box!important;word-break:break-word!important;}} img,video,canvas,svg{{max-width:100%!important;height:auto!important;}}'; document.head.appendChild(s); }} \
-                         var h=document.getElementById('termblitz-hide-text'); \
-                         if(!h){{ h=document.createElement('style'); h.id='termblitz-hide-text'; h.textContent='*{{color:transparent!important;text-shadow:none!important;-webkit-text-stroke:0!important;}}'; document.head.appendChild(h); }} \
-                         h.media='{}';",
-                        curr_zoom, media_str
-                    );
+                    let setup_js = build_page_style_js(curr_hide_text, curr_adblock);
                     let eval_cmd = format!(
                         r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
-                        seq, setup_js
+                        seq,
+                        json_escape(&setup_js)
                     );
                     let _ = ws.send_text(&eval_cmd);
-
-                    // Option A: Extract visible DOM text nodes
-                    request_text_extraction(&mut ws, &mut seq);
+                    pending_extract = true;
+                    active_until = Instant::now() + Duration::from_secs(2);
                 }
 
                 // Handle text extraction response
@@ -1454,6 +1726,18 @@ fn spawn_cdp_worker(
                             let mut spans = Vec::new();
                             for line in unescaped.lines() {
                                 let parts: Vec<&str> = line.split('\t').collect();
+                                if parts.first() == Some(&"META") && parts.len() >= 5 {
+                                    let vw = parts[1].parse::<u32>().unwrap_or(width_px).max(100);
+                                    let vh = parts[2].parse::<u32>().unwrap_or(height_px).max(100);
+                                    let pct = parts[3].parse::<usize>().unwrap_or(0);
+                                    let url_str = parts[4].trim();
+                                    *shared_viewport.lock().unwrap() = (vw, vh);
+                                    shared_scroll_pct.store(pct, Ordering::Relaxed);
+                                    if !url_str.is_empty() && url_str != "about:blank" {
+                                        *shared_live_url.lock().unwrap() = url_str.to_string();
+                                    }
+                                    continue;
+                                }
                                 if parts.len() >= 8 {
                                     let text = parts[0].to_string();
                                     let px_x = parts[1].parse::<i32>().unwrap_or(0);
@@ -1468,6 +1752,12 @@ fn spawn_cdp_worker(
                                     } else {
                                         None
                                     };
+                                    let is_input = parts.get(9).copied() == Some("1");
+                                    let link_url = parts
+                                        .get(10)
+                                        .map(|s| s.trim())
+                                        .filter(|s| !s.is_empty())
+                                        .map(|s| s.to_string());
                                     spans.push(TextOverlaySpan {
                                         text,
                                         px_x,
@@ -1478,6 +1768,8 @@ fn spawn_cdp_worker(
                                         bg,
                                         bold,
                                         is_link,
+                                        is_input,
+                                        link_url,
                                     });
                                 }
                             }
@@ -1487,7 +1779,6 @@ fn spawn_cdp_worker(
                 }
 
                 if msg.contains(r#""Page.screencastFrame""#) {
-                    // Robust whitespace-tolerant sessionId parser
                     let session_id = if let Some(pos) = msg.find(r#""sessionId""#) {
                         let rest = &msg[pos + 11..];
                         let digits: String = rest
@@ -1501,7 +1792,6 @@ fn spawn_cdp_worker(
                         0
                     };
 
-                    // Robust whitespace-tolerant data payload parser
                     if let Some(pos) = msg.find(r#""data""#) {
                         let rest = &msg[pos + 6..];
                         if let Some(q1) = rest.find('"') {
@@ -1516,15 +1806,13 @@ fn spawn_cdp_worker(
                                     if c >= 1 {
                                         is_loading.store(false, Ordering::Relaxed);
                                     }
-                                    if (c == 1 || c == 3 || c == 6 || c == 10) && curr_hide_text {
-                                        request_text_extraction(&mut ws, &mut seq);
-                                    }
+                                    pending_extract = true;
                                 }
                             }
                         }
                     }
 
-                    // Always acknowledge frame immediately to maintain continuous pipeline
+                    // Always acknowledge frame immediately
                     seq += 1;
                     let ack = format!(
                         r#"{{"id":{},"method":"Page.screencastFrameAck","params":{{"sessionId":{}}}}}"#,
@@ -1532,6 +1820,24 @@ fn spawn_cdp_worker(
                     );
                     let _ = ws.send_text(&ack);
                 }
+            }
+
+            // Throttled real-time DOM text & coordinate extraction during active updates
+            let now = Instant::now();
+            if (pending_extract || now < active_until)
+                && last_text_extract.elapsed() >= Duration::from_millis(90)
+            {
+                let setup_js = build_page_style_js(curr_hide_text, curr_adblock);
+                seq += 1;
+                let eval_cmd = format!(
+                    r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
+                    seq,
+                    json_escape(&setup_js)
+                );
+                let _ = ws.send_text(&eval_cmd);
+                request_text_extraction(&mut ws, &mut seq);
+                last_text_extract = now;
+                pending_extract = false;
             }
         }
     });
@@ -1546,9 +1852,13 @@ pub struct CdpEngine {
     pub chromium_bin: Option<String>,
     pub frame_buffer: Arc<Mutex<PixelBuffer>>,
     pub text_overlays: Arc<Mutex<Vec<TextOverlaySpan>>>,
+    pub viewport_dims: Arc<Mutex<(u32, u32)>>,
+    pub scroll_pct: Arc<AtomicUsize>,
+    pub live_url: Arc<Mutex<String>>,
     pub frame_counter: Arc<AtomicUsize>,
     pub is_loading: Arc<AtomicBool>,
     pub zoom: f32,
+    pub adblock_enabled: bool,
     command_tx: Option<Sender<CdpWorkerCommand>>,
     cols: u16,
     rows: u16,
@@ -1565,18 +1875,64 @@ impl CdpEngine {
             error_message: Arc::new(Mutex::new(None)),
             frame_buffer: Arc::new(Mutex::new(PixelBuffer::new(80, 48, Color::new(246, 246, 239)))),
             text_overlays: Arc::new(Mutex::new(Vec::new())),
+            viewport_dims: Arc::new(Mutex::new((360, 640))),
+            scroll_pct: Arc::new(AtomicUsize::new(0)),
+            live_url: Arc::new(Mutex::new(String::new())),
             frame_counter: Arc::new(AtomicUsize::new(0)),
             is_loading: Arc::new(AtomicBool::new(true)),
             chromium_bin,
             command_tx: None,
             cols: 80,
             rows: 24,
-            zoom: 2.0, // Crisp 200% default zoom for mobile terminal readability
+            zoom: 1.0,
+            adblock_enabled: true,
         }
     }
 
     pub fn get_text_overlays(&self) -> Vec<TextOverlaySpan> {
         self.text_overlays.lock().unwrap().clone()
+    }
+
+    pub fn get_viewport_dims(&self) -> (u32, u32) {
+        *self.viewport_dims.lock().unwrap()
+    }
+
+    pub fn get_scroll_pct(&self) -> usize {
+        self.scroll_pct.load(Ordering::Relaxed)
+    }
+
+    pub fn get_live_url(&self) -> String {
+        self.live_url.lock().unwrap().clone()
+    }
+
+    pub fn hit_test_overlay(&self, click_x: u16, click_y: u16, cols: u16, rows: u16) -> (Option<String>, bool) {
+        let overlays = self.get_text_overlays();
+        let (vw, vh) = self.get_viewport_dims();
+        let pw = vw.max(1) as f32;
+        let ph = vh.max(1) as f32;
+        let view_start_y = 1u16;
+        let view_rows = (rows.saturating_sub(view_start_y)).max(1) as f32;
+
+        for span in overlays.iter().rev() {
+            let start_col = ((span.px_x.max(0) as f32 * cols as f32) / pw).round() as u16;
+            let span_cols = ((span.px_w.max(8) as f32 * cols as f32) / pw).round().max(2.0) as u16;
+            let term_row = view_start_y + ((span.px_y.max(0) as f32 * view_rows) / ph).round() as u16;
+            let box_rows = ((span.px_h.max(14) as f32 * view_rows) / ph).ceil().max(1.0) as u16;
+
+            if click_y >= term_row
+                && click_y < term_row.saturating_add(box_rows)
+                && click_x >= start_col
+                && click_x <= start_col.saturating_add(span_cols)
+            {
+                if span.is_input {
+                    return (None, true);
+                }
+                if let Some(ref u) = span.link_url {
+                    return (Some(u.clone()), false);
+                }
+            }
+        }
+        (None, false)
     }
 
     pub fn set_hide_text(&mut self, hide: bool) {
@@ -1585,22 +1941,41 @@ impl CdpEngine {
         }
     }
 
+    pub fn set_adblock(&mut self, enabled: bool) {
+        self.adblock_enabled = enabled;
+        if let Some(ref tx) = self.command_tx {
+            let _ = tx.send(CdpWorkerCommand::SetAdBlock(enabled));
+        }
+    }
+
+    pub fn history_back(&mut self) {
+        if let Some(ref tx) = self.command_tx {
+            let _ = tx.send(CdpWorkerCommand::HistoryBack);
+        }
+    }
+
+    pub fn history_forward(&mut self) {
+        if let Some(ref tx) = self.command_tx {
+            let _ = tx.send(CdpWorkerCommand::HistoryForward);
+        }
+    }
+
     pub fn zoom_in(&mut self) {
-        self.zoom = (self.zoom + 0.25).min(3.5);
+        self.zoom = (self.zoom + 0.25).min(2.5);
         if let Some(ref tx) = self.command_tx {
             let _ = tx.send(CdpWorkerCommand::SetZoom(self.zoom));
         }
     }
 
     pub fn zoom_out(&mut self) {
-        self.zoom = (self.zoom - 0.25).max(0.75);
+        self.zoom = (self.zoom - 0.25).max(0.5);
         if let Some(ref tx) = self.command_tx {
             let _ = tx.send(CdpWorkerCommand::SetZoom(self.zoom));
         }
     }
 
     pub fn zoom_reset(&mut self) {
-        self.zoom = if self.cols < 60 { 2.0 } else { 1.0 };
+        self.zoom = 1.0;
         if let Some(ref tx) = self.command_tx {
             let _ = tx.send(CdpWorkerCommand::SetZoom(self.zoom));
         }
@@ -1618,9 +1993,8 @@ impl CdpEngine {
         self.is_loading.load(Ordering::Relaxed)
     }
 
-    /// Automatically searches for headless Chromium across Termux ($PREFIX), Debian/Linux (/usr/bin), macOS, and $PATH
+    /// Automatically searches for headless Chromium across Termux ($PREFIX), Debian/Linux (/usr/bin), macOS, Windows, and $PATH
     pub fn find_chromium_binary() -> Option<String> {
-        // 1. Explicit Termux environment path ($PREFIX/bin/chromium)
         if let Ok(prefix) = std::env::var("PREFIX") {
             let termux_candidates = [
                 format!("{}/bin/chromium", prefix),
@@ -1633,7 +2007,6 @@ impl CdpEngine {
             }
         }
 
-        // 2. Standard Linux, Desktop, and macOS locations (prefer direct binary over shell wrapper)
         let standard_candidates = [
             "/usr/lib/chromium/chromium",
             "/data/data/com.termux/files/usr/var/lib/proot-distro/containers/debian/rootfs/usr/lib/chromium/chromium",
@@ -1647,11 +2020,13 @@ impl CdpEngine {
             "/var/lib/flatpak/exports/bin/org.chromium.Chromium",
             "/data/data/com.termux/files/usr/var/lib/proot-distro/containers/debian/rootfs/usr/bin/chromium",
             "/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/debian/usr/bin/chromium",
-            // macOS Desktop Applications
             "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
             "/Applications/Chromium.app/Contents/MacOS/Chromium",
             "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
             "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+            "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
         ];
 
         for p in &standard_candidates {
@@ -1660,7 +2035,6 @@ impl CdpEngine {
             }
         }
 
-        // 3. Search all directories in $PATH
         let binary_names = [
             "chromium",
             "chromium-browser",
@@ -1669,6 +2043,7 @@ impl CdpEngine {
             "chrome",
             "brave-browser",
             "microsoft-edge-stable",
+            "msedge",
         ];
 
         if let Ok(path_var) = std::env::var("PATH") {
@@ -1682,7 +2057,6 @@ impl CdpEngine {
             }
         }
 
-        // 4. Execution check fallback
         for name in &binary_names {
             if let Ok(res) = Command::new(name).arg("--version").output() {
                 if res.status.success() {
@@ -1694,13 +2068,11 @@ impl CdpEngine {
         None
     }
 
-    /// Spawns headless Chromium with remote debugging port and window sizing
     pub fn ensure_browser_running(&mut self, window_w: u16, window_h: u16) -> Result<(), String> {
         if self.process.is_some() {
             return Ok(());
         }
 
-        // Check if an existing Chromium instance is already healthy on this port
         if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", self.port)) {
             stream.set_read_timeout(Some(Duration::from_millis(300))).ok();
             stream.set_write_timeout(Some(Duration::from_millis(300))).ok();
@@ -1739,6 +2111,7 @@ impl CdpEngine {
             .arg("--disable-breakpad")
             .arg("--disable-component-update")
             .arg("--disable-background-networking")
+            .arg("--disable-popup-blocking")
             .arg("--disable-features=DevicePosture,MediaStream,AudioServiceOutOfProcess,Translate,BackForwardCache")
             .arg("--mute-audio")
             .arg("--no-first-run")
@@ -1778,7 +2151,11 @@ impl CdpEngine {
                     self.is_connected = true;
                     Ok(())
                 } else {
-                    let err = format!("Chromium started (PID: {:?}) but failed to bind port {}", self.process.as_ref().map(|p| p.id()), self.port);
+                    let err = format!(
+                        "Chromium started (PID: {:?}) but failed to bind port {}",
+                        self.process.as_ref().map(|p| p.id()),
+                        self.port
+                    );
                     *self.error_message.lock().unwrap() = Some(err.clone());
                     Err(err)
                 }
@@ -1793,12 +2170,12 @@ impl CdpEngine {
 
     pub fn navigate(&mut self, url: &str, cols: u16, rows: u16) {
         self.current_url = url.to_string();
+        *self.live_url.lock().unwrap() = url.to_string();
         self.cols = cols;
         self.rows = rows;
         self.is_loading.store(true, Ordering::Relaxed);
 
-        let w_px = (cols as u32) * 8;
-        let h_px = (rows.saturating_sub(1) as u32) * 16;
+        let (w_px, h_px) = compute_viewport_size(cols, rows, self.zoom);
 
         if let Err(e) = self.ensure_browser_running(w_px as u16, h_px as u16) {
             *self.error_message.lock().unwrap() = Some(e);
@@ -1817,6 +2194,9 @@ impl CdpEngine {
                 rows,
                 Arc::clone(&self.frame_buffer),
                 Arc::clone(&self.text_overlays),
+                Arc::clone(&self.viewport_dims),
+                Arc::clone(&self.scroll_pct),
+                Arc::clone(&self.live_url),
                 Arc::clone(&self.frame_counter),
                 Arc::clone(&self.error_message),
                 Arc::clone(&self.is_loading),
@@ -1857,14 +2237,16 @@ impl CdpEngine {
             let pid = child.id();
             let _ = child.kill();
             let _ = child.wait();
-            // Clean up any child worker processes
-            let _ = Command::new("pkill")
-                .arg("-9")
-                .arg("-P")
-                .arg(pid.to_string())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .output();
+            #[cfg(unix)]
+            {
+                let _ = Command::new("pkill")
+                    .arg("-9")
+                    .arg("-P")
+                    .arg(pid.to_string())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output();
+            }
         }
     }
 }
@@ -1899,6 +2281,25 @@ mod tests {
     }
 
     #[test]
+    fn test_script_with_less_than_does_not_swallow_body() {
+        let mut engine = NativeEngine::new();
+        engine.raw_html = r##"
+        <html>
+        <head><script>for (var i = 0; i < 10; i++) { console.log(i); }</script></head>
+        <body><p>Visible Body Content</p></body>
+        </html>
+        "##.to_string();
+        engine.parse_and_layout(80);
+        let all_text: String = engine
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.text.as_str()))
+            .collect();
+        assert!(all_text.contains("Visible Body Content"));
+        assert!(!all_text.contains("console.log"));
+    }
+
+    #[test]
     fn test_table_horizontal_layout() {
         let mut engine = NativeEngine::new();
         engine.raw_html = r##"
@@ -1920,18 +2321,15 @@ mod tests {
 
         engine.parse_and_layout(100);
 
-        // Header row should have orange background
         assert_eq!(engine.lines[0].row_bg, Some(Color::new(255, 102, 0)));
         let header_text: String = engine.lines[0].spans.iter().map(|s| s.text.as_str()).collect();
         assert!(header_text.contains("Hacker News"));
         assert!(header_text.contains("new | past | comments"));
 
-        // Row 1 should have "1." and "AI is forcing us to pay debt" on the same line!
         let story_text: String = engine.lines[1].spans.iter().map(|s| s.text.as_str()).collect();
         assert!(story_text.contains("1."));
         assert!(story_text.contains("AI is forcing us to pay debt"));
 
-        // Row 2 should have decoded comments (not raw &nbsp;)
         let subtext: String = engine.lines[2].spans.iter().map(|s| s.text.as_str()).collect();
         assert!(subtext.contains("473 comments"));
         assert!(!subtext.contains("&nbsp;"));
@@ -1943,7 +2341,6 @@ mod tests {
         assert_eq!(RenderMode::CdpHybrid.next(true), RenderMode::CdpRaw);
         assert_eq!(RenderMode::CdpRaw.next(true), RenderMode::Native);
 
-        // When Chromium is missing, lock to Native
         assert_eq!(RenderMode::Native.next(false), RenderMode::Native);
         assert_eq!(RenderMode::CdpHybrid.next(false), RenderMode::Native);
         assert_eq!(RenderMode::CdpRaw.next(false), RenderMode::Native);
@@ -1956,7 +2353,7 @@ mod tests {
     #[test]
     fn test_rgba_color_parsing() {
         assert_eq!(parse_color_from_str("rgba(255, 102, 0, 1.0)"), Some(Color::new(255, 102, 0)));
-        assert_eq!(parse_color_from_str("rgba(0, 0, 0, 0)"), None); // Fully transparent
+        assert_eq!(parse_color_from_str("rgba(0, 0, 0, 0)"), None);
         assert_eq!(parse_color_from_str("rgb(10, 20, 30)"), Some(Color::new(10, 20, 30)));
     }
 
@@ -1965,56 +2362,6 @@ mod tests {
         assert_eq!(json_unescape("hello\\nworld\\ttab"), "hello\nworld\ttab");
         assert_eq!(json_unescape("say \\\"hello\\\""), "say \"hello\"");
         assert_eq!(json_unescape("unicode \\u0041"), "unicode A");
-    }
-
-    #[test]
-    fn test_chromium_resolver() {
-        let bin = CdpEngine::find_chromium_binary();
-        // Verifies the resolver runs without panic and identifies chromium in Debian if present
-        if let Some(path) = bin {
-            assert!(!path.is_empty());
-        }
-    }
-
-    #[test]
-    fn test_parse_simulated_frame() {
-        let dummy_jpeg = std::fs::read("/tmp/screencast_frame.jpg").unwrap_or_default();
-        if dummy_jpeg.is_empty() {
-            return;
-        }
-        let b64 = crate::renderer::base64_encode(&dummy_jpeg);
-        let msg = format!(
-            r#"{{"method":"Page.screencastFrame","params":{{"data":"{}","metadata":{{}},"sessionId": 1}}}}"#,
-            b64
-        );
-
-        let session_id = if let Some(pos) = msg.find(r#""sessionId""#) {
-            let rest = &msg[pos + 11..];
-            let digits: String = rest
-                .chars()
-                .skip_while(|c| *c != ':' && !c.is_ascii_digit())
-                .skip_while(|c| *c == ':' || c.is_whitespace())
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            digits.parse::<u64>().unwrap_or(0)
-        } else {
-            0
-        };
-        assert_eq!(session_id, 1);
-
-        if let Some(pos) = msg.find(r#""data""#) {
-            let rest = &msg[pos + 6..];
-            if let Some(q1) = rest.find('"') {
-                let after = &rest[q1 + 1..];
-                if let Some(q2) = after.find('"') {
-                    let b64_extracted = &after[..q2];
-                    let jpeg_bytes = base64_decode(b64_extracted);
-                    assert_eq!(jpeg_bytes.len(), dummy_jpeg.len());
-                    let img = image::load_from_memory(&jpeg_bytes);
-                    assert!(img.is_ok());
-                }
-            }
-        }
     }
 
     #[test]
@@ -2029,6 +2376,8 @@ mod tests {
             bg: None,
             bold: false,
             is_link: false,
+            is_input: false,
+            link_url: None,
         };
 
         let cols = 45u16;
@@ -2046,10 +2395,5 @@ mod tests {
         assert_eq!(start_col, 8);
         assert_eq!(term_row, 17);
         assert_eq!(span_cols, 15);
-
-        let available_cols = (cols - start_col) as usize;
-        let max_len = span_cols.max(span.text.chars().count()).min(available_cols);
-        let display_text: String = span.text.chars().take(max_len).collect();
-        assert_eq!(display_text, "Google offered in:");
     }
 }

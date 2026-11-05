@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use std::io;
+use std::io::{self, Write};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {
@@ -107,6 +107,7 @@ impl PixelBuffer {
         }
     }
 
+    #[inline(always)]
     pub fn get_pixel(&self, x: usize, y: usize) -> Color {
         if x < self.width && y < self.height {
             self.data[y * self.width + x]
@@ -142,9 +143,8 @@ pub enum GraphicsProtocol {
 }
 
 impl GraphicsProtocol {
-    /// Probes terminal emulator capabilities via environment variables ($TERM, $TERM_PROGRAM, KITTY_WINDOW_ID)
+    /// Probes terminal emulator capabilities across Android Termux, Linux, macOS, and Windows
     pub fn auto_detect() -> Self {
-        // 1. Kitty Graphics Protocol check
         if std::env::var("KITTY_WINDOW_ID").is_ok() {
             return GraphicsProtocol::Kitty;
         }
@@ -156,12 +156,11 @@ impl GraphicsProtocol {
         }
         if let Ok(prog) = std::env::var("TERM_PROGRAM") {
             let p = prog.to_lowercase();
-            if p == "ghostty" || p == "kitty" || p == "wezterm" {
+            if p == "ghostty" || p == "kitty" || p == "wezterm" || p == "iterm.app" {
                 return GraphicsProtocol::Kitty;
             }
         }
 
-        // 2. Sixel Graphics Protocol check
         if let Ok(term) = std::env::var("TERM") {
             let t = term.to_lowercase();
             if t.contains("sixel") || t.contains("mlterm") || t == "foot" || t == "foot-extra" {
@@ -175,7 +174,6 @@ impl GraphicsProtocol {
             }
         }
 
-        // 3. Universal High-Performance TrueColor Half-Block Fallback
         GraphicsProtocol::HalfBlockAnsi
     }
 
@@ -261,6 +259,40 @@ fn push_u8(buf: &mut Vec<u8>, mut n: u8) {
     buf.push(b'0' + n);
 }
 
+#[inline]
+fn write_stdout_bytes(buf: &[u8]) -> io::Result<()> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    unsafe {
+        let mut offset = 0;
+        while offset < buf.len() {
+            let ptr = buf[offset..].as_ptr() as *const libc::c_void;
+            let written = libc::write(libc::STDOUT_FILENO, ptr, buf.len() - offset);
+            if written < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if written == 0 {
+                break;
+            }
+            offset += written as usize;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        handle.write_all(buf)?;
+        handle.flush()
+    }
+}
+
 pub struct DiffRenderer {
     pub width: u16,
     pub height: u16,
@@ -336,9 +368,8 @@ impl DiffRenderer {
         }
     }
 
-    /// Prints a string directly over existing ANSI cells while eliminating blurry background text bleed.
-    /// If the target cell was a half-block ('▀'), it detects stroke contrast and selects the clean,
-    /// true background color of the element so the sharp terminal character displays with zero blur.
+    /// Prints a string directly over existing ANSI cells while eliminating blurry background text bleed
+    /// and enforcing minimum luminance contrast so overlaid terminal characters are always razor-sharp.
     pub fn put_str_with_existing_bg(
         &mut self,
         x: u16,
@@ -362,11 +393,11 @@ impl DiffRenderer {
                     let lum_bg = cell.bg.luma_fast();
                     let text_lum = fg.luma_fast();
                     if text_lum < 128 {
-                        // Dark text: pick the lighter subpixel as clean solid background
                         if lum_fg >= lum_bg { cell.fg } else { cell.bg }
+                    } else if lum_fg <= lum_bg {
+                        cell.fg
                     } else {
-                        // Light text: pick the darker subpixel as clean solid background
-                        if lum_fg <= lum_bg { cell.fg } else { cell.bg }
+                        cell.bg
                     }
                 } else if cell.bg != Color::BLACK || cell.ch == ' ' {
                     cell.bg
@@ -374,9 +405,23 @@ impl DiffRenderer {
                     fallback_bg
                 };
 
+                // Guarantee readability if background and foreground have insufficient contrast
+                let bg_lum = clean_bg.luma_fast();
+                let fg_lum = fg.luma_fast();
+                let contrast = bg_lum.abs_diff(fg_lum);
+                let effective_fg = if contrast < 65 {
+                    if bg_lum > 128 {
+                        Color::new(18, 20, 26)
+                    } else {
+                        Color::new(245, 247, 250)
+                    }
+                } else {
+                    fg
+                };
+
                 self.current[idx] = Cell {
                     ch,
-                    fg,
+                    fg: effective_fg,
                     bg: clean_bg,
                     bold,
                     underline,
@@ -414,7 +459,6 @@ impl DiffRenderer {
         let w = x1 - x0;
         let h = y1 - y0;
 
-        // For 1:1 or near 1:1 mapping, use center-pixel nearest-neighbor
         if w <= 1 && h <= 1 {
             return px_buf.get_pixel(x0.min(px_buf.width - 1), y0.min(px_buf.height - 1));
         }
@@ -424,9 +468,6 @@ impl DiffRenderer {
             return px_buf.get_pixel(cx.min(px_buf.width - 1), cy.min(px_buf.height - 1));
         }
 
-        // High-contrast, sharpness-preserving downsampling:
-        // Use regular grid sampling across the entire box (up to 4x4) to guarantee
-        // that thin text strokes and fine UI lines are always captured.
         let cx = x0 + w / 2;
         let cy = y0 + h / 2;
         let center = px_buf.get_pixel(cx.min(px_buf.width - 1), cy.min(px_buf.height - 1));
@@ -474,36 +515,29 @@ impl DiffRenderer {
         let avg_g = (sum_g / count) as u8;
         let avg_b = (sum_b / count) as u8;
         let avg_lum = (sum_r * 77 + sum_g * 150 + sum_b * 29) >> 8;
-        let avg_lum = (avg_lum / count) as u32;
+        let avg_lum = avg_lum / count;
 
         let dark_contrast = avg_lum.saturating_sub(min_lum);
         let light_contrast = max_lum.saturating_sub(avg_lum);
 
-        // Detect contrast (text strokes, icons, borders)
-        if dark_contrast >= 30 && dark_contrast >= light_contrast {
-            // Dark text / stroke on lighter background (e.g. Google Search text)
-            // Preserve stroke boldness (80% stroke, 20% background)
+        if dark_contrast >= 35 && dark_contrast >= light_contrast {
             Color::new(
-                ((min_color.r as u32 * 4 + avg_r as u32) / 5) as u8,
-                ((min_color.g as u32 * 4 + avg_g as u32) / 5) as u8,
-                ((min_color.b as u32 * 4 + avg_b as u32) / 5) as u8,
+                ((min_color.r as u32 * 3 + avg_r as u32 * 2) / 5) as u8,
+                ((min_color.g as u32 * 3 + avg_g as u32 * 2) / 5) as u8,
+                ((min_color.b as u32 * 3 + avg_b as u32 * 2) / 5) as u8,
             )
-        } else if light_contrast >= 30 {
-            // Light text / stroke on darker background (e.g. dark mode web pages)
+        } else if light_contrast >= 35 {
             Color::new(
-                ((max_color.r as u32 * 4 + avg_r as u32) / 5) as u8,
-                ((max_color.g as u32 * 4 + avg_g as u32) / 5) as u8,
-                ((max_color.b as u32 * 4 + avg_b as u32) / 5) as u8,
+                ((max_color.r as u32 * 3 + avg_r as u32 * 2) / 5) as u8,
+                ((max_color.g as u32 * 3 + avg_g as u32 * 2) / 5) as u8,
+                ((max_color.b as u32 * 3 + avg_b as u32 * 2) / 5) as u8,
             )
         } else {
-            // Smooth area / image: use true average color
             Color::new(avg_r, avg_g, avg_b)
         }
     }
 
     /// Renders a PixelBuffer into the terminal using Unicode half-blocks '▀' (upper half = fg, lower half = bg).
-    /// Scales any source dimensions smoothly across the entire terminal viewport width and height with
-    /// contrast-preserving box sampling so thin text strokes and icons remain readable.
     pub fn blit_pixel_buffer(&mut self, px_buf: &PixelBuffer, start_y: u16, max_y: u16) {
         let cols = self.width as usize;
         let rows = (max_y.saturating_sub(start_y)) as usize;
@@ -576,7 +610,6 @@ impl DiffRenderer {
 
         let mut out = Vec::with_capacity(total_len + 512);
 
-        // Delete previous graphics and position cursor
         out.extend_from_slice(b"\x1b_Ga=d,d=A\x1b\\");
         out.extend_from_slice(b"\x1b[");
         push_u16(&mut out, start_y + 1);
@@ -617,10 +650,7 @@ impl DiffRenderer {
             offset = end;
         }
 
-        unsafe {
-            let ptr = out.as_ptr() as *const libc::c_void;
-            libc::write(libc::STDOUT_FILENO, ptr, out.len());
-        }
+        let _ = write_stdout_bytes(&out);
     }
 
     /// Sixel Graphics Protocol generator (6-pixel vertical sliver encoding)
@@ -631,35 +661,32 @@ impl DiffRenderer {
 
         let mut out = Vec::with_capacity(px_buf.width * px_buf.height + 1024);
 
-        // Position cursor at start_y, 1
         out.extend_from_slice(b"\x1b[");
         push_u16(&mut out, start_y + 1);
         out.extend_from_slice(b";1H");
 
-        // DCS q: start of sixel
         out.extend_from_slice(b"\x1bPq\"1;1;");
         push_u16(&mut out, px_buf.width as u16);
         out.push(b';');
         push_u16(&mut out, px_buf.height as u16);
 
-        // Standard 16-color palette definition: #id;2;r%;g%;b% (0..100)
         let colors = [
-            (0, 0, 0),        // 0: Black
-            (100, 100, 100),  // 1: White
-            (100, 0, 0),      // 2: Red
-            (0, 100, 0),      // 3: Green
-            (0, 0, 100),      // 4: Blue
-            (100, 100, 0),    // 5: Yellow
-            (0, 100, 100),    // 6: Cyan
-            (100, 0, 100),    // 7: Magenta
-            (50, 50, 50),     // 8: Gray
-            (80, 80, 80),     // 9: Light gray
-            (100, 40, 0),     // 10: Orange (HN bar!)
-            (96, 96, 93),     // 11: HN Beige (#f6f6ef)
-            (20, 20, 20),     // 12: Dark gray
-            (40, 70, 100),    // 13: Navy
-            (100, 60, 60),    // 14: Light red
-            (60, 100, 60),    // 15: Light green
+            (0, 0, 0),
+            (100, 100, 100),
+            (100, 0, 0),
+            (0, 100, 0),
+            (0, 0, 100),
+            (100, 100, 0),
+            (0, 100, 100),
+            (100, 0, 100),
+            (50, 50, 50),
+            (80, 80, 80),
+            (100, 40, 0),
+            (96, 96, 93),
+            (20, 20, 20),
+            (40, 70, 100),
+            (100, 60, 60),
+            (60, 100, 60),
         ];
 
         for (idx, (r, g, b)) in colors.iter().enumerate() {
@@ -741,15 +768,10 @@ impl DiffRenderer {
 
         out.extend_from_slice(b"\x1b\\");
 
-        unsafe {
-            let ptr = out.as_ptr() as *const libc::c_void;
-            libc::write(libc::STDOUT_FILENO, ptr, out.len());
-        }
+        let _ = write_stdout_bytes(&out);
     }
 
     /// High-performance dirty-cell diffing and run-length batching.
-    /// Emits single-pass ANSI escape sequences into a pre-allocated buffer
-    /// and performs a SINGLE atomic libc::write syscall per frame.
     pub fn flush(&mut self) -> io::Result<usize> {
         self.write_buf.clear();
 
@@ -780,7 +802,6 @@ impl DiffRenderer {
 
                 dirty_count += 1;
 
-                // Position cursor if needed
                 let target_pos = (x as u16 + 1, y as u16 + 1);
                 if cursor_pos != Some(target_pos) {
                     self.write_buf.extend_from_slice(b"\x1b[");
@@ -790,13 +811,11 @@ impl DiffRenderer {
                     self.write_buf.push(b'H');
                 }
 
-                // Collect contiguous run of identical attributes
                 let run_fg = cur.fg;
                 let run_bg = cur.bg;
                 let run_bold = cur.bold;
                 let run_underline = cur.underline;
 
-                // Update text styles if changed
                 if last_bold != Some(run_bold) || last_underline != Some(run_underline) {
                     last_bold = Some(run_bold);
                     last_underline = Some(run_underline);
@@ -813,7 +832,6 @@ impl DiffRenderer {
                     last_bg = None;
                 }
 
-                // Update Foreground 24-bit TrueColor
                 if last_fg != Some(run_fg) {
                     last_fg = Some(run_fg);
                     self.write_buf.extend_from_slice(b"\x1b[38;2;");
@@ -825,7 +843,6 @@ impl DiffRenderer {
                     self.write_buf.push(b'm');
                 }
 
-                // Update Background 24-bit TrueColor
                 if last_bg != Some(run_bg) {
                     last_bg = Some(run_bg);
                     self.write_buf.extend_from_slice(b"\x1b[48;2;");
@@ -837,7 +854,6 @@ impl DiffRenderer {
                     self.write_buf.push(b'm');
                 }
 
-                // Emit run of characters
                 let mut run_len = 0;
                 while x < width {
                     let r_idx = row_offset + x;
@@ -859,17 +875,7 @@ impl DiffRenderer {
             }
         }
 
-        if !self.write_buf.is_empty() {
-            unsafe {
-                let ptr = self.write_buf.as_ptr() as *const libc::c_void;
-                let len = self.write_buf.len();
-                let written = libc::write(libc::STDOUT_FILENO, ptr, len);
-                if written < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-        }
-
+        write_stdout_bytes(&self.write_buf)?;
         Ok(dirty_count)
     }
 }
@@ -890,7 +896,6 @@ mod tests {
     #[test]
     fn test_protocol_auto_detection() {
         let proto = GraphicsProtocol::auto_detect();
-        // Returns a valid variant without crashing
         assert!(proto == GraphicsProtocol::HalfBlockAnsi || proto == GraphicsProtocol::Kitty || proto == GraphicsProtocol::Sixel);
         assert!(!proto.name().is_empty());
         assert!(!proto.short_name().is_empty());
@@ -907,7 +912,6 @@ mod tests {
     #[test]
     fn test_put_str_with_existing_bg() {
         let mut renderer = DiffRenderer::new(10, 5);
-        // Simulate a blurry text half-block: black top stroke on white page background
         renderer.set_cell(0, 0, Cell {
             ch: '▀',
             fg: Color::BLACK,
@@ -916,13 +920,11 @@ mod tests {
             underline: false,
         });
 
-        // Overlay sharp dark text 'A'
         renderer.put_str_with_existing_bg(0, 0, "A", Color::BLACK, Color::LIGHT_GRAY, true, false);
 
         let cell = renderer.current[0];
         assert_eq!(cell.ch, 'A');
         assert_eq!(cell.fg, Color::BLACK);
-        // Clean background should automatically pick white (the lighter subpixel), eliminating the blurry black stroke
         assert_eq!(cell.bg, Color::WHITE);
         assert!(cell.bold);
     }
