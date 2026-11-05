@@ -1,4 +1,4 @@
-name: TermBlitz CI
+name: TermBlitz CI & Multi-Platform Check
 
 on:
   push:
@@ -7,9 +7,12 @@ on:
     branches: [ main, master ]
 
 jobs:
-  test-and-report:
-    name: Build & Diagnostic Suite
-    runs-on: ubuntu-latest
+  build-and-test:
+    name: Build & Test (Linux, macOS, Windows)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - name: Checkout Source Code
@@ -21,40 +24,68 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Run Test Suite
+      - name: Run Neural & Math Diagnostic Tests
         shell: bash
         run: |
+          set -eo pipefail
           mkdir -p target
+          # Run tests and capture both console output and exit code
           cargo test --verbose 2>&1 | tee target/test_output.txt
 
-      - name: Build Release Binary
+      - name: Compile Release Binary
         shell: bash
         run: cargo build --release --verbose
 
-      - name: Generate 1-Page Summary Report
+      - name: Generate Detailed CI Summary Report
         if: always()
         shell: bash
         run: |
+          # Calculate binary size if build produced one
           BIN_SIZE="N/A"
           if [ -f "target/release/termblitz" ]; then
             BIN_SIZE=$(ls -lh target/release/termblitz | awk '{print $5}')
+          elif [ -f "target/release/termblitz.exe" ]; then
+            BIN_SIZE=$(ls -lh target/release/termblitz.exe | awk '{print $5}')
           fi
 
-          TESTS_PASSED=$(grep -c "test .* \.\.\. ok" target/test_output.txt || true)
-          TESTS_FAILED=$(grep -c "test .* \.\.\. FAILED" target/test_output.txt || true)
+          # Count test passes and failures safely
+          if [ -f "target/test_output.txt" ]; then
+            TESTS_PASSED=$(grep -c "test .* \.\.\. ok" target/test_output.txt || true)
+            TESTS_FAILED=$(grep -c "test .* \.\.\. FAILED" target/test_output.txt || true)
+          else
+            TESTS_PASSED=0
+            TESTS_FAILED=0
+          fi
 
-          # Single clean report page on GitHub Actions summary
-          echo "# 📋 TermBlitz Single-Page Verification Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Check | Status | Details |" >> $GITHUB_STEP_SUMMARY
-          echo "| :--- | :---: | :--- |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Platform** | 🐧 | Linux / Android Termux Target |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Binary Build** | ✅ | Size: \`$BIN_SIZE\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Neural & Math Tests** | ✅ | Passed: \`$TESTS_PASSED\` / Failed: \`$TESTS_FAILED\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Super-Resolution Engine** | 🚀 | FSR 1.0 + FSRCNN-ESPCN Hybrid active |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Dithering Engine** | 🎨 | 4x4 Bayer + Sixel Floyd-Steinberg active |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🔬 Verified Test Cases" >> $GITHUB_STEP_SUMMARY
-          echo '```text' >> $GITHUB_STEP_SUMMARY
-          grep -E "test .* \.\.\. (ok|FAILED)" target/test_output.txt >> $GITHUB_STEP_SUMMARY || echo "Tests executed successfully." >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          # Append structured report to GitHub Actions Step Summary
+          {
+            echo "## 🚀 TermBlitz Build & Diagnostic Report"
+            echo ""
+            echo "| Metric | Details |"
+            echo "| :--- | :--- |"
+            echo "| **Target OS** | \`${{ matrix.os }}\` |"
+            echo "| **Commit** | \`${{ github.sha }}\` |"
+            echo "| **Release Binary Size** | \`${BIN_SIZE}\` |"
+            echo "| **Tests Passed** | ✅ \`${TESTS_PASSED}\` |"
+            echo "| **Tests Failed** | ❌ \`${TESTS_FAILED}\` |"
+            echo ""
+            echo "### 🔬 Diagnostic Test Suite Results"
+            echo '```text'
+            if [ -f "target/test_output.txt" ]; then
+              grep -E "test .* \.\.\. (ok|FAILED)" target/test_output.txt || echo "No test output found."
+            else
+              echo "No test output found."
+            fi
+            echo '```'
+            echo ""
+            echo "<details><summary><b>View Full Raw Test Log</b></summary>"
+            echo ""
+            echo '```text'
+            if [ -f "target/test_output.txt" ]; then
+              cat target/test_output.txt
+            else
+              echo "No log file available."
+            fi
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"

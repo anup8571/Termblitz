@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#[allow(unused_imports)]
 use std::io::{self, Write};
 use crate::upscale::{apply_terminal_subpixel_rcas, apply_upscale_pipeline, UpscaleMode};
 

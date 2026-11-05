@@ -503,7 +503,7 @@ fn main() -> io::Result<()> {
                 } else {
                     if cdp_engine.get_error().is_some() {
                         cdp_engine.stop();
-                        *cdp_engine.error_message.lock().unwrap() = None;
+                        cdp_engine.clear_error();
                     }
                     cdp_engine.navigate(&curr, cols, rows);
                 }

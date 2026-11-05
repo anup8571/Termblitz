@@ -2301,11 +2301,16 @@ impl CdpEngine {
         self.frame_buffer.lock().unwrap().clone()
     }
 
+    pub fn clear_error(&self) {
+        *self.error_message.lock().unwrap() = None;
+    }
+
     pub fn stop(&mut self) {
         if let Some(tx) = self.command_tx.take() {
             let _ = tx.send(CdpWorkerCommand::Stop);
         }
         if let Some(mut child) = self.process.take() {
+            #[cfg(unix)]
             let pid = child.id();
             let _ = child.kill();
             let _ = child.wait();
