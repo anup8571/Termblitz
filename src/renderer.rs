@@ -98,7 +98,7 @@ impl AssetRoi {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
@@ -1400,12 +1400,23 @@ impl DiffRenderer {
                         active_buf.data[cy_bot * active_buf.width + cx_r],
                     )
                 } else {
-                    (
-                        Self::sample_subpixel_box(active_buf, x0, x_mid, top_y0, top_y1),
-                        Self::sample_subpixel_box(active_buf, x_mid_clamped, x1, top_y0, top_y1),
-                        Self::sample_subpixel_box(active_buf, x0, x_mid, bot_y0, bot_y1),
-                        Self::sample_subpixel_box(active_buf, x_mid_clamped, x1, bot_y0, bot_y1),
-                    )
+                    let stride = active_buf.width;
+                    let p_tl = active_buf.data[top_y0 * stride + x0];
+                    let x_end = x1.saturating_sub(1).min(stride - 1);
+                    let y_end = bot_y1.saturating_sub(1).min(active_buf.height - 1);
+                    let p_tr = active_buf.data[top_y0 * stride + x_end];
+                    let p_bl = active_buf.data[y_end * stride + x0];
+                    let p_br = active_buf.data[y_end * stride + x_end];
+                    if p_tl == p_tr && p_tl == p_bl && p_tl == p_br {
+                        (p_tl, p_tl, p_tl, p_tl)
+                    } else {
+                        (
+                            Self::sample_subpixel_box(active_buf, x0, x_mid, top_y0, top_y1),
+                            Self::sample_subpixel_box(active_buf, x_mid_clamped, x1, top_y0, top_y1),
+                            Self::sample_subpixel_box(active_buf, x0, x_mid, bot_y0, bot_y1),
+                            Self::sample_subpixel_box(active_buf, x_mid_clamped, x1, bot_y0, bot_y1),
+                        )
+                    }
                 };
                 self.subpixel_buf.data[top_row_off + sub_x_left] = tl;
                 self.subpixel_buf.data[top_row_off + sub_x_right] = tr;
@@ -1515,10 +1526,13 @@ impl DiffRenderer {
                 let bl = self.subpixel_buf.data[bot_row_off + sx_l];
                 let br = self.subpixel_buf.data[bot_row_off + sx_r];
 
-                let horiz_diff = tl
-                    .luma_fast()
-                    .abs_diff(tr.luma_fast())
-                    .max(bl.luma_fast().abs_diff(br.luma_fast()));
+                let horiz_diff = if tl == tr && bl == br {
+                    0
+                } else {
+                    tl.luma_fast()
+                        .abs_diff(tr.luma_fast())
+                        .max(bl.luma_fast().abs_diff(br.luma_fast()))
+                };
 
                 if horiz_diff >= 14 {
                     let (q_ch, q_fg, q_bg) = binarize_quadrant(tl, tr, bl, br);

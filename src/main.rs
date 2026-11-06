@@ -17,7 +17,7 @@ use crossterm::{
 
 use engine::{CdpEngine, NativeEngine, RenderMode};
 use input::{resolve_input_to_url, AppAction, InputHandler};
-use renderer::{display_width, has_complex_script, is_combining_char, Color, DiffRenderer, GraphicsProtocol};
+use renderer::{display_width, has_complex_script, is_combining_char, Color, DiffRenderer, GraphicsProtocol, PixelBuffer};
 use upscale::UpscaleMode;
 
 struct TerminalGuard;
@@ -138,8 +138,241 @@ fn wrap_overlay_text(text: &str, max_width: usize, max_lines: usize) -> Vec<Stri
     lines
 }
 
+fn print_help() {
+    println!("\x1b[1m⚡ TermBlitz\x1b[0m :: Ultra-fast visual terminal browser for Linux & Android Termux");
+    println!("\n\x1b[1mUSAGE:\x1b[0m\n  termblitz [OPTIONS] [URL or Search Query]");
+    println!("\n\x1b[1mOPTIONS:\x1b[0m");
+    println!("  --benchmark                  Run automated headless stress-test & benchmark against live mainstream websites");
+    println!("  --benchmark-url=<URL>        Run automated stress-test & benchmark against a specific live URL");
+    println!("  --native                     Force Native HTML terminal engine (zero Chromium overhead)");
+    println!("  --hybrid / --cdp             Force Chromium Hybrid mode (60 FPS visual background + crisp terminal text)");
+    println!("  --raw / --cdp-raw            Force Chromium Raw ANSI mode");
+    println!("  --sixel                      Force Sixel graphics protocol");
+    println!("  --kitty                      Force Kitty graphics protocol");
+    println!("  --ansi                       Force Half-Block TrueColor ANSI protocol");
+    println!("  --no-dither                  Disable 4x4 Bayer + Floyd-Steinberg dithering");
+    println!("  --upscale=<MODE>             Set Super-Resolution mode (off, fsr, rcas, photo, srmax)");
+    println!("  --pixel-art                  Enable forced Scale2x pixel-art super-resolution");
+    println!("  -h, --help                   Show this help message");
+}
+
+fn run_live_benchmark(single_url: Option<String>) -> io::Result<()> {
+    let targets: Vec<String> = if let Some(u) = single_url {
+        vec![u]
+    } else {
+        vec![
+            "https://www.google.com".to_string(),
+            "https://m.youtube.com".to_string(),
+            "https://www.instagram.com".to_string(),
+            "https://en.wikipedia.org".to_string(),
+            "https://github.com".to_string(),
+        ]
+    };
+
+    println!("\x1b[1;36m======================================================================\x1b[0m");
+    println!("\x1b[1;32m⚡ TermBlitz Headless Diagnostic & Live Stress-Test Benchmark Loop\x1b[0m");
+    println!("\x1b[1;36m======================================================================\x1b[0m");
+
+    let cols = 80u16;
+    let rows = 30u16;
+    let mut all_passed = true;
+
+    for (idx, url) in targets.iter().enumerate() {
+        println!("\n\x1b[1;33m[{}/{}] Navigating to: {}\x1b[0m", idx + 1, targets.len(), url);
+        let start_time = Instant::now();
+
+        let port = 9222 + (idx as u16);
+        let mut engine = CdpEngine::new(port);
+        engine.upscale_mode = UpscaleMode::FsrOnly;
+        engine.dithering_enabled = true;
+
+        if let Err(e) = engine.ensure_browser_running(cols, rows) {
+            eprintln!("\x1b[1;31m  ✗ Failed to start headless Chromium: {}\x1b[0m", e);
+            all_passed = false;
+            continue;
+        }
+
+        engine.navigate(url, cols, rows);
+
+        let mut frames_captured = 0usize;
+        let mut first_frame_time: Option<Duration> = None;
+        let mut first_dom_time: Option<Duration> = None;
+        let mut last_frame = PixelBuffer::default();
+
+        let nav_wait_start = Instant::now();
+        while nav_wait_start.elapsed() < Duration::from_secs(8) {
+            std::thread::sleep(Duration::from_millis(60));
+            let fc = engine.get_frame_count();
+            if fc > frames_captured {
+                frames_captured = fc;
+                if first_frame_time.is_none() {
+                    first_frame_time = Some(nav_wait_start.elapsed());
+                    last_frame = engine.get_frame();
+                }
+            }
+            let overlays = engine.get_text_overlays();
+            if !overlays.is_empty() && first_dom_time.is_none() {
+                first_dom_time = Some(nav_wait_start.elapsed());
+            }
+            if first_frame_time.is_some() && first_dom_time.is_some() {
+                break;
+            }
+        }
+
+        if last_frame.width == 0 {
+            last_frame = engine.get_frame();
+        }
+        let overlays = engine.get_text_overlays();
+        let overlays_count = overlays.len();
+        let rois = engine.get_active_rois();
+        let rois_count = rois.len();
+        let rect_masks = engine.get_rect_masks();
+        let popups_count = rect_masks.len();
+
+        println!(
+            "  • Captured: Frame {}x{} | Latency: {:.1}ms | Overlays: {} | ROIs: {} | Popups: {}",
+            last_frame.width,
+            last_frame.height,
+            first_frame_time.unwrap_or(nav_wait_start.elapsed()).as_secs_f64() * 1000.0,
+            overlays_count,
+            rois_count,
+            popups_count
+        );
+
+        let mut renderer = DiffRenderer::new(cols, rows);
+        renderer.upscale_mode = UpscaleMode::FsrOnly;
+        renderer.dithering_enabled = true;
+        renderer.set_active_rois(rois.clone(), 360, 576);
+
+        // Warm up blit
+        renderer.blit_frame_cached(1, || last_frame.clone(), 1, rows);
+        let _ = renderer.build_synchronized_frame();
+
+        // High precision benchmark of DiffRenderer blit + VRS Subpixel + FSR + overlay compositing
+        let blit_start = Instant::now();
+        let iterations = 30;
+        let mut total_ansi_bytes = 0usize;
+        for _ in 0..iterations {
+            renderer.blit_frame(&last_frame, 1, rows);
+            for mask in &rect_masks {
+                let (mc0, mr0, mc1, mr1) = mask.to_terminal_bounds(cols, rows, 360, 576);
+                renderer.fill_popup_mask(mc0, mr0, mc1, mr1, mask.color);
+            }
+            for span in overlays.iter().take(50) {
+                let start_col = ((span.px_x.max(0) as f32 * cols as f32) / 360.0).round().min(cols.saturating_sub(1) as f32) as u16;
+                let term_row = 1 + ((span.px_y.max(0) as f32 * (rows - 1) as f32) / 576.0).round() as u16;
+                renderer.put_str_with_existing_bg(
+                    start_col,
+                    term_row.min(rows.saturating_sub(1)),
+                    &span.text,
+                    span.fg,
+                    span.bg,
+                    span.bold,
+                    span.is_link,
+                );
+            }
+            let bytes = renderer.build_synchronized_frame();
+            total_ansi_bytes += bytes;
+        }
+        let avg_blit_micros = (blit_start.elapsed().as_micros() as f64) / (iterations as f64);
+        let avg_blit_ms = avg_blit_micros / 1000.0;
+        let avg_ansi_bytes = total_ansi_bytes / iterations;
+
+        println!(
+            "  • Render Latency: \x1b[1;32m{:.3}ms\x1b[0m (Subpixel VRS + FSR + TrueColor Dither) | ANSI output: {} bytes",
+            avg_blit_ms, avg_ansi_bytes
+        );
+
+        // Simulate Scroll Down & Up
+        let scroll_start = Instant::now();
+        engine.scroll_at(3, cols / 2, rows / 2);
+        std::thread::sleep(Duration::from_millis(200));
+        let pending_px = engine.get_pending_scroll_px();
+        let scroll_pct = engine.get_scroll_pct();
+        println!(
+            "  • Simulated Scroll: dy=+3 -> offset: {}px, pct: {}% ({:.1}ms)",
+            pending_px,
+            scroll_pct,
+            scroll_start.elapsed().as_secs_f64() * 1000.0
+        );
+
+        // Simulate Input / Search focus and typing
+        let type_start = Instant::now();
+        engine.focus_input(cols / 2, rows / 4);
+        engine.type_text("termblitz");
+        std::thread::sleep(Duration::from_millis(300));
+        let typed_overlays = engine.get_text_overlays();
+        let typed_masks = engine.get_rect_masks();
+        println!(
+            "  • Simulated Input: Typed 'termblitz' -> extractions: {} overlays, {} popup masks ({:.1}ms)",
+            typed_overlays.len(),
+            typed_masks.len(),
+            type_start.elapsed().as_secs_f64() * 1000.0
+        );
+
+        let frame_ok = last_frame.width > 0 && last_frame.height > 0;
+        let time_ok = avg_blit_ms <= 1.5;
+        let status_ok = frame_ok && time_ok;
+
+        if status_ok {
+            println!(
+                "\x1b[1;32m  ✓ SUCCESS: {} benchmark passed cleanly in {:.2}s\x1b[0m",
+                url,
+                start_time.elapsed().as_secs_f64()
+            );
+        } else {
+            eprintln!(
+                "\x1b[1;31m  ✗ FAIL/SLOW: {} (frame_ok={}, avg_blit_ms={:.2}ms)\x1b[0m",
+                url, frame_ok, avg_blit_ms
+            );
+            all_passed = false;
+        }
+
+        engine.stop();
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    println!("\x1b[1;36m======================================================================\x1b[0m");
+    if all_passed {
+        println!("\x1b[1;32m✓ ALL LIVE WEBSITES BENCHMARKED SUCCESSFULLY (Render times < 1.5ms)!\x1b[0m");
+        Ok(())
+    } else {
+        eprintln!("\x1b[1;31m✗ Some live benchmarks had issues.\x1b[0m");
+        Err(io::Error::new(io::ErrorKind::Other, "Live benchmark failed"))
+    }
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
+
+    let benchmark_url = args.iter().find_map(|a| {
+        a.strip_prefix("--benchmark-url=")
+            .or_else(|| a.strip_prefix("--benchmark="))
+    }).map(|s| s.to_string());
+    let mut has_bench_flag = benchmark_url.is_some() || args.iter().any(|a| a == "--benchmark" || a == "--benchmark-url");
+    let mut bench_arg_url = benchmark_url;
+    if bench_arg_url.is_none() {
+        let mut iter = args.iter().skip(1);
+        while let Some(arg) = iter.next() {
+            if arg == "--benchmark-url" || arg == "--benchmark" {
+                has_bench_flag = true;
+                if let Some(next) = iter.next() {
+                    if !next.starts_with("--") {
+                        bench_arg_url = Some(next.clone());
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    if has_bench_flag {
+        return run_live_benchmark(bench_arg_url);
+    }
     let raw_arg = args
         .iter()
         .skip(1)

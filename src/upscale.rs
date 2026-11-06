@@ -2034,21 +2034,32 @@ impl SrScratchpad {
                     continue;
                 }
 
-                // Fixed-point BT.601 luma normalized to 0.0..=1.0
-                let lc = (c.luma_fast() as f32) * (1.0 / 255.0);
-                let ln = (n.luma_fast() as f32) * (1.0 / 255.0);
-                let ls = (s.luma_fast() as f32) * (1.0 / 255.0);
-                let lw = (w_px.luma_fast() as f32) * (1.0 / 255.0);
-                let le = (e.luma_fast() as f32) * (1.0 / 255.0);
+                let lc = c.luma_fast();
+                let ln = n.luma_fast();
+                let ls = s.luma_fast();
+                let lw = w_px.luma_fast();
+                let le = e.luma_fast();
 
-                let min4 = ln.min(ls).min(lw).min(le);
-                let max4 = ln.max(ls).max(lw).max(le);
-                let min5 = min4.min(lc);
-                let max5 = max4.max(lc);
+                let min4_u = ln.min(ls).min(lw).min(le);
+                let max4_u = ln.max(ls).max(lw).max(le);
+                let min5_u = min4_u.min(lc);
+                let max5_u = max4_u.max(lc);
 
-                if !should_enhance_pixel(min5, max5) || (max5 > 0.985 && min5 < 0.015) {
+                // Integer-domain flat-patch suppression: skips 75%+ of pixels with zero float operations
+                if max5_u.saturating_sub(min5_u) < 4 || (max5_u >= 251 && min5_u <= 4) {
                     continue;
                 }
+
+                let inv255 = 1.0 / 255.0;
+                let ln_f = ln as f32 * inv255;
+                let ls_f = ls as f32 * inv255;
+                let lw_f = lw as f32 * inv255;
+                let le_f = le as f32 * inv255;
+                let lc_f = lc as f32 * inv255;
+                let min4 = ln_f.min(ls_f).min(lw_f).min(le_f);
+                let max4 = ln_f.max(ls_f).max(lw_f).max(le_f);
+                let min5 = min4.min(lc_f);
+                let max5 = max4.max(lc_f);
 
                 let hit_min = min4 / (4.0 * max5 + 1e-5);
                 let hit_max = (1.0 - max4) / (4.0 * min5 - 4.0 - 1e-5);

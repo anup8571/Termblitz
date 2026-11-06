@@ -11,6 +11,9 @@ use crate::input::PageKey;
 use crate::renderer::{display_width, AssetRoi, Cell, Color, DiffRenderer, PixelBuffer};
 use crate::upscale::UpscaleMode;
 
+pub const ANDROID_CHROME_UA: &str =
+    "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RenderMode {
     Native,    // Option B: HTML/DOM text parser, ultra-fast, zero Chromium overhead
@@ -470,7 +473,7 @@ impl NativeEngine {
         let output = Command::new("curl")
             .arg("-sL")
             .arg("-A")
-            .arg("Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+            .arg(ANDROID_CHROME_UA)
             .arg("--max-time")
             .arg("10")
             .arg(url)
@@ -1443,6 +1446,27 @@ fn build_page_style_js(hide_text: bool, adblock: bool, muted: bool) -> String {
             for(var mi=0;mi<mediaEls.length;mi++){{\
                 mediaEls[mi].muted=!!window.__termblitz_muted;\
             }}\
+            var forceEagerMedia=function(){{\
+                try{{\
+                    var imgs=document.querySelectorAll('img[loading=lazy],img[data-src],img[data-srcset]');\
+                    for(var i=0;i<imgs.length;i++){{\
+                        var im=imgs[i];\
+                        if(im.getAttribute('loading')==='lazy'){{im.setAttribute('loading','eager');}}\
+                        if(im.loading==='lazy')im.loading='eager';\
+                        if(im.dataset){{\
+                            if(im.dataset.src&&(!im.src||im.src.indexOf('data:')===0)){{im.src=im.dataset.src;}}\
+                            if(im.dataset.srcset&&!im.srcset){{im.srcset=im.dataset.srcset;}}\
+                        }}\
+                    }}\
+                    var vids=document.querySelectorAll('video[preload=none],video[data-src]');\
+                    for(var vi=0;vi<vids.length;vi++){{\
+                        var vd=vids[vi];\
+                        if(vd.getAttribute('preload')==='none'){{vd.setAttribute('preload','auto');}}\
+                        if(vd.dataset&&vd.dataset.src&&!vd.src){{vd.src=vd.dataset.src;}}\
+                    }}\
+                }}catch(_e){{}}\
+            }};\
+            forceEagerMedia();\
             var head=document.head||d;\
             var s=document.getElementById('termblitz-core-style');\
             if(!s){{\
@@ -1498,6 +1522,7 @@ fn build_page_style_js(hide_text: bool, adblock: bool, muted: bool) -> String {
                     var obs=new MutationObserver(sweepAds);\
                     obs.observe(d,{{childList:true,subtree:true,attributes:true,attributeFilter:['class']}});\
                 }}catch(_e){{}}\
+                forceEagerMedia();\
                 sweepAds();\
             }};\
             if(document.readyState==='loading'){{\
@@ -1515,6 +1540,24 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
     let js = "(function(){\
         var T=String.fromCharCode(9),N=String.fromCharCode(10),r=[],items=[];\
         if(!document.body)return '';\
+        try{\
+            var _imgs=document.querySelectorAll('img[loading=lazy],img[data-src],img[data-srcset]');\
+            for(var _i=0;_i<_imgs.length;_i++){\
+                var _m=_imgs[_i];\
+                if(_m.getAttribute('loading')==='lazy')_m.setAttribute('loading','eager');\
+                if(_m.loading==='lazy')_m.loading='eager';\
+                if(_m.dataset){\
+                    if(_m.dataset.src&&(!_m.src||_m.src.indexOf('data:')===0))_m.src=_m.dataset.src;\
+                    if(_m.dataset.srcset&&!_m.srcset)_m.srcset=_m.dataset.srcset;\
+                }\
+            }\
+            var _vids=document.querySelectorAll('video[preload=none],video[data-src]');\
+            for(var _vi=0;_vi<_vids.length;_vi++){\
+                var _vd=_vids[_vi];\
+                if(_vd.getAttribute('preload')==='none')_vd.setAttribute('preload','auto');\
+                if(_vd.dataset&&_vd.dataset.src&&!_vd.src)_vd.src=_vd.dataset.src;\
+            }\
+        }catch(_e){}\
         var vw=window.innerWidth||360,vh=window.innerHeight||576;\
         var scEl=window.__termblitz_scroll_el||document.scrollingElement||document.documentElement||document.body;\
         var scTop=(scEl&&scEl!==document.body&&scEl!==document.documentElement&&scEl.scrollTop>0)?scEl.scrollTop:(window.scrollY||document.documentElement.scrollTop||document.body.scrollTop||0);\
@@ -1539,13 +1582,15 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
                 }\
             }\
         }\
-        var assetCand=document.querySelectorAll('img,svg,canvas,[style*=background-image]');\
-        for(var ai=0;ai<assetCand.length&&rois.length<24;ai++){\
+        var assetCand=document.querySelectorAll('img,svg,canvas,[style*=background-image],[style*=background],div[role=img],[data-visual],._aagv,ytd-thumbnail,ytm-media-item');\
+        for(var ai=0;ai<assetCand.length&&rois.length<28;ai++){\
             var ael=assetCand[ai];\
             var as=getComputedStyle(ael);\
             if(as.display==='none'||as.visibility==='hidden'||parseFloat(as.opacity)<0.05)continue;\
             var tag=ael.tagName;\
-            if(tag!=='IMG'&&tag!=='SVG'&&tag!=='CANVAS'){\
+            var isSvg=(tag==='SVG');\
+            var isRaster=(tag==='IMG'||tag==='CANVAS');\
+            if(!isSvg&&!isRaster){\
                 var bgi=as.backgroundImage;\
                 if(!bgi||bgi==='none'||bgi.indexOf('url(')===-1)continue;\
             }\
@@ -1553,8 +1598,8 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             if(!arc||arc.width<16||arc.height<16||arc.bottom<=0||arc.top>=vh||arc.right<=0||arc.left>=vw)continue;\
             var rx=Math.max(0,~~arc.left),ry=Math.max(0,~~arc.top),rw=Math.min(vw-rx,~~arc.width),rh=Math.min(vh-ry,~~arc.height);\
             if(rw<16||rh<16)continue;\
-            if(rw>=vw-4&&rh>=vh-8&&tag!=='IMG'&&tag!=='CANVAS')continue;\
-            var kind=(tag==='SVG')?1:0;\
+            if(rw>=vw-4&&rh>=vh-8&&!isRaster)continue;\
+            var kind=isSvg?1:0;\
             rois.push(rx+','+ry+','+rw+','+rh+','+kind);\
         }\
         var vHeader=vRects.length?('VIDEO:'+vRects.join(';')):'';\
@@ -1578,7 +1623,7 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             }\
             return 0;\
         }\
-        var popSel='[role=listbox],[role=dialog],[role=menu],.G43f7e,.UUbT9,.aajZCb,.sbct';\
+        var popSel='[role=listbox],[role=dialog],[role=alertdialog],[aria-modal=true],[role=menu],.modal,.dialog,#dialog,[id*=cookie],[id*=consent],[class*=consent],[class*=dialog],.G43f7e,.UUbT9,.aajZCb,.sbct';\
         var popCand=document.querySelectorAll(popSel+',div,ul,section');\
         var popBoxes=[];\
         for(var pi=0;pi<popCand.length;pi++){\
@@ -1725,6 +1770,33 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
                 items.push({txt:val,l:~~(erc.left+8),top:ity,w:~~Math.max(16,erc.width-16),h:18,col:es.color,bold:isFocused?1:0,link:0,bg:getBg(el),inp:1,href:'',fix:ifix,pop:0});\
             }\
         }\
+        var btnCand=document.querySelectorAll('button,[role=button],[aria-label*=close],[aria-label*=dismiss]');\
+        for(var bi=0;bi<btnCand.length&&items.length<400;bi++){\
+            var bel=btnCand[bi];\
+            var bs=getComputedStyle(bel);\
+            if(bs.display==='none'||bs.visibility==='hidden'||parseFloat(bs.opacity)<0.1)continue;\
+            var brc=bel.getBoundingClientRect();\
+            if(!brc||brc.width<12||brc.height<12||brc.bottom<=0||brc.top>=vh||brc.right<=0||brc.left>=vw)continue;\
+            var bLabel=(bel.getAttribute('aria-label')||bel.getAttribute('title')||bel.textContent||'').trim();\
+            if(!bLabel)continue;\
+            var bx=~~brc.left,by=~~brc.top,bw=~~brc.width,bh=~~brc.height;\
+            var alr=false;\
+            for(var exi=0;exi<items.length;exi++){\
+                var eit=items[exi];\
+                if(Math.abs(eit.l-bx)<12&&Math.abs(eit.top-by)<12){alr=true;break;}\
+            }\
+            if(!alr){\
+                var bText=bLabel.length>22?bLabel.substring(0,22):bLabel;\
+                if(bel.matches('[aria-label*=close],[aria-label*=dismiss]')&&bText.toLowerCase().indexOf('close')===-1){\
+                    bText='[✕ '+bText+']';\
+                }else if(bel.matches('[aria-label*=close]')){\
+                    bText='[✕ Close]';\
+                }\
+                var bInPop=(bel.closest(popSel)||isFixed(bel))?1:0;\
+                var bBg=getBg(bel)||'rgb(240, 240, 240)';\
+                items.push({txt:bText,l:bx,top:by,w:bw,h:bh,col:bs.color||'rgb(0,0,0)',bold:1,link:1,bg:bBg,inp:0,href:'',fix:isFixed(bel),pop:bInPop});\
+            }\
+        }\
         for(var m=0;m<items.length;m++){\
             var x=items[m];\
             r.push(x.txt+T+x.l+T+x.top+T+x.w+T+x.h+T+x.col+T+x.bold+T+x.link+T+x.bg+T+x.inp+T+x.href+T+(x.fix||0)+T+(x.pop||0));\
@@ -1849,10 +1921,20 @@ fn spawn_cdp_worker(
         configure_cdp_adblock(&mut ws, &mut seq, curr_adblock);
 
         seq += 1;
+        let stealth_js = "(function(){\
+            try{delete Object.getPrototypeOf(navigator).webdriver;}catch(_e){}\
+            try{\
+                Object.defineProperty(navigator,'webdriver',{get:()=>undefined,configurable:true});\
+                Object.defineProperty(navigator,'languages',{get:()=>['en-US','en'],configurable:true});\
+                Object.defineProperty(navigator,'platform',{get:()=>'Linux armv8l',configurable:true});\
+                Object.defineProperty(navigator,'maxTouchPoints',{get:()=>5,configurable:true});\
+            }catch(_e){}\
+            window.chrome=window.chrome||{runtime:{},loadTimes:function(){},csi:function(){},app:{}};\
+        })()";
         let preload_js = build_page_style_js(curr_hide_text, curr_adblock, curr_muted);
         let preload_src = format!(
-            "document.addEventListener('DOMContentLoaded',function(){{{}}});{}",
-            preload_js, preload_js
+            "{};document.addEventListener('DOMContentLoaded',function(){{{}}});{}",
+            stealth_js, preload_js, preload_js
         );
         let add_script_cmd = format!(
             r#"{{"id":{},"method":"Page.addScriptToEvaluateOnNewDocument","params":{{"source":"{}"}}}}"#,
@@ -1862,11 +1944,33 @@ fn spawn_cdp_worker(
         let _ = ws.send_text(&add_script_cmd);
 
         seq += 1;
-        let ua_cmd = format!(
-            r#"{{"id":{},"method":"Emulation.setUserAgentOverride","params":{{"userAgent":"Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"}}}}"#,
+        let ua_str = ANDROID_CHROME_UA;
+        let net_ua_cmd = format!(
+            r#"{{"id":{},"method":"Network.setUserAgentOverride","params":{{"userAgent":"{}","acceptLanguage":"en-US,en;q=0.9","platform":"Linux armv8l"}}}}"#,
+            seq, ua_str
+        );
+        let _ = ws.send_text(&net_ua_cmd);
+
+        seq += 1;
+        let emu_ua_cmd = format!(
+            r#"{{"id":{},"method":"Emulation.setUserAgentOverride","params":{{"userAgent":"{}","acceptLanguage":"en-US,en;q=0.9","platform":"Linux armv8l"}}}}"#,
+            seq, ua_str
+        );
+        let _ = ws.send_text(&emu_ua_cmd);
+
+        seq += 1;
+        let touch_cmd = format!(
+            r#"{{"id":{},"method":"Emulation.setTouchEmulationEnabled","params":{{"enabled":true,"maxTouchPoints":5}}}}"#,
             seq
         );
-        let _ = ws.send_text(&ua_cmd);
+        let _ = ws.send_text(&touch_cmd);
+
+        seq += 1;
+        let headers_cmd = format!(
+            r#"{{"id":{},"method":"Network.setExtraHTTPHeaders","params":{{"headers":{{"Accept-Language":"en-US,en;q=0.9","sec-ch-ua":"\"Chromium\";v=\"130\", \"Google Chrome\";v=\"130\", \"Not?A_Brand\";v=\"99\"","sec-ch-ua-mobile":"?1","sec-ch-ua-platform":"\"Android\""}}}}}}"#,
+            seq
+        );
+        let _ = ws.send_text(&headers_cmd);
 
         let (mut width_px, mut height_px) = compute_viewport_size(curr_cols, curr_rows, curr_zoom);
         *shared_viewport.lock().unwrap() = (width_px, height_px);
@@ -2363,8 +2467,27 @@ fn spawn_cdp_worker(
                                     if(canScroll(cur,dy)){{scEl=cur;cur.scrollTop+=dy;window.__termblitz_scroll_el=cur;break;}}\
                                     cur=cur.parentElement;\
                                 }}\
+                                if(!scEl){{\
+                                    var vh=window.innerHeight||576;\
+                                    var cand=document.querySelectorAll('main,[role=main],#content,#primary,section,article,.scrollable,.feed,[data-scrollable],[data-testid],div');\
+                                    for(var ci=0;ci<cand.length;ci++){{\
+                                        var cel=cand[ci];\
+                                        if(canScroll(cel,dy)){{\
+                                            var crc=cel.getBoundingClientRect();\
+                                            if(crc.width>80&&crc.height>80&&crc.top<vh&&crc.bottom>0){{\
+                                                scEl=cel;\
+                                                cel.scrollTop+=dy;\
+                                                window.__termblitz_scroll_el=cel;\
+                                                break;\
+                                            }}\
+                                        }}\
+                                    }}\
+                                }}\
                                 if(!scEl){{scEl=root;}}\
                             }}\
+                        }}\
+                        if(scEl&&scEl!==document.body&&scEl!==document.documentElement){{\
+                            try{{scEl.dispatchEvent(new Event('scroll',{{bubbles:true}}));}}catch(_e){{}}\
                         }}\
                         var nowTop=(scEl&&scEl!==document.body&&scEl!==document.documentElement&&scEl.scrollTop>0)?scEl.scrollTop:(window.scrollY||document.documentElement.scrollTop||document.body.scrollTop||0);\
                         var baseTop=window.__termblitz_extract_top||0;\
@@ -3031,6 +3154,8 @@ impl CdpEngine {
                 .arg("--no-first-run")
                 .arg("--no-default-browser-check")
                 .arg("--hide-scrollbars")
+                .arg(&format!("--user-agent={}", ANDROID_CHROME_UA))
+                .arg("--blink-settings=primaryHoverType=2,availableHoverTypes=2,primaryPointerType=4,availablePointerTypes=4")
                 .arg(&win_arg)
                 .arg("about:blank")
                 .env("CHROME_LOG_FILE", "/dev/null")
@@ -3442,6 +3567,20 @@ mod tests {
         assert!(js.contains(".ytp-ad-skip-button"));
         assert!(js.contains(".ad-showing"));
         assert!(js.contains("ytd-ad-slot-renderer"));
+    }
+
+    #[test]
+    fn test_android_chrome_user_agent_and_stealth() {
+        assert!(ANDROID_CHROME_UA.contains("Android 14"));
+        assert!(ANDROID_CHROME_UA.contains("Chrome/130.0.0.0"));
+        assert!(ANDROID_CHROME_UA.contains("Mobile Safari/537.36"));
+    }
+
+    #[test]
+    fn test_spa_inner_container_scroll_and_roi_selectors() {
+        let js = build_page_style_js(true, true, false);
+        assert!(js.contains("forceEagerMedia"));
+        assert!(js.contains("loading"));
     }
 }
 
