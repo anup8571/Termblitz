@@ -244,6 +244,8 @@ fn main() -> io::Result<()> {
     let mut fps_timer = Instant::now();
     let mut cdp_last_count = 0;
     let mut cdp_fps = 0.0;
+    let mut cached_mem_mb = get_memory_mb();
+    let mut occupied_cells: Vec<bool> = Vec::with_capacity((cols as usize) * (rows as usize));
     let mut scroll_fast_until = Instant::now() - Duration::from_secs(1);
     let mut quality_settle_pending = false;
 
@@ -720,7 +722,8 @@ fn main() -> io::Result<()> {
                                 .collect();
 
                             let cols_usize = cols as usize;
-                            let mut occupied = vec![false; cols_usize * (rows as usize)];
+                            occupied_cells.clear();
+                            occupied_cells.resize(cols_usize * (rows as usize), false);
 
                             // Pass 2a: Render base document overlays (!span.is_popup), then apply POPUP_MASK popup
                             // clearing, then render elevated popup/autocomplete suggestion items (span.is_popup) on top.
@@ -734,7 +737,7 @@ fn main() -> io::Result<()> {
                                             let r_base = (ry as usize) * cols_usize;
                                             let c0_u = (mc0 as usize).min(cols_usize);
                                             let c1_u = (mc1 as usize).min(cols_usize);
-                                            for occ in &mut occupied[r_base + c0_u..r_base + c1_u] {
+                                            for occ in &mut occupied_cells[r_base + c0_u..r_base + c1_u] {
                                                 *occ = false;
                                             }
                                         }
@@ -804,7 +807,7 @@ fn main() -> io::Result<()> {
                                             let check_c0 = (start_col.saturating_sub(1) as usize).min(cols_usize);
                                             let check_c1 = ((line_end_col + 1) as usize).min(cols_usize);
                                             if check_c0 < check_c1
-                                                && occupied[row_base + check_c0..row_base + check_c1]
+                                                && occupied_cells[row_base + check_c0..row_base + check_c1]
                                                     .iter()
                                                     .any(|&occ| occ)
                                             {
@@ -832,7 +835,7 @@ fn main() -> io::Result<()> {
 
                                             let mark_c0 = (start_col as usize).min(cols_usize);
                                             let mark_c1 = (line_end_col as usize).min(cols_usize);
-                                            for cell_occ in &mut occupied[row_base + mark_c0..row_base + mark_c1] {
+                                            for cell_occ in &mut occupied_cells[row_base + mark_c0..row_base + mark_c1] {
                                                 *cell_occ = true;
                                             }
                                         }
@@ -913,7 +916,7 @@ fn main() -> io::Result<()> {
             let prompt = format!("{}{}█", prefix, visible_input);
             renderer.put_str(addr_x, 0, &prompt, Color::CYAN, bar_bg, true, false);
         } else {
-            let mem = get_memory_mb();
+            let mem = cached_mem_mb;
             let scroll_pct = if mode.is_cdp() {
                 cdp_engine.get_scroll_pct()
             } else if native_engine.max_scroll > 0 {
@@ -1011,6 +1014,7 @@ fn main() -> io::Result<()> {
         let elapsed_secs = fps_timer.elapsed().as_secs_f32();
         if elapsed_secs >= 0.5 {
             fps = (frame_count as f32) / elapsed_secs;
+            cached_mem_mb = get_memory_mb();
             let cdp_curr = cdp_engine.get_frame_count();
             if cdp_curr >= cdp_last_count {
                 cdp_fps = ((cdp_curr - cdp_last_count) as f32) / elapsed_secs;

@@ -2131,16 +2131,10 @@ impl SrScratchpad {
                         self.fsr_rcas_in_place(&mut crop, 0.85);
                     }
                     UpscaleMode::NeuralOnly => {
-                        if has_jpeg_block_artifacts(&crop) {
-                            self.remove_jpeg_artifacts_in_place(&mut crop);
-                        }
                         self.refine_y_neural_1x_in_place(&mut crop);
                         self.fsr_rcas_in_place(&mut crop, 0.35);
                     }
                     UpscaleMode::Combined => {
-                        if has_jpeg_block_artifacts(&crop) {
-                            self.remove_jpeg_artifacts_in_place(&mut crop);
-                        }
                         self.refine_y_neural_1x_in_place(&mut crop);
                         self.fsr_rcas_in_place(&mut crop, 0.80);
                     }
