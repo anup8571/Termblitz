@@ -245,6 +245,7 @@ fn main() -> io::Result<()> {
     let mut cdp_last_count = 0;
     let mut cdp_fps = 0.0;
     let mut scroll_fast_until = Instant::now() - Duration::from_secs(1);
+    let mut quality_settle_pending = false;
 
     loop {
         let frame_start = Instant::now();
@@ -528,7 +529,8 @@ fn main() -> io::Result<()> {
                 } else {
                     let (ptr_col, ptr_row) = input_handler.last_pointer_pos;
                     cdp_engine.scroll_at(delta, ptr_col, ptr_row);
-                    scroll_fast_until = Instant::now() + Duration::from_millis(180);
+                    scroll_fast_until = Instant::now() + Duration::from_millis(160);
+                    quality_settle_pending = true;
                 }
             }
             AppAction::PageScroll(delta) => {
@@ -542,7 +544,8 @@ fn main() -> io::Result<()> {
                 } else {
                     let (ptr_col, ptr_row) = input_handler.last_pointer_pos;
                     cdp_engine.scroll_at(delta * 3, ptr_col, ptr_row);
-                    scroll_fast_until = Instant::now() + Duration::from_millis(180);
+                    scroll_fast_until = Instant::now() + Duration::from_millis(160);
+                    quality_settle_pending = true;
                 }
             }
             AppAction::Reload => {
@@ -657,8 +660,19 @@ fn main() -> io::Result<()> {
                     let is_loading = cdp_engine.is_loading();
                     let count = cdp_engine.get_frame_count();
                     let video_rects = cdp_engine.get_video_rects();
+                    let (vw, vh) = cdp_engine.get_viewport_dims();
+                    renderer.set_active_rois(cdp_engine.get_active_rois(), vw, vh);
                     renderer.video_fast_path = !video_rects.is_empty();
-                    renderer.scroll_fast_path = Instant::now() < scroll_fast_until;
+
+                    // Two-Gear Kinetic Frame Pacer:
+                    // Gear 1 (< 160ms since last scroll): Kinetic Motion Mode (1-tap Q16.16 blitter)
+                    // Gear 2 (>= 160ms after scroll stops): High-Precision Rest Mode (Quality Settling Pass)
+                    let in_kinetic_motion = Instant::now() < scroll_fast_until;
+                    if !in_kinetic_motion && quality_settle_pending {
+                        quality_settle_pending = false;
+                        renderer.invalidate_frame_cache();
+                    }
+                    renderer.scroll_fast_path = in_kinetic_motion;
 
                     if count == 0 || (is_loading && count < 2) {
                         let msg = " 🌐 Connecting & Loading Visual Web Page... ⏳ ";
@@ -676,9 +690,11 @@ fn main() -> io::Result<()> {
                         );
 
                         // 2. In Hybrid Mode: Overlay razor-sharp native terminal characters at 1:1 CSS viewport coordinates
-                        // while suppressing stale DOM text overlays inside any actively playing <video> bounding box.
+                        // while suppressing stale DOM text overlays inside any actively playing <video> bounding box,
+                        // and clearing underlying page text beneath elevated dropdown popups (`POPUP_MASK`).
                         if mode == RenderMode::CdpHybrid {
                             let mut overlays = cdp_engine.get_text_overlays();
+                            let rect_masks = cdp_engine.get_rect_masks();
                             let scroll_delta_px = cdp_engine.get_pending_scroll_px();
                             // Prioritize inputs first, then sticky/fixed headers, then bold/navigation/link elements,
                             // then body text so sticky headers, footers, and search boxes claim their terminal cells first
@@ -695,7 +711,6 @@ fn main() -> io::Result<()> {
                                 }
                             });
 
-                            let (vw, vh) = cdp_engine.get_viewport_dims();
                             let pw = vw.max(1) as f32;
                             let ph = vh.max(1) as f32;
                             let view_rows = (view_max_y.saturating_sub(view_start_y)).max(1) as f32;
@@ -707,96 +722,119 @@ fn main() -> io::Result<()> {
                             let cols_usize = cols as usize;
                             let mut occupied = vec![false; cols_usize * (rows as usize)];
 
-                            for span in &overlays {
-                                let eff_px_y = span.effective_px_y(scroll_delta_px);
-                                if eff_px_y < 0 || eff_px_y >= (vh as i32).saturating_sub(2) {
-                                    continue;
+                            // Pass 2a: Render base document overlays (!span.is_popup), then apply POPUP_MASK popup
+                            // clearing, then render elevated popup/autocomplete suggestion items (span.is_popup) on top.
+                            for pass_popup in [false, true] {
+                                if pass_popup {
+                                    for mask in &rect_masks {
+                                        let (mc0, mr0, mc1, mr1) =
+                                            mask.to_terminal_bounds(cols, rows, vw, vh);
+                                        renderer.fill_popup_mask(mc0, mr0, mc1, mr1, mask.color);
+                                        for ry in mr0.max(view_start_y)..mr1.min(view_max_y) {
+                                            let r_base = (ry as usize) * cols_usize;
+                                            let c0_u = (mc0 as usize).min(cols_usize);
+                                            let c1_u = (mc1 as usize).min(cols_usize);
+                                            for occ in &mut occupied[r_base + c0_u..r_base + c1_u] {
+                                                *occ = false;
+                                            }
+                                        }
+                                    }
                                 }
-                                let start_col = ((span.px_x.max(0) as f32 * cols as f32) / pw)
-                                    .round()
-                                    .min(cols.saturating_sub(1) as f32) as u16;
-                                let term_row = view_start_y
-                                    + ((eff_px_y as f32 * view_rows) / ph).round() as u16;
-                                let span_cols = ((span.px_w.max(8) as f32 * cols as f32) / pw)
-                                    .round()
-                                    .max(1.0) as usize;
-                                let box_rows = ((span.px_h.max(12) as f32 * view_rows) / ph)
-                                    .ceil()
-                                    .max(1.0) as usize;
 
-                                if term_row >= view_start_y && term_row < view_max_y && start_col < cols {
-                                    let available_cols = (cols - start_col) as usize;
-                                    let is_multiline = !span.is_input && box_rows >= 2 && span.px_h >= 30;
-                                    let text_disp_w = display_width(&span.text);
-                                    let wrap_w = if is_multiline {
-                                        span_cols.min(available_cols).max(8)
-                                    } else {
-                                        span_cols.max(text_disp_w).min(available_cols)
-                                    };
-                                    let max_lines = if is_multiline { box_rows.min(2) } else { 1 };
-                                    let wrapped_lines = wrap_overlay_text(&span.text, wrap_w, max_lines);
+                                for span in overlays.iter().filter(|s| s.is_popup == pass_popup) {
+                                    let eff_px_y = span.effective_px_y(scroll_delta_px);
+                                    if eff_px_y < 0 || eff_px_y >= (vh as i32).saturating_sub(2) {
+                                        continue;
+                                    }
+                                    let start_col = ((span.px_x.max(0) as f32 * cols as f32) / pw)
+                                        .round()
+                                        .min(cols.saturating_sub(1) as f32) as u16;
+                                    let term_row = view_start_y
+                                        + ((eff_px_y as f32 * view_rows) / ph).round() as u16;
+                                    let span_cols = ((span.px_w.max(8) as f32 * cols as f32) / pw)
+                                        .round()
+                                        .max(1.0) as usize;
+                                    let box_rows = ((span.px_h.max(12) as f32 * view_rows) / ph)
+                                        .ceil()
+                                        .max(1.0) as usize;
 
-                                    let link_fg = if span.is_input {
-                                        Color::new(40, 90, 195)
-                                    } else if span.is_link && span.fg.luma_fast() < 40 {
-                                        Color::new(26, 86, 219)
-                                    } else {
-                                        span.fg
-                                    };
+                                    if term_row >= view_start_y && term_row < view_max_y && start_col < cols {
+                                        let available_cols = (cols - start_col) as usize;
+                                        let is_multiline = !span.is_input && !span.is_popup && box_rows >= 2 && span.px_h >= 30;
+                                        let text_disp_w = display_width(&span.text);
+                                        let wrap_w = if is_multiline {
+                                            span_cols.min(available_cols).max(8)
+                                        } else {
+                                            span_cols.max(text_disp_w).min(available_cols)
+                                        };
+                                        let max_lines = if is_multiline { box_rows.min(2) } else { 1 };
+                                        let wrapped_lines = wrap_overlay_text(&span.text, wrap_w, max_lines);
 
-                                    for (line_offset, line_text) in wrapped_lines.iter().enumerate() {
-                                        let target_y = term_row + (line_offset as u16);
-                                        if target_y >= view_max_y {
-                                            break;
-                                        }
-                                        let line_w = display_width(line_text) as u16;
-                                        if line_w == 0 {
-                                            continue;
-                                        }
-                                        let line_end_col = start_col.saturating_add(line_w).min(cols);
-                                        let inside_video = video_term_boxes.iter().any(|&(vc0, vr0, vc1, vr1)| {
-                                            target_y >= vr0
-                                                && target_y < vr1
-                                                && start_col < vc1
-                                                && line_end_col > vc0
-                                        });
-                                        if inside_video {
-                                            continue;
-                                        }
+                                        let link_fg = if span.is_input {
+                                            Color::new(40, 90, 195)
+                                        } else if span.is_popup {
+                                            Color::new(32, 33, 36)
+                                        } else if span.is_link && span.fg.luma_fast() < 40 {
+                                            Color::new(26, 86, 219)
+                                        } else {
+                                            span.fg
+                                        };
 
-                                        let row_base = (target_y as usize) * cols_usize;
-                                        let check_c0 = (start_col.saturating_sub(1) as usize).min(cols_usize);
-                                        let check_c1 = ((line_end_col + 1) as usize).min(cols_usize);
-                                        if check_c0 < check_c1
-                                            && occupied[row_base + check_c0..row_base + check_c1]
-                                                .iter()
-                                                .any(|&occ| occ)
-                                        {
-                                            // Prevent text spans mapped to the same terminal row from merging
-                                            continue;
-                                        }
+                                        for (line_offset, line_text) in wrapped_lines.iter().enumerate() {
+                                            let target_y = term_row + (line_offset as u16);
+                                            if target_y >= view_max_y {
+                                                break;
+                                            }
+                                            let line_w = display_width(line_text) as u16;
+                                            if line_w == 0 {
+                                                continue;
+                                            }
+                                            let line_end_col = start_col.saturating_add(line_w).min(cols);
+                                            let inside_video = video_term_boxes.iter().any(|&(vc0, vr0, vc1, vr1)| {
+                                                target_y >= vr0
+                                                    && target_y < vr1
+                                                    && start_col < vc1
+                                                    && line_end_col > vc0
+                                            });
+                                            if inside_video {
+                                                continue;
+                                            }
 
-                                        // Suppress underline on colored buttons (e.g. "Sign in"), inputs, and Indic scripts
-                                        // where terminal underlines slice through subscript vowel matras.
-                                        let should_underline = span.is_link
-                                            && !span.is_input
-                                            && !has_complex_script(line_text)
-                                            && span.bg.map_or(true, |b| b.luma_fast() > 215);
+                                            let row_base = (target_y as usize) * cols_usize;
+                                            let check_c0 = (start_col.saturating_sub(1) as usize).min(cols_usize);
+                                            let check_c1 = ((line_end_col + 1) as usize).min(cols_usize);
+                                            if check_c0 < check_c1
+                                                && occupied[row_base + check_c0..row_base + check_c1]
+                                                    .iter()
+                                                    .any(|&occ| occ)
+                                            {
+                                                // Prevent text spans mapped to the same terminal row from merging
+                                                continue;
+                                            }
 
-                                        renderer.put_str_with_existing_bg(
-                                            start_col,
-                                            target_y,
-                                            line_text,
-                                            link_fg,
-                                            span.bg,
-                                            span.bold,
-                                            should_underline,
-                                        );
+                                            // Suppress underline on colored buttons (e.g. "Sign in"), inputs, popups, and Indic scripts
+                                            // where terminal underlines slice through subscript vowel matras.
+                                            let should_underline = span.is_link
+                                                && !span.is_input
+                                                && !span.is_popup
+                                                && !has_complex_script(line_text)
+                                                && span.bg.map_or(true, |b| b.luma_fast() > 215);
 
-                                        let mark_c0 = (start_col as usize).min(cols_usize);
-                                        let mark_c1 = (line_end_col as usize).min(cols_usize);
-                                        for cell_occ in &mut occupied[row_base + mark_c0..row_base + mark_c1] {
-                                            *cell_occ = true;
+                                            renderer.put_str_with_existing_bg(
+                                                start_col,
+                                                target_y,
+                                                line_text,
+                                                link_fg,
+                                                span.bg,
+                                                span.bold,
+                                                should_underline,
+                                            );
+
+                                            let mark_c0 = (start_col as usize).min(cols_usize);
+                                            let mark_c1 = (line_end_col as usize).min(cols_usize);
+                                            for cell_occ in &mut occupied[row_base + mark_c0..row_base + mark_c1] {
+                                                *cell_occ = true;
+                                            }
                                         }
                                     }
                                 }

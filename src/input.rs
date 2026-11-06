@@ -1,5 +1,5 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageKey {
@@ -180,6 +180,7 @@ pub struct InputHandler {
     pub sr_hit_range: Option<(u16, u16)>,
     pub dither_hit_range: Option<(u16, u16)>,
     pub mute_hit_range: Option<(u16, u16)>,
+    pub last_interaction: Instant,
     drag_start: Option<(u16, u16)>,
     last_drag_y: Option<u16>,
     has_dragged: bool,
@@ -195,10 +196,16 @@ impl InputHandler {
             sr_hit_range: None,
             dither_hit_range: None,
             mute_hit_range: None,
+            last_interaction: Instant::now() - Duration::from_secs(10),
             drag_start: None,
             last_drag_y: None,
             has_dragged: false,
         }
+    }
+
+    #[inline(always)]
+    pub fn ms_since_last_interaction(&self) -> u64 {
+        self.last_interaction.elapsed().as_millis() as u64
     }
 
     pub fn set_status_hit_zones(
@@ -272,13 +279,16 @@ impl InputHandler {
             match act {
                 AppAction::None => {}
                 AppAction::Scroll(delta) => {
+                    self.last_interaction = Instant::now();
                     has_scroll = true;
                     coalesced_scroll = (coalesced_scroll + delta).clamp(-3, 3);
                 }
                 AppAction::TypeInPage(ch_str) => {
+                    self.last_interaction = Instant::now();
                     typed_buffer.push_str(&ch_str);
                 }
                 discrete => {
+                    self.last_interaction = Instant::now();
                     // Discrete action supersedes accumulated scroll in this frame and resets drag latching.
                     self.reset_drag_state();
                     if !typed_buffer.is_empty() && matches!(discrete, AppAction::PageKey(PageKey::Enter)) {

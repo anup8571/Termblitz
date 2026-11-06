@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::input::PageKey;
-use crate::renderer::{display_width, Cell, Color, DiffRenderer, PixelBuffer};
+use crate::renderer::{display_width, AssetRoi, Cell, Color, DiffRenderer, PixelBuffer};
 use crate::upscale::UpscaleMode;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,19 +59,84 @@ pub struct TextOverlaySpan {
     pub is_input: bool,
     pub link_url: Option<String>,
     pub is_fixed: bool,
+    pub is_popup: bool,
 }
 
 impl TextOverlaySpan {
     /// Computes the live viewport Y coordinate of this span during active scrolling.
-    /// Sticky/fixed headers and footers (`is_fixed == true`) remain anchored at `px_y`,
-    /// while scrolling document text shifts by `-scroll_delta_px` in lockstep with the bitmap.
+    /// Sticky/fixed headers, footers, and dropdown popups (`is_fixed == true || is_popup == true`)
+    /// remain anchored at `px_y`, while scrolling document text shifts by `-scroll_delta_px`
+    /// in lockstep with the bitmap.
     #[inline(always)]
     pub fn effective_px_y(&self, scroll_delta_px: i32) -> i32 {
-        if self.is_fixed {
+        if self.is_fixed || self.is_popup {
             self.px_y
         } else {
             self.px_y.saturating_sub(scroll_delta_px)
         }
+    }
+}
+
+/// Elevated popup or autocomplete dropdown box (`POPUP_MASK:x,y,w,h,r,g,b` or `RECT_MASK:x,y,w,h,r,g,b`)
+/// emitted by the DOM extractor before suggestion text items so the renderer can wipe stale underlying page text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RectMask {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub color: Color,
+}
+
+pub type PopupMask = RectMask;
+
+impl RectMask {
+    /// Parses a `POPUP_MASK:x,y,w,h,r,g,b` or `RECT_MASK:x,y,w,h,r,g,b` line emitted by `request_text_extraction`.
+    pub fn parse_line(line: &str) -> Option<Self> {
+        let trimmed = line.trim();
+        let body = trimmed
+            .strip_prefix("POPUP_MASK:")
+            .or_else(|| trimmed.strip_prefix("RECT_MASK:"))?;
+        let nums: Vec<i32> = body
+            .split(',')
+            .filter_map(|s| s.trim().parse::<i32>().ok())
+            .collect();
+        if nums.len() >= 7 && nums[2] >= 16 && nums[3] >= 12 {
+            Some(Self {
+                x: nums[0],
+                y: nums[1],
+                w: nums[2],
+                h: nums[3],
+                color: Color::new(
+                    nums[4].clamp(0, 255) as u8,
+                    nums[5].clamp(0, 255) as u8,
+                    nums[6].clamp(0, 255) as u8,
+                ),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Maps this CSS viewport popup rectangle to terminal cell bounds `(col_start, row_start, col_end, row_end)`
+    /// where `row` is in full terminal coordinates (`1..rows`, excluding row 0 status bar).
+    pub fn to_terminal_bounds(&self, cols: u16, rows: u16, vw: u32, vh: u32) -> (u16, u16, u16, u16) {
+        let pw = vw.max(1) as f32;
+        let ph = vh.max(1) as f32;
+        let view_start_y = 1u16;
+        let view_rows = (rows.saturating_sub(view_start_y)).max(1) as f32;
+
+        let c0 = ((self.x.max(0) as f32 * cols as f32) / pw).floor().max(0.0) as u16;
+        let c1 = (((self.x.saturating_add(self.w)).max(0) as f32 * cols as f32) / pw)
+            .ceil()
+            .min(cols as f32) as u16;
+        let r0 = view_start_y
+            + ((self.y.max(0) as f32 * view_rows) / ph).floor().max(0.0) as u16;
+        let r1 = view_start_y
+            + (((self.y.saturating_add(self.h)).max(0) as f32 * view_rows) / ph)
+                .ceil()
+                .min(view_rows) as u16;
+        (c0.min(cols), r0.min(rows), c1.min(cols), r1.min(rows))
     }
 }
 
@@ -157,23 +222,15 @@ pub struct RenderedLine {
     pub is_full_width_bg: bool,
 }
 
-/// Computes logical CSS viewport dimensions that preserve the terminal's 1:2 character cell aspect ratio
-/// without relying on CSS style.zoom (which distorts getBoundingClientRect coordinates).
-pub fn compute_viewport_size(cols: u16, rows: u16, zoom: f32) -> (u32, u32) {
+/// Keeps the base CDP screencast locked at a fast `360x576` (`deviceScaleFactor: 1.0`)
+/// so JPEG decoding takes <2ms while respecting zoom adjustments.
+pub fn compute_viewport_size(_cols: u16, _rows: u16, zoom: f32) -> (u32, u32) {
     let safe_zoom = zoom.clamp(0.5, 3.0);
-    let base_w: f32 = if cols <= 68 {
-        360.0
-    } else if cols <= 100 {
-        480.0
-    } else {
-        (cols as f32) * 7.0
-    };
-    let width_px = (base_w / safe_zoom).round().clamp(240.0, 1280.0) as u32;
-    let view_rows = rows.saturating_sub(1).max(10) as f32;
-    let safe_cols = cols.max(20) as f32;
-    let height_px = ((width_px as f32 * (view_rows * 2.0)) / safe_cols)
-        .round()
-        .clamp(320.0, 2400.0) as u32;
+    if (safe_zoom - 1.0).abs() < 0.01 {
+        return (360, 576);
+    }
+    let width_px = (360.0 / safe_zoom).round().clamp(240.0, 720.0) as u32;
+    let height_px = (576.0 / safe_zoom).round().clamp(320.0, 1152.0) as u32;
     (width_px, height_px)
 }
 
@@ -1339,15 +1396,15 @@ impl WsConnection {
         }
     }
 
-    /// Reads available socket bytes until a full WebSocket frame is assembled without stalling
-    /// when a frame is already buffered.
+    /// Reads available socket bytes with a strict 2ms read timeout and a bounded 4-chunk cap
+    /// per call so the WebSocket reader can never block or loop indefinitely.
     fn poll_message(&mut self) -> Option<String> {
         if let Some(msg) = self.try_extract_frame() {
             return Some(msg);
         }
 
         let mut chunk = [0u8; 65536];
-        loop {
+        for _ in 0..4 {
             match self.stream.read(&mut chunk) {
                 Ok(n) if n > 0 => {
                     self.buf.extend_from_slice(&chunk[..n]);
@@ -1368,7 +1425,8 @@ const SCROLL_SYNC_ID: u64 = 55556;
 
 /// Injects mobile reflow CSS, cosmetic ad-blocking rules, YouTube Ad-Shield auto-skipper, audio mute sync,
 /// and non-destructive text transparency (`-webkit-text-fill-color: transparent`).
-/// Using `-webkit-text-fill-color: transparent` hides Chromium's raster glyphs from the screencast while preserving `getComputedStyle(p).color`!
+/// Defers heavy `setInterval` and throttled `MutationObserver` ad-shield sweeps until `DOMContentLoaded`
+/// (`document.readyState !== 'loading'`) so initial page parsing and layout never stall.
 fn build_page_style_js(hide_text: bool, adblock: bool, muted: bool) -> String {
     let raw_flag = if hide_text { "no" } else { "yes" };
     let ad_flag = if adblock { "yes" } else { "no" };
@@ -1398,9 +1456,14 @@ fn build_page_style_js(hide_text: bool, adblock: bool, muted: bool) -> String {
                 ';\
                 head.appendChild(s);\
             }}\
-            if(!window.__termblitz_yt_shield){{\
+            var initShield=function(){{\
+                if(window.__termblitz_yt_shield)return;\
                 window.__termblitz_yt_shield=true;\
+                var lastSweep=0;\
                 var sweepAds=function(){{\
+                    var now=Date.now();\
+                    if(now-lastSweep<300)return;\
+                    lastSweep=now;\
                     var root=document.documentElement;\
                     if(!root||root.getAttribute('data-termblitz-adblock')!=='yes')return;\
                     var adNodes=document.querySelectorAll('ytd-ad-slot-renderer,ytd-in-feed-ad-layout-renderer,ytm-promoted-sparkles-web-renderer,ytm-companion-ad-renderer,.ytp-ad-overlay-container');\
@@ -1430,12 +1493,17 @@ fn build_page_style_js(hide_text: bool, adblock: bool, muted: bool) -> String {
                         }}\
                     }}\
                 }};\
-                setInterval(sweepAds,250);\
+                setInterval(sweepAds,400);\
                 try{{\
                     var obs=new MutationObserver(sweepAds);\
                     obs.observe(d,{{childList:true,subtree:true,attributes:true,attributeFilter:['class']}});\
                 }}catch(_e){{}}\
                 sweepAds();\
+            }};\
+            if(document.readyState==='loading'){{\
+                document.addEventListener('DOMContentLoaded',initShield,{{once:true}});\
+            }}else{{\
+                initShield();\
             }}\
         }})()",
         raw_flag, ad_flag, muted_js
@@ -1447,7 +1515,7 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
     let js = "(function(){\
         var T=String.fromCharCode(9),N=String.fromCharCode(10),r=[],items=[];\
         if(!document.body)return '';\
-        var vw=window.innerWidth||360,vh=window.innerHeight||640;\
+        var vw=window.innerWidth||360,vh=window.innerHeight||576;\
         var scEl=window.__termblitz_scroll_el||document.scrollingElement||document.documentElement||document.body;\
         var scTop=(scEl&&scEl!==document.body&&scEl!==document.documentElement&&scEl.scrollTop>0)?scEl.scrollTop:(window.scrollY||document.documentElement.scrollTop||document.body.scrollTop||0);\
         window.__termblitz_extract_top=scTop;\
@@ -1455,22 +1523,43 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
         var scClient=(scEl&&scEl.clientHeight>0&&scEl.clientHeight<vh)?scEl.clientHeight:vh;\
         var maxS=Math.max(1,scH-scClient);\
         var pct=Math.min(100,Math.max(0,Math.round((scTop*100)/maxS)));\
-        var vRects=[];\
+        var vRects=[],rois=[];\
         var vids=document.querySelectorAll('video');\
         for(var vi=0;vi<vids.length;vi++){\
             var vel=vids[vi];\
             var vs=getComputedStyle(vel);\
             if(vs.display==='none'||vs.visibility==='hidden'||parseFloat(vs.opacity)<0.05)continue;\
             var vrc=vel.getBoundingClientRect();\
-            if(vrc&&vrc.width>40&&vrc.height>40&&vrc.bottom>0&&vrc.top<vh&&vrc.right>0&&vrc.left<vw){\
+            if(vrc&&vrc.width>=16&&vrc.height>=16&&vrc.bottom>0&&vrc.top<vh&&vrc.right>0&&vrc.left<vw){\
+                var vx=Math.max(0,~~vrc.left),vy=Math.max(0,~~vrc.top),vw2=Math.min(vw-vx,~~vrc.width),vh2=Math.min(vh-vy,~~vrc.height);\
+                if(vw2>=16&&vh2>=16)rois.push(vx+','+vy+','+vw2+','+vh2+',2');\
                 var playing=(!vel.paused&&!vel.ended&&vel.readyState>=2)||(vel.currentTime>0&&!vel.ended);\
-                if(playing){\
+                if(playing&&vrc.width>40&&vrc.height>40){\
                     vRects.push((~~vrc.left)+','+(~~vrc.top)+','+(~~vrc.width)+','+(~~vrc.height));\
                 }\
             }\
         }\
+        var assetCand=document.querySelectorAll('img,svg,canvas,[style*=background-image]');\
+        for(var ai=0;ai<assetCand.length&&rois.length<24;ai++){\
+            var ael=assetCand[ai];\
+            var as=getComputedStyle(ael);\
+            if(as.display==='none'||as.visibility==='hidden'||parseFloat(as.opacity)<0.05)continue;\
+            var tag=ael.tagName;\
+            if(tag!=='IMG'&&tag!=='SVG'&&tag!=='CANVAS'){\
+                var bgi=as.backgroundImage;\
+                if(!bgi||bgi==='none'||bgi.indexOf('url(')===-1)continue;\
+            }\
+            var arc=ael.getBoundingClientRect();\
+            if(!arc||arc.width<16||arc.height<16||arc.bottom<=0||arc.top>=vh||arc.right<=0||arc.left>=vw)continue;\
+            var rx=Math.max(0,~~arc.left),ry=Math.max(0,~~arc.top),rw=Math.min(vw-rx,~~arc.width),rh=Math.min(vh-ry,~~arc.height);\
+            if(rw<16||rh<16)continue;\
+            if(rw>=vw-4&&rh>=vh-8&&tag!=='IMG'&&tag!=='CANVAS')continue;\
+            var kind=(tag==='SVG')?1:0;\
+            rois.push(rx+','+ry+','+rw+','+rh+','+kind);\
+        }\
         var vHeader=vRects.length?('VIDEO:'+vRects.join(';')):'';\
-        r.push('META'+T+vw+T+vh+T+pct+T+(location.href||'')+T+vHeader);\
+        var roiHeader=rois.length?('ROI:'+rois.join(';')):'';\
+        r.push('META'+T+vw+T+vh+T+pct+T+(location.href||'')+T+vHeader+T+roiHeader);\
         function getBg(el){\
             var bp=el;\
             while(bp&&bp!==document.documentElement){\
@@ -1489,12 +1578,44 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             }\
             return 0;\
         }\
+        var popSel='[role=listbox],[role=dialog],[role=menu],.G43f7e,.UUbT9,.aajZCb,.sbct';\
+        var popCand=document.querySelectorAll(popSel+',div,ul,section');\
+        var popBoxes=[];\
+        for(var pi=0;pi<popCand.length;pi++){\
+            var pel=popCand[pi];\
+            var ps=getComputedStyle(pel);\
+            if(ps.display==='none'||ps.visibility==='hidden'||parseFloat(ps.opacity)<0.1)continue;\
+            var isRolePop=pel.matches(popSel);\
+            var isPosPop=(ps.position==='fixed'||ps.position==='absolute')&&(parseInt(ps.zIndex,10)>2||isRolePop);\
+            if(!isRolePop&&!isPosPop)continue;\
+            if(isRolePop&&!pel.matches('.sbct')&&!pel.querySelector('[role=option],.sbct,li'))continue;\
+            var prc=pel.getBoundingClientRect();\
+            if(!prc||prc.width<40||prc.height<20||prc.bottom<=4||prc.top>=vh-4||prc.right<=4||prc.left>=vw-4)continue;\
+            if(prc.width>=vw-4&&prc.height>=vh-16&&!isRolePop)continue;\
+            var pbg=getBg(pel);\
+            if(!pbg&&isRolePop)pbg='rgb(255, 255, 255)';\
+            if(!pbg)continue;\
+            var rgbm=pbg.match(/(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)/);\
+            if(!rgbm)continue;\
+            var mx=Math.max(0,~~prc.left),my=Math.max(0,~~prc.top),mw=Math.min(vw-mx,~~prc.width),mh=Math.min(vh-my,~~prc.height);\
+            if(mw<24||mh<16)continue;\
+            var dup=false;\
+            for(var di=0;di<popBoxes.length;di++){\
+                var pb=popBoxes[di];\
+                if(Math.abs(pb.x-mx)<8&&Math.abs(pb.y-my)<8&&Math.abs(pb.w-mw)<12&&Math.abs(pb.h-mh)<12){dup=true;break;}\
+            }\
+            if(!dup){\
+                popBoxes.push({el:pel,x:mx,y:my,w:mw,h:mh,bg:pbg});\
+                r.push('POPUP_MASK:'+mx+','+my+','+mw+','+mh+','+rgbm[1]+','+rgbm[2]+','+rgbm[3]);\
+                if(popBoxes.length>=8)break;\
+            }\
+        }\
         function isOccluded(el,cx,cy){\
             if(cx<1||cy<1||cx>=vw-1||cy>=vh-1)return false;\
             var hit=document.elementFromPoint(cx,cy);\
             if(!hit||hit===el||el.contains(hit)||hit.contains(el))return false;\
-            var ia=el.closest('a,button,label,[role=button]');\
-            if(ia&&ia===hit.closest('a,button,label,[role=button]'))return false;\
+            var ia=el.closest('a,button,label,[role=button],[role=option],[role=listbox],.sbct,.G43f7e,li');\
+            if(ia&&ia===hit.closest('a,button,label,[role=button],[role=option],[role=listbox],.sbct,.G43f7e,li'))return false;\
             return true;\
         }\
         var skipTags={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,SVG:1,PATH:1,HEAD:1,META:1,TITLE:1,OBJECT:1};\
@@ -1527,6 +1648,14 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
                 }\
             }\
             if(!cnt)continue;\
+            var optEl=p.closest('[role=option],.sbct,[data-entityname]');\
+            var popAnc=optEl||p.closest(popSel);\
+            var inPop=popAnc?1:0;\
+            if(!inPop){\
+                for(var pbi=0;pbi<popBoxes.length;pbi++){\
+                    if(popBoxes[pbi].el.contains(p)){inPop=1;break;}\
+                }\
+            }\
             var anc=p.parentElement,clipped=false;\
             while(anc&&anc!==document.body&&anc!==document.documentElement){\
                 var as=getComputedStyle(anc);\
@@ -1548,12 +1677,14 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             var w=~~(maxR-minL),h=~~(maxB-minT),l=~~minL,top=~~minT;\
             if(w<4||h<4||top>=vh-2||l>=vw-2)continue;\
             var cx=~~(l+w/2),cy=~~(top+h/2);\
-            if(isOccluded(p,cx,cy))continue;\
+            if(!inPop&&isOccluded(p,cx,cy))continue;\
             var a=p.closest('a');\
             var href=a?(a.href||''):'';\
             var bg=getBg(p);\
-            var fix=isFixed(p);\
-            items.push({txt:txt,l:l,top:top,w:w,h:h,col:s.color,bold:(s.fontWeight==='bold'||+s.fontWeight>=600?1:0),link:(a?1:0),bg:bg,inp:0,href:href,fix:fix});\
+            if(!bg&&inPop)bg='rgb(255, 255, 255)';\
+            var fix=(inPop||isFixed(p))?1:0;\
+            var isLink=(a||optEl)?1:0;\
+            items.push({txt:txt,l:l,top:top,w:w,h:h,col:s.color,bold:(s.fontWeight==='bold'||+s.fontWeight>=600?1:0),link:isLink,bg:bg,inp:0,href:href,fix:fix,pop:inPop});\
             if(items.length>400)break;\
         }\
         var inputs=document.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]),textarea,[contenteditable=true],[role=searchbox],[role=combobox]');\
@@ -1572,7 +1703,7 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             var ifix=isFixed(el);\
             for(var k=0;k<items.length;k++){\
                 var it=items[k];\
-                if(it.l>=erc.left-6&&it.l<=erc.right&&it.top>=erc.top-6&&it.top<=erc.bottom){\
+                if(!it.pop&&it.l>=erc.left-6&&it.l<=erc.right&&it.top>=erc.top-6&&it.top<=erc.bottom){\
                     it.top=ity;\
                     it.inp=1;\
                     it.fix=ifix;\
@@ -1591,12 +1722,12 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
                 }else if(!val){\
                     val='Search or type...';\
                 }\
-                items.push({txt:val,l:~~(erc.left+8),top:ity,w:~~Math.max(16,erc.width-16),h:18,col:es.color,bold:isFocused?1:0,link:0,bg:getBg(el),inp:1,href:'',fix:ifix});\
+                items.push({txt:val,l:~~(erc.left+8),top:ity,w:~~Math.max(16,erc.width-16),h:18,col:es.color,bold:isFocused?1:0,link:0,bg:getBg(el),inp:1,href:'',fix:ifix,pop:0});\
             }\
         }\
         for(var m=0;m<items.length;m++){\
             var x=items[m];\
-            r.push(x.txt+T+x.l+T+x.top+T+x.w+T+x.h+T+x.col+T+x.bold+T+x.link+T+x.bg+T+x.inp+T+x.href+T+(x.fix||0));\
+            r.push(x.txt+T+x.l+T+x.top+T+x.w+T+x.h+T+x.col+T+x.bold+T+x.link+T+x.bg+T+x.inp+T+x.href+T+(x.fix||0)+T+(x.pop||0));\
         }\
         return r.join(N);\
     })()";
@@ -1635,7 +1766,9 @@ fn spawn_cdp_worker(
     rows: u16,
     shared_buf: Arc<Mutex<PixelBuffer>>,
     shared_overlays: Arc<Mutex<Vec<TextOverlaySpan>>>,
+    shared_rect_masks: Arc<Mutex<Vec<RectMask>>>,
     shared_video_rects: Arc<Mutex<Vec<VideoRect>>>,
+    shared_rois: Arc<Mutex<Vec<AssetRoi>>>,
     shared_viewport: Arc<Mutex<(u32, u32)>>,
     shared_scroll_pct: Arc<AtomicUsize>,
     shared_pending_scroll_px: Arc<AtomicI32>,
@@ -1761,7 +1894,10 @@ fn spawn_cdp_worker(
 
         let mut last_text_extract = Instant::now() - Duration::from_secs(1);
         let mut last_scroll_instant = Instant::now() - Duration::from_secs(5);
-        let mut pending_extract = true;
+        let mut pending_extract = false;
+        let mut page_load_ready = false;
+        let mut nav_started_at = Instant::now();
+        let mut followup_extracts: Vec<Instant> = Vec::with_capacity(4);
         let mut active_until = Instant::now() + Duration::from_secs(3);
 
         loop {
@@ -1776,7 +1912,9 @@ fn spawn_cdp_worker(
                         is_loading.store(true, Ordering::Relaxed);
                         frame_counter.store(0, Ordering::Relaxed);
                         shared_overlays.lock().unwrap().clear();
+                        shared_rect_masks.lock().unwrap().clear();
                         shared_video_rects.lock().unwrap().clear();
+                        shared_rois.lock().unwrap().clear();
                         *shared_live_url.lock().unwrap() = new_url.clone();
                         let (w, h) = compute_viewport_size(curr_cols, curr_rows, curr_zoom);
                         width_px = w;
@@ -1795,6 +1933,9 @@ fn spawn_cdp_worker(
                             json_escape(&new_url)
                         );
                         let _ = ws.send_text(&msg);
+                        page_load_ready = false;
+                        nav_started_at = Instant::now();
+                        followup_extracts.clear();
                         pending_extract = true;
                         active_until = Instant::now() + Duration::from_secs(3);
                     }
@@ -1886,8 +2027,11 @@ fn spawn_cdp_worker(
                             seq, px_x, px_y
                         );
                         let _ = ws.send_text(&release);
+                        let now = Instant::now();
+                        followup_extracts.push(now + Duration::from_millis(150));
+                        followup_extracts.push(now + Duration::from_millis(380));
                         pending_extract = true;
-                        active_until = Instant::now() + Duration::from_secs(2);
+                        active_until = now + Duration::from_secs(2);
                     }
                     CdpWorkerCommand::FocusInput(col, row) => {
                         coalesced_scroll_delta = 0;
@@ -1925,7 +2069,7 @@ fn spawn_cdp_worker(
                                 }}\
                                 if(inp){{\
                                     window.__termblitz_active_input=inp;\
-                                    try{{inp.focus();if(typeof inp.selectionStart==='number'){{var l=(inp.value||'').length;inp.setSelectionRange(l,l);}}}}catch(_e){{}}\
+                                    try{{inp.focus();inp.click();if(typeof inp.selectionStart==='number'){{var l=(inp.value||'').length;inp.setSelectionRange(l,l);}}}}catch(_e){{}}\
                                 }}\
                             }})()",
                             px_x, px_y
@@ -1936,8 +2080,11 @@ fn spawn_cdp_worker(
                             json_escape(&focus_js)
                         );
                         let _ = ws.send_text(&eval_cmd);
+                        let now = Instant::now();
+                        followup_extracts.push(now + Duration::from_millis(150));
+                        followup_extracts.push(now + Duration::from_millis(380));
                         pending_extract = true;
-                        active_until = Instant::now() + Duration::from_secs(2);
+                        active_until = now + Duration::from_secs(2);
                     }
                     CdpWorkerCommand::TypeText(text) => {
                         if !text.is_empty() {
@@ -1955,8 +2102,21 @@ fn spawn_cdp_worker(
                                 json_escape(&text)
                             );
                             let _ = ws.send_text(&insert_cmd);
+                            seq += 1;
+                            let trigger_autocomplete_js = "(function(){var a=window.__termblitz_active_input||document.activeElement;if(a){try{a.dispatchEvent(new Event('input',{bubbles:true}));a.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true}));}catch(_e){}}})()";
+                            let _ = ws.send_text(&format!(
+                                r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
+                                seq,
+                                json_escape(trigger_autocomplete_js)
+                            ));
+                            // Schedule automatic delayed DOM re-extractions at +150ms and +380ms
+                            // so async XHR autocomplete suggestions ([role="listbox"], .G43f7e, .sbct)
+                            // are captured as soon as they appear.
+                            let now = Instant::now();
+                            followup_extracts.push(now + Duration::from_millis(150));
+                            followup_extracts.push(now + Duration::from_millis(380));
                             pending_extract = true;
-                            active_until = Instant::now() + Duration::from_millis(1200);
+                            active_until = now + Duration::from_millis(1200);
                         }
                     }
                     CdpWorkerCommand::SendKey(page_key) => {
@@ -2084,8 +2244,11 @@ fn spawn_cdp_worker(
                                 ));
                             }
                         }
+                        let now = Instant::now();
+                        followup_extracts.push(now + Duration::from_millis(150));
+                        followup_extracts.push(now + Duration::from_millis(380));
                         pending_extract = true;
-                        active_until = Instant::now() + Duration::from_secs(2);
+                        active_until = now + Duration::from_secs(2);
                     }
                     CdpWorkerCommand::BlurInput => {
                         seq += 1;
@@ -2095,6 +2258,8 @@ fn spawn_cdp_worker(
                             seq,
                             json_escape(blur_js)
                         ));
+                        let now = Instant::now();
+                        followup_extracts.push(now + Duration::from_millis(150));
                         pending_extract = true;
                     }
                     CdpWorkerCommand::SetZoom(new_zoom) => {
@@ -2128,6 +2293,8 @@ fn spawn_cdp_worker(
                             seq
                         );
                         let _ = ws.send_text(&eval_cmd);
+                        page_load_ready = false;
+                        nav_started_at = Instant::now();
                         pending_extract = true;
                         active_until = Instant::now() + Duration::from_secs(2);
                     }
@@ -2140,6 +2307,8 @@ fn spawn_cdp_worker(
                             seq
                         );
                         let _ = ws.send_text(&eval_cmd);
+                        page_load_ready = false;
+                        nav_started_at = Instant::now();
                         pending_extract = true;
                         active_until = Instant::now() + Duration::from_secs(2);
                     }
@@ -2199,7 +2368,7 @@ fn spawn_cdp_worker(
                         }}\
                         var nowTop=(scEl&&scEl!==document.body&&scEl!==document.documentElement&&scEl.scrollTop>0)?scEl.scrollTop:(window.scrollY||document.documentElement.scrollTop||document.body.scrollTop||0);\
                         var baseTop=window.__termblitz_extract_top||0;\
-                        var vh=window.innerHeight||640;\
+                        var vh=window.innerHeight||576;\
                         var scH=(scEl&&scEl.scrollHeight>vh)?scEl.scrollHeight:Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0,vh);\
                         var scClient=(scEl&&scEl.clientHeight>0&&scEl.clientHeight<vh)?scEl.clientHeight:vh;\
                         var maxS=Math.max(1,scH-scClient);\
@@ -2219,12 +2388,27 @@ fn spawn_cdp_worker(
                 active_until = Instant::now() + Duration::from_millis(450);
             }
 
-            let mut latest_screencast_b64: Option<String> = None;
+            // Lock-Free Latest-Frame Dropper & Bounded WebSocket Reader:
+            // Enforce a strict non-blocking budget (at most 6 WebSocket frames or 8ms max per tick).
+            let mut latest_frame: Option<Vec<u8>> = None;
+            let mut drained_messages = 0usize;
+            let poll_start = Instant::now();
 
-            while let Some(msg) = ws.poll_message() {
-                if msg.contains(r#""Page.loadEventFired""#) || msg.contains(r#""Page.frameNavigated""#) {
+            while drained_messages < 6 && poll_start.elapsed() < Duration::from_millis(8) {
+                let Some(msg) = ws.poll_message() else {
+                    break;
+                };
+                drained_messages += 1;
+
+                if msg.contains(r#""Page.loadEventFired""#)
+                    || msg.contains(r#""Page.domContentEventFired""#)
+                    || msg.contains(r#""Page.frameNavigated""#)
+                {
                     if msg.contains(r#""Page.loadEventFired""#) {
                         is_loading.store(false, Ordering::Relaxed);
+                        page_load_ready = true;
+                    } else if msg.contains(r#""Page.domContentEventFired""#) {
+                        page_load_ready = true;
                     }
                     shared_pending_scroll_px.store(0, Ordering::Relaxed);
                     seq += 1;
@@ -2268,7 +2452,14 @@ fn spawn_cdp_worker(
                             let raw_val = &rest[..q_end];
                             let unescaped = json_unescape(raw_val);
                             let mut spans = Vec::new();
+                            let mut masks = Vec::new();
                             for line in unescaped.lines() {
+                                if line.starts_with("POPUP_MASK:") || line.starts_with("RECT_MASK:") {
+                                    if let Some(mask) = RectMask::parse_line(line) {
+                                        masks.push(mask);
+                                    }
+                                    continue;
+                                }
                                 let parts: Vec<&str> = line.split('\t').collect();
                                 if parts.first() == Some(&"META") && parts.len() >= 5 {
                                     let vw = parts[1].parse::<u32>().unwrap_or(width_px).max(100);
@@ -2278,6 +2469,10 @@ fn spawn_cdp_worker(
                                     let parsed_videos = parts
                                         .get(5)
                                         .map(|s| VideoRect::parse_list(s))
+                                        .unwrap_or_default();
+                                    let parsed_rois = parts
+                                        .get(6)
+                                        .map(|s| AssetRoi::parse_list(s))
                                         .unwrap_or_default();
                                     let now_video_active = !parsed_videos.is_empty();
                                     if now_video_active != video_mode_active {
@@ -2291,6 +2486,7 @@ fn spawn_cdp_worker(
                                         let _ = ws.send_text(&sc);
                                     }
                                     *shared_video_rects.lock().unwrap() = parsed_videos;
+                                    *shared_rois.lock().unwrap() = parsed_rois;
                                     *shared_viewport.lock().unwrap() = (vw, vh);
                                     shared_scroll_pct.store(pct, Ordering::Relaxed);
                                     if !url_str.is_empty() && url_str != "about:blank" {
@@ -2319,6 +2515,7 @@ fn spawn_cdp_worker(
                                         .filter(|s| !s.is_empty())
                                         .map(|s| s.to_string());
                                     let is_fixed = parts.get(11).copied() == Some("1");
+                                    let is_popup = parts.get(12).copied() == Some("1");
                                     spans.push(TextOverlaySpan {
                                         text,
                                         px_x,
@@ -2332,9 +2529,11 @@ fn spawn_cdp_worker(
                                         is_input,
                                         link_url,
                                         is_fixed,
+                                        is_popup,
                                     });
                                 }
                             }
+                            *shared_rect_masks.lock().unwrap() = masks;
                             *shared_overlays.lock().unwrap() = spans;
                             shared_pending_scroll_px.store(0, Ordering::Relaxed);
                         }
@@ -2355,29 +2554,30 @@ fn spawn_cdp_worker(
                         0
                     };
 
-                    if let Some(pos) = msg.find(r#""data""#) {
-                        let rest = &msg[pos + 6..];
-                        if let Some(q1) = rest.find('"') {
-                            let after = &rest[q1 + 1..];
-                            if let Some(q2) = after.find('"') {
-                                latest_screencast_b64 = Some(after[..q2].to_string());
-                            }
-                        }
-                    }
-
-                    // Always acknowledge frame immediately so Chromium never stalls
+                    // Immediately send Page.screencastFrameAck as soon as the frame is received
+                    // so Chromium's compositor never stalls, while storing only the newest raw JPEG payload
+                    // in single-slot `latest_frame: Option<Vec<u8>>` (overwriting/dropping older un-rendered frames).
                     seq += 1;
                     let ack = format!(
                         r#"{{"id":{},"method":"Page.screencastFrameAck","params":{{"sessionId":{}}}}}"#,
                         seq, session_id
                     );
                     let _ = ws.send_text(&ack);
+
+                    if let Some(pos) = msg.find(r#""data""#) {
+                        let rest = &msg[pos + 6..];
+                        if let Some(q1) = rest.find('"') {
+                            let after = &rest[q1 + 1..];
+                            if let Some(q2) = after.find('"') {
+                                latest_frame = Some(base64_decode(&after[..q2]));
+                            }
+                        }
+                    }
                 }
             }
 
-            // Decode only the newest screencast frame in this batch, eliminating stale frame backlog lag
-            if let Some(b64) = latest_screencast_b64 {
-                let jpeg_bytes = base64_decode(&b64);
+            // Call `image::load_from_memory` at most once per render tick on the newest `latest_frame`
+            if let Some(jpeg_bytes) = latest_frame {
                 if let Ok(img) = image::load_from_memory(&jpeg_bytes) {
                     let new_buf = PixelBuffer::from_image(&img);
                     *shared_buf.lock().unwrap() = new_buf;
@@ -2389,15 +2589,31 @@ fn spawn_cdp_worker(
                 }
             }
 
-            // Scroll-Gated DOM Text Extraction:
-            // Suspend heavy TreeWalker / getComputedStyle / elementFromPoint calls while the user is
-            // actively scrolling (`< 220ms`) so Chromium's compositor streams screencast frames at 60 FPS,
-            // then extract fresh DOM coordinates immediately once scrolling settles.
             let now = Instant::now();
-            let is_actively_scrolling = last_scroll_instant.elapsed() < Duration::from_millis(220);
+            if !page_load_ready && now.duration_since(nav_started_at) >= Duration::from_millis(1200) {
+                page_load_ready = true;
+            }
+
+            // Check scheduled +150ms / +380ms autocomplete follow-up extractions
+            let mut followup_due = false;
+            followup_extracts.retain(|&deadline| {
+                if now >= deadline {
+                    followup_due = true;
+                    false
+                } else {
+                    true
+                }
+            });
+
+            // Scroll-Gated & Load-Deferred DOM Text Extraction:
+            // Suspend heavy TreeWalker / getComputedStyle calls while actively scrolling (< 160ms)
+            // or before Page.loadEventFired / DOMContentLoaded so Chromium never stalls.
+            let is_actively_scrolling = last_scroll_instant.elapsed() < Duration::from_millis(160);
             if !is_actively_scrolling
-                && (pending_extract || now < active_until)
-                && last_text_extract.elapsed() >= Duration::from_millis(100)
+                && page_load_ready
+                && (followup_due
+                    || ((pending_extract || now < active_until)
+                        && last_text_extract.elapsed() >= Duration::from_millis(100)))
             {
                 request_text_extraction(&mut ws, &mut seq);
                 last_text_extract = now;
@@ -2416,7 +2632,9 @@ pub struct CdpEngine {
     pub chromium_bin: Option<String>,
     pub frame_buffer: Arc<Mutex<PixelBuffer>>,
     pub text_overlays: Arc<Mutex<Vec<TextOverlaySpan>>>,
+    pub rect_masks: Arc<Mutex<Vec<RectMask>>>,
     pub video_rects: Arc<Mutex<Vec<VideoRect>>>,
+    pub active_rois: Arc<Mutex<Vec<AssetRoi>>>,
     pub viewport_dims: Arc<Mutex<(u32, u32)>>,
     pub scroll_pct: Arc<AtomicUsize>,
     pub pending_scroll_px: Arc<AtomicI32>,
@@ -2444,8 +2662,10 @@ impl CdpEngine {
             error_message: Arc::new(Mutex::new(None)),
             frame_buffer: Arc::new(Mutex::new(PixelBuffer::new(80, 48, Color::new(246, 246, 239)))),
             text_overlays: Arc::new(Mutex::new(Vec::new())),
+            rect_masks: Arc::new(Mutex::new(Vec::new())),
             video_rects: Arc::new(Mutex::new(Vec::new())),
-            viewport_dims: Arc::new(Mutex::new((360, 640))),
+            active_rois: Arc::new(Mutex::new(Vec::new())),
+            viewport_dims: Arc::new(Mutex::new((360, 576))),
             scroll_pct: Arc::new(AtomicUsize::new(0)),
             pending_scroll_px: Arc::new(AtomicI32::new(0)),
             live_url: Arc::new(Mutex::new(String::new())),
@@ -2465,6 +2685,14 @@ impl CdpEngine {
 
     pub fn get_text_overlays(&self) -> Vec<TextOverlaySpan> {
         self.text_overlays.lock().unwrap().clone()
+    }
+
+    pub fn get_rect_masks(&self) -> Vec<RectMask> {
+        self.rect_masks.lock().unwrap().clone()
+    }
+
+    pub fn get_active_rois(&self) -> Vec<AssetRoi> {
+        self.active_rois.lock().unwrap().clone()
     }
 
     pub fn get_pending_scroll_px(&self) -> i32 {
@@ -2876,7 +3104,9 @@ impl CdpEngine {
                 rows,
                 Arc::clone(&self.frame_buffer),
                 Arc::clone(&self.text_overlays),
+                Arc::clone(&self.rect_masks),
                 Arc::clone(&self.video_rects),
+                Arc::clone(&self.active_rois),
                 Arc::clone(&self.viewport_dims),
                 Arc::clone(&self.scroll_pct),
                 Arc::clone(&self.pending_scroll_px),
@@ -3101,6 +3331,7 @@ mod tests {
             is_link: false,
             is_input: false,
             is_fixed: false,
+            is_popup: false,
             link_url: None,
         };
 
@@ -3135,6 +3366,7 @@ mod tests {
             is_link: false,
             is_input: false,
             is_fixed: false,
+            is_popup: false,
             link_url: None,
         };
         let fixed_header = TextOverlaySpan {
@@ -3149,6 +3381,7 @@ mod tests {
             is_link: false,
             is_input: false,
             is_fixed: true,
+            is_popup: false,
             link_url: None,
         };
 
@@ -3159,6 +3392,25 @@ mod tests {
         // Scrolling up by -40 CSS pixels shifts body text down to y=280 while sticky header stays at y=12
         assert_eq!(scrolling_span.effective_px_y(-40), 280);
         assert_eq!(fixed_header.effective_px_y(-40), 12);
+    }
+
+    #[test]
+    fn test_rect_mask_parsing_and_popup_bounds() {
+        let mask = RectMask::parse_line("RECT_MASK:16,180,328,220,255,255,255")
+            .expect("RECT_MASK line should parse");
+        assert_eq!(mask.x, 16);
+        assert_eq!(mask.y, 180);
+        assert_eq!(mask.w, 328);
+        assert_eq!(mask.h, 220);
+        assert_eq!(mask.color, Color::WHITE);
+
+        let popup_mask = PopupMask::parse_line("POPUP_MASK:16,180,328,220,255,255,255")
+            .expect("POPUP_MASK line should parse");
+        assert_eq!(popup_mask, mask);
+
+        let (c0, r0, c1, r1) = mask.to_terminal_bounds(60, 40, 360, 576);
+        assert!(c0 >= 1 && c1 > c0 && c1 <= 60);
+        assert!(r0 >= 1 && r1 > r0 && r1 <= 40);
     }
 
     #[test]
