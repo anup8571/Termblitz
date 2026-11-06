@@ -679,16 +679,19 @@ fn main() -> io::Result<()> {
                         // while suppressing stale DOM text overlays inside any actively playing <video> bounding box.
                         if mode == RenderMode::CdpHybrid {
                             let mut overlays = cdp_engine.get_text_overlays();
-                            // Prioritize inputs first, then bold/navigation/link elements, then body text
-                            // so sticky headers, footers, and search boxes claim their terminal cells first
+                            let scroll_delta_px = cdp_engine.get_pending_scroll_px();
+                            // Prioritize inputs first, then sticky/fixed headers, then bold/navigation/link elements,
+                            // then body text so sticky headers, footers, and search boxes claim their terminal cells first
                             // and scrolled body text can never overwrite or merge into them.
                             overlays.sort_by_key(|s| {
                                 if s.is_input {
                                     0u8
-                                } else if s.bold || s.is_link {
+                                } else if s.is_fixed {
                                     1u8
-                                } else {
+                                } else if s.bold || s.is_link {
                                     2u8
+                                } else {
+                                    3u8
                                 }
                             });
 
@@ -705,11 +708,15 @@ fn main() -> io::Result<()> {
                             let mut occupied = vec![false; cols_usize * (rows as usize)];
 
                             for span in &overlays {
+                                let eff_px_y = span.effective_px_y(scroll_delta_px);
+                                if eff_px_y < 0 || eff_px_y >= (vh as i32).saturating_sub(2) {
+                                    continue;
+                                }
                                 let start_col = ((span.px_x.max(0) as f32 * cols as f32) / pw)
                                     .round()
                                     .min(cols.saturating_sub(1) as f32) as u16;
                                 let term_row = view_start_y
-                                    + ((span.px_y.max(0) as f32 * view_rows) / ph).round() as u16;
+                                    + ((eff_px_y as f32 * view_rows) / ph).round() as u16;
                                 let span_cols = ((span.px_w.max(8) as f32 * cols as f32) / pw)
                                     .round()
                                     .max(1.0) as usize;
@@ -975,14 +982,22 @@ fn main() -> io::Result<()> {
             fps_timer = Instant::now();
         }
 
-        let elapsed = frame_start.elapsed();
         let target_frame_time = if renderer.video_fast_path || renderer.scroll_fast_path || input_handler.is_typing_in_page {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(33)
         };
-        if elapsed < target_frame_time {
-            std::thread::sleep(target_frame_time - elapsed);
+        let rendered_cdp_count = cdp_engine.get_frame_count();
+        let was_scroll_fast = renderer.scroll_fast_path;
+        while frame_start.elapsed() < target_frame_time {
+            if mode.is_cdp() && cdp_engine.get_frame_count() != rendered_cdp_count {
+                break;
+            }
+            if was_scroll_fast && Instant::now() >= scroll_fast_until {
+                break;
+            }
+            let remaining = target_frame_time.saturating_sub(frame_start.elapsed());
+            std::thread::sleep(remaining.min(Duration::from_millis(2)));
         }
     }
 

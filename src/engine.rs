@@ -2,7 +2,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -58,6 +58,21 @@ pub struct TextOverlaySpan {
     pub is_link: bool,
     pub is_input: bool,
     pub link_url: Option<String>,
+    pub is_fixed: bool,
+}
+
+impl TextOverlaySpan {
+    /// Computes the live viewport Y coordinate of this span during active scrolling.
+    /// Sticky/fixed headers and footers (`is_fixed == true`) remain anchored at `px_y`,
+    /// while scrolling document text shifts by `-scroll_delta_px` in lockstep with the bitmap.
+    #[inline(always)]
+    pub fn effective_px_y(&self, scroll_delta_px: i32) -> i32 {
+        if self.is_fixed {
+            self.px_y
+        } else {
+            self.px_y.saturating_sub(scroll_delta_px)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1349,6 +1364,7 @@ impl WsConnection {
 }
 
 const TEXT_EXTRACT_ID: u64 = 55555;
+const SCROLL_SYNC_ID: u64 = 55556;
 
 /// Injects mobile reflow CSS, cosmetic ad-blocking rules, YouTube Ad-Shield auto-skipper, audio mute sync,
 /// and non-destructive text transparency (`-webkit-text-fill-color: transparent`).
@@ -1434,6 +1450,7 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
         var vw=window.innerWidth||360,vh=window.innerHeight||640;\
         var scEl=window.__termblitz_scroll_el||document.scrollingElement||document.documentElement||document.body;\
         var scTop=(scEl&&scEl!==document.body&&scEl!==document.documentElement&&scEl.scrollTop>0)?scEl.scrollTop:(window.scrollY||document.documentElement.scrollTop||document.body.scrollTop||0);\
+        window.__termblitz_extract_top=scTop;\
         var scH=(scEl&&scEl.scrollHeight>vh)?scEl.scrollHeight:Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0,vh);\
         var scClient=(scEl&&scEl.clientHeight>0&&scEl.clientHeight<vh)?scEl.clientHeight:vh;\
         var maxS=Math.max(1,scH-scClient);\
@@ -1462,6 +1479,15 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
                 bp=bp.parentElement;\
             }\
             return '';\
+        }\
+        function isFixed(el){\
+            var cur=el;\
+            while(cur&&cur!==document.body&&cur!==document.documentElement){\
+                var pos=getComputedStyle(cur).position;\
+                if(pos==='fixed'||pos==='sticky')return 1;\
+                cur=cur.parentElement;\
+            }\
+            return 0;\
         }\
         function isOccluded(el,cx,cy){\
             if(cx<1||cy<1||cx>=vw-1||cy>=vh-1)return false;\
@@ -1526,7 +1552,8 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             var a=p.closest('a');\
             var href=a?(a.href||''):'';\
             var bg=getBg(p);\
-            items.push({txt:txt,l:l,top:top,w:w,h:h,col:s.color,bold:(s.fontWeight==='bold'||+s.fontWeight>=600?1:0),link:(a?1:0),bg:bg,inp:0,href:href});\
+            var fix=isFixed(p);\
+            items.push({txt:txt,l:l,top:top,w:w,h:h,col:s.color,bold:(s.fontWeight==='bold'||+s.fontWeight>=600?1:0),link:(a?1:0),bg:bg,inp:0,href:href,fix:fix});\
             if(items.length>400)break;\
         }\
         var inputs=document.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]),textarea,[contenteditable=true],[role=searchbox],[role=combobox]');\
@@ -1542,11 +1569,13 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             var isFocused=(el===document.activeElement||el===window.__termblitz_active_input);\
             var rawVal=(typeof el.value==='string')?el.value:(el.isContentEditable?(el.textContent||''):'');\
             var matched=false;\
+            var ifix=isFixed(el);\
             for(var k=0;k<items.length;k++){\
                 var it=items[k];\
                 if(it.l>=erc.left-6&&it.l<=erc.right&&it.top>=erc.top-6&&it.top<=erc.bottom){\
                     it.top=ity;\
                     it.inp=1;\
+                    it.fix=ifix;\
                     if(rawVal&&rawVal.trim()){\
                         it.txt=isFocused?(rawVal+'▏'):rawVal.trim();\
                     }else if(isFocused){\
@@ -1562,12 +1591,12 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
                 }else if(!val){\
                     val='Search or type...';\
                 }\
-                items.push({txt:val,l:~~(erc.left+8),top:ity,w:~~Math.max(16,erc.width-16),h:18,col:es.color,bold:isFocused?1:0,link:0,bg:getBg(el),inp:1,href:''});\
+                items.push({txt:val,l:~~(erc.left+8),top:ity,w:~~Math.max(16,erc.width-16),h:18,col:es.color,bold:isFocused?1:0,link:0,bg:getBg(el),inp:1,href:'',fix:ifix});\
             }\
         }\
         for(var m=0;m<items.length;m++){\
             var x=items[m];\
-            r.push(x.txt+T+x.l+T+x.top+T+x.w+T+x.h+T+x.col+T+x.bold+T+x.link+T+x.bg+T+x.inp+T+x.href);\
+            r.push(x.txt+T+x.l+T+x.top+T+x.w+T+x.h+T+x.col+T+x.bold+T+x.link+T+x.bg+T+x.inp+T+x.href+T+(x.fix||0));\
         }\
         return r.join(N);\
     })()";
@@ -1609,6 +1638,7 @@ fn spawn_cdp_worker(
     shared_video_rects: Arc<Mutex<Vec<VideoRect>>>,
     shared_viewport: Arc<Mutex<(u32, u32)>>,
     shared_scroll_pct: Arc<AtomicUsize>,
+    shared_pending_scroll_px: Arc<AtomicI32>,
     shared_live_url: Arc<Mutex<String>>,
     frame_counter: Arc<AtomicUsize>,
     shared_error: Arc<Mutex<Option<String>>>,
@@ -1742,6 +1772,7 @@ fn spawn_cdp_worker(
                 match cmd {
                     CdpWorkerCommand::Navigate(new_url) => {
                         coalesced_scroll_delta = 0;
+                        shared_pending_scroll_px.store(0, Ordering::Relaxed);
                         is_loading.store(true, Ordering::Relaxed);
                         frame_counter.store(0, Ordering::Relaxed);
                         shared_overlays.lock().unwrap().clear();
@@ -2090,6 +2121,7 @@ fn spawn_cdp_worker(
                     }
                     CdpWorkerCommand::HistoryBack => {
                         coalesced_scroll_delta = 0;
+                        shared_pending_scroll_px.store(0, Ordering::Relaxed);
                         seq += 1;
                         let eval_cmd = format!(
                             r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"history.back()"}}}}"#,
@@ -2101,6 +2133,7 @@ fn spawn_cdp_worker(
                     }
                     CdpWorkerCommand::HistoryForward => {
                         coalesced_scroll_delta = 0;
+                        shared_pending_scroll_px.store(0, Ordering::Relaxed);
                         seq += 1;
                         let eval_cmd = format!(
                             r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"history.forward()"}}}}"#,
@@ -2130,77 +2163,58 @@ fn spawn_cdp_worker(
                     .round()
                     .clamp(1.0, (height_px.saturating_sub(2)).max(1) as f32) as i32;
 
-                // Single-application deterministic scroll:
-                // 1. Check for a scrollable inner container under pointer (or cached container) and scroll it once.
-                // 2. Otherwise scroll the document root once via window.scrollBy(0, dy).
-                // 3. Only if window.scrollY did not move, fall back to the largest scrollable container.
-                seq += 1;
+                // O(1) Cached Scroll Step + Exact Drift-Free Scroll Offset Readback:
+                // Scrolls once and returns `totalDeltaFromExtract\tpct` without running any DOM TreeWalker!
                 let scroll_js = format!(
                     "(function(){{\
-                        var dy={0},x={1},y={2};\
+                        var dy={0},x={1},y={2},T=String.fromCharCode(9);\
                         function canScroll(el,dir){{\
                             if(!el||el===document.documentElement||el===document.body)return false;\
-                            var s=getComputedStyle(el);\
-                            var ov=s.overflowY;\
-                            if(ov!=='auto'&&ov!=='scroll'&&ov!=='overlay')return false;\
                             if(el.scrollHeight<=el.clientHeight+4)return false;\
+                            var ov=getComputedStyle(el).overflowY;\
+                            if(ov!=='auto'&&ov!=='scroll'&&ov!=='overlay')return false;\
                             return dir>0?(el.scrollTop+el.clientHeight<el.scrollHeight-1):(el.scrollTop>0);\
                         }}\
-                        var cur=document.elementFromPoint(x,y);\
-                        while(cur&&cur!==document.body&&cur!==document.documentElement){{\
-                            if(canScroll(cur,dy)){{\
-                                var b0=cur.scrollTop;\
-                                cur.scrollTop+=dy;\
-                                if(cur.scrollTop!==b0){{window.__termblitz_scroll_el=cur;return;}}\
-                            }}\
-                            cur=cur.parentElement;\
-                        }}\
-                        var root=document.scrollingElement||document.documentElement||document.body;\
-                        var prevY=window.scrollY||(root?root.scrollTop:0)||0;\
-                        window.scrollBy(0,dy);\
-                        var afterY=window.scrollY||(root?root.scrollTop:0)||0;\
-                        if(afterY===prevY&&root){{\
-                            root.scrollTop+=dy;\
-                            afterY=root.scrollTop||0;\
-                        }}\
-                        if(afterY!==prevY){{\
-                            window.__termblitz_scroll_el=root;\
-                            return;\
-                        }}\
-                        if(window.__termblitz_scroll_el&&canScroll(window.__termblitz_scroll_el,dy)){{\
-                            var b1=window.__termblitz_scroll_el.scrollTop;\
-                            window.__termblitz_scroll_el.scrollTop+=dy;\
-                            if(window.__termblitz_scroll_el.scrollTop!==b1)return;\
-                        }}\
-                        var cands=document.querySelectorAll('main,[role=main],ytm-app,ytd-app,div,section');\
-                        var best=null,bestArea=0;\
-                        for(var i=0;i<cands.length&&i<100;i++){{\
-                            var c=cands[i];\
-                            if(c.clientWidth>160&&c.clientHeight>160&&canScroll(c,dy)){{\
-                                var area=c.clientWidth*c.clientHeight;\
-                                if(area>bestArea){{bestArea=area;best=c;}}\
+                        var scEl=null;\
+                        if(window.__termblitz_scroll_el&&window.__termblitz_scroll_el!==document.body&&window.__termblitz_scroll_el!==document.documentElement&&canScroll(window.__termblitz_scroll_el,dy)){{\
+                            scEl=window.__termblitz_scroll_el;\
+                            scEl.scrollTop+=dy;\
+                        }}else{{\
+                            var root=document.scrollingElement||document.documentElement||document.body;\
+                            var prevY=window.scrollY||(root?root.scrollTop:0)||0;\
+                            window.scrollBy(0,dy);\
+                            var afterY=window.scrollY||(root?root.scrollTop:0)||0;\
+                            if(afterY===prevY&&root){{root.scrollTop+=dy;afterY=root.scrollTop||0;}}\
+                            if(afterY!==prevY){{\
+                                scEl=root;\
+                                window.__termblitz_scroll_el=root;\
+                            }}else{{\
+                                var cur=document.elementFromPoint(x,y);\
+                                while(cur&&cur!==document.body&&cur!==document.documentElement){{\
+                                    if(canScroll(cur,dy)){{scEl=cur;cur.scrollTop+=dy;window.__termblitz_scroll_el=cur;break;}}\
+                                    cur=cur.parentElement;\
+                                }}\
+                                if(!scEl){{scEl=root;}}\
                             }}\
                         }}\
-                        if(best){{\
-                            window.__termblitz_scroll_el=best;\
-                            best.scrollTop+=dy;\
-                        }}\
+                        var nowTop=(scEl&&scEl!==document.body&&scEl!==document.documentElement&&scEl.scrollTop>0)?scEl.scrollTop:(window.scrollY||document.documentElement.scrollTop||document.body.scrollTop||0);\
+                        var baseTop=window.__termblitz_extract_top||0;\
+                        var vh=window.innerHeight||640;\
+                        var scH=(scEl&&scEl.scrollHeight>vh)?scEl.scrollHeight:Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0,vh);\
+                        var scClient=(scEl&&scEl.clientHeight>0&&scEl.clientHeight<vh)?scEl.clientHeight:vh;\
+                        var maxS=Math.max(1,scH-scClient);\
+                        var pct=Math.min(100,Math.max(0,Math.round((nowTop*100)/maxS)));\
+                        return (~~(nowTop-baseTop))+T+pct;\
                     }})()",
                     pixel_delta, px_x, px_y
                 );
                 let scroll_cmd = format!(
-                    r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
-                    seq,
+                    r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}","returnByValue":true}}}}"#,
+                    SCROLL_SYNC_ID,
                     json_escape(&scroll_js)
                 );
                 let _ = ws.send_text(&scroll_cmd);
-                if curr_hide_text {
-                    request_text_extraction(&mut ws, &mut seq);
-                    last_text_extract = Instant::now();
-                    pending_extract = false;
-                } else {
-                    pending_extract = true;
-                }
+                pending_extract = true;
                 last_scroll_instant = Instant::now();
                 active_until = Instant::now() + Duration::from_millis(450);
             }
@@ -2212,6 +2226,7 @@ fn spawn_cdp_worker(
                     if msg.contains(r#""Page.loadEventFired""#) {
                         is_loading.store(false, Ordering::Relaxed);
                     }
+                    shared_pending_scroll_px.store(0, Ordering::Relaxed);
                     seq += 1;
                     let setup_js = build_page_style_js(curr_hide_text, curr_adblock, curr_muted);
                     let eval_cmd = format!(
@@ -2224,7 +2239,28 @@ fn spawn_cdp_worker(
                     active_until = Instant::now() + Duration::from_secs(2);
                 }
 
-                // Handle text extraction response
+                // Handle O(1) scroll offset sync response (SCROLL_SYNC_ID = 55556)
+                if msg.contains(r#""id":55556"#) || msg.contains(r#""id": 55556"#) {
+                    if let Some(pos) = msg.find(r#""value":""#) {
+                        let rest = &msg[pos + 9..];
+                        if let Some(q_end) = find_unescaped_quote(rest) {
+                            let val = json_unescape(&rest[..q_end]);
+                            let mut parts = val.split('\t');
+                            if let Some(delta_s) = parts.next() {
+                                if let Ok(total_delta) = delta_s.trim().parse::<i32>() {
+                                    shared_pending_scroll_px.store(total_delta, Ordering::Relaxed);
+                                }
+                            }
+                            if let Some(pct_s) = parts.next() {
+                                if let Ok(pct) = pct_s.trim().parse::<usize>() {
+                                    shared_scroll_pct.store(pct, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Handle text extraction response (TEXT_EXTRACT_ID = 55555)
                 if msg.contains(r#""id":55555"#) || msg.contains(r#""id": 55555"#) {
                     if let Some(pos) = msg.find(r#""value":""#) {
                         let rest = &msg[pos + 9..];
@@ -2282,6 +2318,7 @@ fn spawn_cdp_worker(
                                         .map(|s| s.trim())
                                         .filter(|s| !s.is_empty())
                                         .map(|s| s.to_string());
+                                    let is_fixed = parts.get(11).copied() == Some("1");
                                     spans.push(TextOverlaySpan {
                                         text,
                                         px_x,
@@ -2294,10 +2331,12 @@ fn spawn_cdp_worker(
                                         is_link,
                                         is_input,
                                         link_url,
+                                        is_fixed,
                                     });
                                 }
                             }
                             *shared_overlays.lock().unwrap() = spans;
+                            shared_pending_scroll_px.store(0, Ordering::Relaxed);
                         }
                     }
                 }
@@ -2350,15 +2389,15 @@ fn spawn_cdp_worker(
                 }
             }
 
-            // Throttled real-time DOM text & coordinate extraction
+            // Scroll-Gated DOM Text Extraction:
+            // Suspend heavy TreeWalker / getComputedStyle / elementFromPoint calls while the user is
+            // actively scrolling (`< 220ms`) so Chromium's compositor streams screencast frames at 60 FPS,
+            // then extract fresh DOM coordinates immediately once scrolling settles.
             let now = Instant::now();
-            let extract_interval = if last_scroll_instant.elapsed() < Duration::from_millis(150) {
-                Duration::from_millis(140)
-            } else {
-                Duration::from_millis(90)
-            };
-            if (pending_extract || now < active_until)
-                && last_text_extract.elapsed() >= extract_interval
+            let is_actively_scrolling = last_scroll_instant.elapsed() < Duration::from_millis(220);
+            if !is_actively_scrolling
+                && (pending_extract || now < active_until)
+                && last_text_extract.elapsed() >= Duration::from_millis(100)
             {
                 request_text_extraction(&mut ws, &mut seq);
                 last_text_extract = now;
@@ -2380,6 +2419,7 @@ pub struct CdpEngine {
     pub video_rects: Arc<Mutex<Vec<VideoRect>>>,
     pub viewport_dims: Arc<Mutex<(u32, u32)>>,
     pub scroll_pct: Arc<AtomicUsize>,
+    pub pending_scroll_px: Arc<AtomicI32>,
     pub live_url: Arc<Mutex<String>>,
     pub frame_counter: Arc<AtomicUsize>,
     pub is_loading: Arc<AtomicBool>,
@@ -2407,6 +2447,7 @@ impl CdpEngine {
             video_rects: Arc::new(Mutex::new(Vec::new())),
             viewport_dims: Arc::new(Mutex::new((360, 640))),
             scroll_pct: Arc::new(AtomicUsize::new(0)),
+            pending_scroll_px: Arc::new(AtomicI32::new(0)),
             live_url: Arc::new(Mutex::new(String::new())),
             frame_counter: Arc::new(AtomicUsize::new(0)),
             is_loading: Arc::new(AtomicBool::new(true)),
@@ -2424,6 +2465,10 @@ impl CdpEngine {
 
     pub fn get_text_overlays(&self) -> Vec<TextOverlaySpan> {
         self.text_overlays.lock().unwrap().clone()
+    }
+
+    pub fn get_pending_scroll_px(&self) -> i32 {
+        self.pending_scroll_px.load(Ordering::Relaxed)
     }
 
     pub fn get_video_rects(&self) -> Vec<VideoRect> {
@@ -2448,6 +2493,7 @@ impl CdpEngine {
 
     pub fn hit_test_overlay(&self, click_x: u16, click_y: u16, cols: u16, rows: u16) -> (Option<String>, bool) {
         let overlays = self.get_text_overlays();
+        let scroll_delta_px = self.get_pending_scroll_px();
         let (vw, vh) = self.get_viewport_dims();
         let pw = vw.max(1) as f32;
         let ph = vh.max(1) as f32;
@@ -2455,9 +2501,13 @@ impl CdpEngine {
         let view_rows = (rows.saturating_sub(view_start_y)).max(1) as f32;
 
         for span in overlays.iter().rev() {
+            let eff_y = span.effective_px_y(scroll_delta_px);
+            if eff_y < 0 || eff_y >= vh as i32 {
+                continue;
+            }
             let start_col = ((span.px_x.max(0) as f32 * cols as f32) / pw).round() as u16;
             let span_cols = ((span.px_w.max(8) as f32 * cols as f32) / pw).round().max(2.0) as u16;
-            let term_row = view_start_y + ((span.px_y.max(0) as f32 * view_rows) / ph).round() as u16;
+            let term_row = view_start_y + ((eff_y as f32 * view_rows) / ph).round() as u16;
             let box_rows = ((span.px_h.max(14) as f32 * view_rows) / ph).ceil().max(1.0) as u16;
 
             if click_y >= term_row
@@ -2829,6 +2879,7 @@ impl CdpEngine {
                 Arc::clone(&self.video_rects),
                 Arc::clone(&self.viewport_dims),
                 Arc::clone(&self.scroll_pct),
+                Arc::clone(&self.pending_scroll_px),
                 Arc::clone(&self.live_url),
                 Arc::clone(&self.frame_counter),
                 Arc::clone(&self.error_message),
@@ -3049,6 +3100,7 @@ mod tests {
             bold: false,
             is_link: false,
             is_input: false,
+            is_fixed: false,
             link_url: None,
         };
 
@@ -3067,6 +3119,46 @@ mod tests {
         assert_eq!(start_col, 8);
         assert_eq!(term_row, 17);
         assert_eq!(span_cols, 15);
+    }
+
+    #[test]
+    fn test_predictive_scroll_overlay_shift() {
+        let scrolling_span = TextOverlaySpan {
+            text: "Body paragraph".to_string(),
+            px_x: 24,
+            px_y: 240,
+            px_w: 180,
+            px_h: 20,
+            fg: Color::BLACK,
+            bg: None,
+            bold: false,
+            is_link: false,
+            is_input: false,
+            is_fixed: false,
+            link_url: None,
+        };
+        let fixed_header = TextOverlaySpan {
+            text: "Sticky Navbar".to_string(),
+            px_x: 0,
+            px_y: 12,
+            px_w: 360,
+            px_h: 28,
+            fg: Color::WHITE,
+            bg: Some(Color::new(20, 24, 32)),
+            bold: true,
+            is_link: false,
+            is_input: false,
+            is_fixed: true,
+            link_url: None,
+        };
+
+        // Scrolling down by +80 CSS pixels shifts body text up to y=160 while sticky header stays at y=12
+        assert_eq!(scrolling_span.effective_px_y(80), 160);
+        assert_eq!(fixed_header.effective_px_y(80), 12);
+
+        // Scrolling up by -40 CSS pixels shifts body text down to y=280 while sticky header stays at y=12
+        assert_eq!(scrolling_span.effective_px_y(-40), 280);
+        assert_eq!(fixed_header.effective_px_y(-40), 12);
     }
 
     #[test]

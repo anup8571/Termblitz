@@ -52,6 +52,94 @@ impl Color {
     }
 }
 
+/// High-performance integer luminance approximation: `(R*77 + G*150 + B*29) >> 8`
+#[inline(always)]
+pub fn luma_fast_u32(c: Color) -> u32 {
+    (c.r as u32 * 77 + c.g as u32 * 150 + c.b as u32 * 29) >> 8
+}
+
+/// Averages two colors using fast integer ALU bit-shifts without overflow.
+#[inline(always)]
+pub fn avg_color(c1: Color, c2: Color) -> Color {
+    Color::new(
+        ((c1.r as u16 + c2.r as u16) >> 1) as u8,
+        ((c1.g as u16 + c2.g as u16) >> 1) as u8,
+        ((c1.b as u16 + c2.b as u16) >> 1) as u8,
+    )
+}
+
+/// Maps a 24-bit RGB `Color` to the nearest xterm-256 palette index (`16..=255`).
+#[inline(always)]
+pub fn rgb_to_xterm256(c: Color) -> u8 {
+    if c.r.abs_diff(c.g) <= 2 && c.g.abs_diff(c.b) <= 2 {
+        if c.r < 8 {
+            return 16;
+        }
+        if c.r > 248 {
+            return 231;
+        }
+        return (((c.r as u16 - 8) * 24) / 240) as u8 + 232;
+    }
+    let r = ((c.r as u16 * 5 + 127) / 255) as u8;
+    let g = ((c.g as u16 * 5 + 127) / 255) as u8;
+    let b = ((c.b as u16 * 5 + 127) / 255) as u8;
+    16 + 36 * r + 6 * g + b
+}
+
+/// Returns true if `ch` is a half-block or 2x2 quadrant block glyph used for subpixel rendering.
+#[inline(always)]
+pub fn is_quadrant_block_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '▀' | '▄' | '▌' | '▐' | '▖' | '▗' | '▘' | '▙' | '▚' | '▛' | '▜' | '▝' | '▞' | '▟' | '█'
+    )
+}
+
+/// Carbonyl-grade 2x2 Quadrant Binarizer:
+/// Maps 4 subpixel quadrant colors `(tl, tr, bl, br)` into `(Unicode char, Foreground, Background)`
+/// using integer luminance `(R*77 + G*150 + B*29) >> 8` and dynamic midpoint thresholding.
+#[inline]
+pub fn binarize_quadrant(tl: Color, tr: Color, bl: Color, br: Color) -> (char, Color, Color) {
+    let a = luma_fast_u32(tl);
+    let b = luma_fast_u32(tr);
+    let c = luma_fast_u32(bl);
+    let d = luma_fast_u32(br);
+
+    let min = a.min(b).min(c).min(d);
+    let max = a.max(b).max(c).max(d);
+
+    // Flat or sub-perceptual contrast cell: emit clean space with averaged background
+    if max.saturating_sub(min) < 6 {
+        return (' ', Color::WHITE, avg_color(avg_color(tl, tr), avg_color(bl, br)));
+    }
+
+    let mid = min + (max - min) / 2;
+    let mask = ((a > mid) as u8) << 3
+        | ((b > mid) as u8) << 2
+        | ((c > mid) as u8) << 1
+        | ((d > mid) as u8);
+
+    match mask {
+        0b0000 => (' ', Color::WHITE, avg_color(avg_color(tl, tr), avg_color(bl, br))),
+        0b0001 => ('▗', br, avg_color(avg_color(tl, tr), bl)),
+        0b0010 => ('▖', bl, avg_color(avg_color(tl, tr), br)),
+        0b0011 => ('▄', avg_color(bl, br), avg_color(tl, tr)),
+        0b0100 => ('▝', tr, avg_color(avg_color(tl, bl), br)),
+        0b0101 => ('▐', avg_color(tr, br), avg_color(tl, bl)),
+        0b0110 => ('▞', avg_color(tr, bl), avg_color(tl, br)),
+        0b0111 => ('▟', avg_color(avg_color(tr, bl), br), tl),
+        0b1000 => ('▘', tl, avg_color(avg_color(tr, bl), br)),
+        0b1001 => ('▚', avg_color(tl, br), avg_color(tr, bl)),
+        0b1010 => ('▌', avg_color(tl, bl), avg_color(tr, br)),
+        0b1011 => ('▙', avg_color(avg_color(tl, bl), br), tr),
+        0b1100 => ('▀', avg_color(tl, tr), avg_color(bl, br)),
+        0b1101 => ('▜', avg_color(avg_color(tl, tr), br), bl),
+        0b1110 => ('▛', avg_color(avg_color(tl, tr), bl), br),
+        0b1111 => ('▀', avg_color(tl, tr), avg_color(bl, br)),
+        _ => (' ', Color::WHITE, avg_color(avg_color(tl, tr), avg_color(bl, br))),
+    }
+}
+
 /// Returns true if `c` is a zero-width Unicode combining mark, Indic vowel matra / virama / nukta / anusvara,
 /// zero-width joiner, or variation selector that must attach to the previous terminal cell rather than
 /// advancing to a new column (which would otherwise render dotted circles `◌` in Indic/complex scripts).
@@ -394,6 +482,7 @@ pub struct DiffRenderer {
     pub video_fast_path: bool,
     pub scroll_fast_path: bool,
     pub pixel_art_mode: bool,
+    pub fast_color_mode: bool,
     current: Vec<Cell>,
     previous: Vec<Cell>,
     cached_bg_cells: Vec<Cell>,
@@ -404,6 +493,10 @@ pub struct DiffRenderer {
 impl DiffRenderer {
     pub fn new(width: u16, height: u16) -> Self {
         let size = (width as usize) * (height as usize);
+        let fast_color_mode = std::env::var("TERMBLITZ_FAST_COLOR")
+            .or_else(|_| std::env::var("CARBONYL_FAST_COLOR"))
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         Self {
             width,
             height,
@@ -413,6 +506,7 @@ impl DiffRenderer {
             video_fast_path: false,
             scroll_fast_path: false,
             pixel_art_mode: false,
+            fast_color_mode,
             current: vec![Cell::EMPTY; size],
             previous: vec![Cell::INVALID; size],
             cached_bg_cells: Vec::new(),
@@ -510,7 +604,7 @@ impl DiffRenderer {
         let uniform_bg = explicit_bg.unwrap_or_else(|| {
             let sample_idx = (y as usize) * (self.width as usize) + (x as usize);
             if let Some(cell) = self.current.get(sample_idx) {
-                if cell.ch == '▀' {
+                if is_quadrant_block_char(cell.ch) {
                     let lum_fg = cell.fg.luma_fast();
                     let lum_bg = cell.bg.luma_fast();
                     if fg.luma_fast() < 128 {
@@ -546,7 +640,7 @@ impl DiffRenderer {
                 let cell = &self.current[idx];
                 let clean_bg = if explicit_bg.is_some() {
                     uniform_bg
-                } else if cell.ch == '▀' {
+                } else if is_quadrant_block_char(cell.ch) {
                     let lum_fg = cell.fg.luma_fast();
                     let lum_bg = cell.bg.luma_fast();
                     let best = if fg.luma_fast() < 128 {
@@ -1012,8 +1106,56 @@ impl DiffRenderer {
             &upscaled_storage
         };
 
-        // Pass 1: Downsample/map `active_buf` to the exact terminal subpixel grid `(target_w x target_h)`
-        let mut subpixel_buf = PixelBuffer::new(target_w, target_h, Color::BLACK);
+        // Motion Fast-Path (Carbonyl-style direct integer ALU quadrant blitter during active scrolling):
+        // Completely bypasses intermediate heap allocations, neural convolutions, and Bayer noise
+        // so scrolling runs at a locked 60 FPS, then snaps to full Super-Resolution on settle.
+        if self.scroll_fast_path {
+            let src_w = px_buf.width;
+            let src_h = px_buf.height;
+            let quad_w = (target_w * 2).max(1);
+            let quad_h = (target_h * 2).max(1);
+
+            for row in 0..rows {
+                let term_y = start_y + (row as u16);
+                if term_y >= self.height {
+                    break;
+                }
+                let qy0 = ((row * 4) * src_h / quad_h).min(src_h - 1);
+                let qy1 = ((row * 4 + 1) * src_h / quad_h).min(src_h - 1);
+                let qy2 = ((row * 4 + 2) * src_h / quad_h).min(src_h - 1);
+                let qy3 = ((row * 4 + 3) * src_h / quad_h).min(src_h - 1);
+
+                for col in 0..cols {
+                    let qx0 = ((col * 2) * src_w / quad_w).min(src_w - 1);
+                    let qx1 = ((col * 2 + 1) * src_w / quad_w).min(src_w - 1);
+
+                    let tl = avg_color(px_buf.get_pixel(qx0, qy0), px_buf.get_pixel(qx0, qy1));
+                    let tr = avg_color(px_buf.get_pixel(qx1, qy0), px_buf.get_pixel(qx1, qy1));
+                    let bl = avg_color(px_buf.get_pixel(qx0, qy2), px_buf.get_pixel(qx0, qy3));
+                    let br = avg_color(px_buf.get_pixel(qx1, qy2), px_buf.get_pixel(qx1, qy3));
+
+                    let (ch, fg, bg) = binarize_quadrant(tl, tr, bl, br);
+                    self.set_cell(
+                        col as u16,
+                        term_y,
+                        Cell {
+                            ch,
+                            comb: ['\0'; 3],
+                            fg,
+                            bg,
+                            bold: false,
+                            underline: false,
+                        },
+                    );
+                }
+            }
+            return;
+        }
+
+        // Static / Settle / Video Path:
+        // Map `active_buf` to a 2x2 Quadrant Subpixel Grid `(sub_w = target_w * 2, target_h = rows * 2)`
+        let sub_w = target_w * 2;
+        let mut subpixel_buf = PixelBuffer::new(sub_w, target_h, Color::BLACK);
         for row in 0..rows {
             let sub_y_top = row * 2;
             let sub_y_bot = row * 2 + 1;
@@ -1023,33 +1165,42 @@ impl DiffRenderer {
             let bot_y1 = ((row * 2 + 2) * active_buf.height) / target_h;
 
             for col in 0..cols {
-                let x0 = (col * active_buf.width) / target_w;
-                let x1 = ((col + 1) * active_buf.width) / target_w;
+                let sub_x_left = col * 2;
+                let sub_x_right = col * 2 + 1;
+                let x0 = (sub_x_left * active_buf.width) / sub_w;
+                let x_mid = (sub_x_right * active_buf.width) / sub_w;
+                let x1 = ((col * 2 + 2) * active_buf.width) / sub_w;
 
-                let (raw_top, raw_bot) = if is_pixel_art {
-                    let cx = (x0 + (x1.saturating_sub(x0)) / 2).min(active_buf.width - 1);
+                let (tl, tr, bl, br) = if is_pixel_art {
+                    let cx_l = (x0 + (x_mid.saturating_sub(x0)) / 2).min(active_buf.width - 1);
+                    let cx_r = (x_mid + (x1.saturating_sub(x_mid)) / 2).min(active_buf.width - 1);
                     let cy_top =
                         (top_y0 + (top_y1.saturating_sub(top_y0)) / 2).min(active_buf.height - 1);
                     let cy_bot =
                         (bot_y0 + (bot_y1.saturating_sub(bot_y0)) / 2).min(active_buf.height - 1);
                     (
-                        active_buf.get_pixel(cx, cy_top),
-                        active_buf.get_pixel(cx, cy_bot),
+                        active_buf.get_pixel(cx_l, cy_top),
+                        active_buf.get_pixel(cx_r, cy_top),
+                        active_buf.get_pixel(cx_l, cy_bot),
+                        active_buf.get_pixel(cx_r, cy_bot),
                     )
                 } else {
                     (
-                        Self::sample_subpixel_box(active_buf, x0, x1, top_y0, top_y1),
-                        Self::sample_subpixel_box(active_buf, x0, x1, bot_y0, bot_y1),
+                        Self::sample_subpixel_box(active_buf, x0, x_mid, top_y0, top_y1),
+                        Self::sample_subpixel_box(active_buf, x_mid, x1, top_y0, top_y1),
+                        Self::sample_subpixel_box(active_buf, x0, x_mid, bot_y0, bot_y1),
+                        Self::sample_subpixel_box(active_buf, x_mid, x1, bot_y0, bot_y1),
                     )
                 };
-                subpixel_buf.set_pixel(col, sub_y_top, raw_top);
-                subpixel_buf.set_pixel(col, sub_y_bot, raw_bot);
+                subpixel_buf.set_pixel(sub_x_left, sub_y_top, tl);
+                subpixel_buf.set_pixel(sub_x_right, sub_y_top, tr);
+                subpixel_buf.set_pixel(sub_x_left, sub_y_bot, bl);
+                subpixel_buf.set_pixel(sub_x_right, sub_y_bot, br);
             }
         }
 
         // Pass 1b: Run Contrast-Adaptive Sharpening (RCAS) directly on the terminal subpixel grid
-        // so 1px sharpening lobes crisp up half-block (`▀`) edges, video frames, and thumbnails.
-        // Bypass RCAS when in crisp Pixel-Art Scale2x mode so retro sprites have zero ringing.
+        // so 1px sharpening lobes crisp up half-block (`▀`) and quadrant edges, video frames, and thumbnails.
         let rcas_storage;
         let final_subpixels = if is_pixel_art {
             &subpixel_buf
@@ -1071,8 +1222,7 @@ impl DiffRenderer {
         let dither = self.dithering_enabled;
         let max_col = cols.saturating_sub(1);
 
-        // Pass 2: Apply 4x4 Ordered Bayer dithering only on cells with active color gradients/textures.
-        // Flat constant backgrounds (`raw_top == raw_bot` and zero neighbor gradient) emit exact clean RGB.
+        // Pass 2: Hybrid Carbonyl Quadrant Binarization + Flat-Suppressed TrueColor Half-Block Dithering
         for row in 0..rows {
             let term_y = start_y + (row as u16);
             if term_y >= self.height {
@@ -1082,12 +1232,57 @@ impl DiffRenderer {
             let sub_y_bot = row * 2 + 1;
 
             for col in 0..cols {
-                let raw_top = final_subpixels.get_pixel(col, sub_y_top);
-                let raw_bot = final_subpixels.get_pixel(col, sub_y_bot);
-                let left_top = final_subpixels.get_pixel(col.saturating_sub(1), sub_y_top);
-                let left_bot = final_subpixels.get_pixel(col.saturating_sub(1), sub_y_bot);
-                let right_top = final_subpixels.get_pixel((col + 1).min(max_col), sub_y_top);
-                let right_bot = final_subpixels.get_pixel((col + 1).min(max_col), sub_y_bot);
+                let sx_l = col * 2;
+                let sx_r = col * 2 + 1;
+                let tl = final_subpixels.get_pixel(sx_l, sub_y_top);
+                let tr = final_subpixels.get_pixel(sx_r, sub_y_top);
+                let bl = final_subpixels.get_pixel(sx_l, sub_y_bot);
+                let br = final_subpixels.get_pixel(sx_r, sub_y_bot);
+
+                let horiz_diff = tl
+                    .luma_fast()
+                    .abs_diff(tr.luma_fast())
+                    .max(bl.luma_fast().abs_diff(br.luma_fast()));
+
+                // If there is a distinct vertical or diagonal edge inside this cell (`horiz_diff >= 14`),
+                // use Carbonyl's 16-state 2x2 quadrant binarizer for 2x horizontal spatial resolution.
+                if horiz_diff >= 14 {
+                    let (q_ch, q_fg, q_bg) = binarize_quadrant(tl, tr, bl, br);
+                    self.set_cell(
+                        col as u16,
+                        term_y,
+                        Cell {
+                            ch: q_ch,
+                            comb: ['\0'; 3],
+                            fg: q_fg,
+                            bg: q_bg,
+                            bold: false,
+                            underline: false,
+                        },
+                    );
+                    continue;
+                }
+
+                let raw_top = avg_color(tl, tr);
+                let raw_bot = avg_color(bl, br);
+                let prev_col = col.saturating_sub(1) * 2;
+                let next_col = (col + 1).min(max_col) * 2;
+                let left_top = avg_color(
+                    final_subpixels.get_pixel(prev_col, sub_y_top),
+                    final_subpixels.get_pixel(prev_col + 1, sub_y_top),
+                );
+                let left_bot = avg_color(
+                    final_subpixels.get_pixel(prev_col, sub_y_bot),
+                    final_subpixels.get_pixel(prev_col + 1, sub_y_bot),
+                );
+                let right_top = avg_color(
+                    final_subpixels.get_pixel(next_col, sub_y_top),
+                    final_subpixels.get_pixel(next_col + 1, sub_y_top),
+                );
+                let right_bot = avg_color(
+                    final_subpixels.get_pixel(next_col, sub_y_bot),
+                    final_subpixels.get_pixel(next_col + 1, sub_y_bot),
+                );
 
                 let is_flat_cell = raw_top == raw_bot
                     && raw_top == left_top
@@ -1318,6 +1513,9 @@ impl DiffRenderer {
 
     /// Encodes all dirty cells into `self.write_buf` wrapped in DEC Synchronized Output
     /// (`\x1b[?2026h` begin synchronized update ... `\x1b[?2026l` end synchronized update).
+    /// Uses Carbonyl-style SGR delta compression (targeted `\x1b[22m`/`\x1b[24m` attribute off-codes
+    /// without destructive `\x1b[0m` color resets, optional xterm-256 quantization, perceptual motion
+    /// color coalescing, and compact `\x1b[nC` relative cursor advances).
     pub fn build_synchronized_frame(&mut self) -> usize {
         self.write_buf.clear();
 
@@ -1326,11 +1524,24 @@ impl DiffRenderer {
 
         let mut last_fg: Option<Color> = None;
         let mut last_bg: Option<Color> = None;
+        let mut last_fg_code: Option<u8> = None;
+        let mut last_bg_code: Option<u8> = None;
         let mut last_bold: Option<bool> = None;
         let mut last_underline: Option<bool> = None;
         let mut cursor_pos: Option<(u16, u16)> = None;
 
         let mut dirty_count = 0;
+        let color_tol: u8 = if self.scroll_fast_path { 2 } else { 0 };
+        let fast_256 = self.fast_color_mode;
+
+        #[inline(always)]
+        fn color_matches(a: Color, b: Color, tol: u8) -> bool {
+            if tol == 0 {
+                a == b
+            } else {
+                a.r.abs_diff(b.r) <= tol && a.g.abs_diff(b.g) <= tol && a.b.abs_diff(b.b) <= tol
+            }
+        }
 
         // Reserve DEC Mode 2026 Synchronized Update header once the first dirty cell is encountered
         for y in 0..height {
@@ -1348,18 +1559,37 @@ impl DiffRenderer {
                 }
 
                 if dirty_count == 0 {
-                    // Begin DEC Synchronized Output (\x1b[?2026h)
-                    self.write_buf.extend_from_slice(b"\x1b[?2026h");
+                    // Begin DEC Synchronized Output (\x1b[?2026h) and initialize clean SGR baseline once
+                    self.write_buf.extend_from_slice(b"\x1b[?2026h\x1b[0m");
+                    last_bold = Some(false);
+                    last_underline = Some(false);
                 }
                 dirty_count += 1;
 
                 let target_pos = (x as u16 + 1, y as u16 + 1);
                 if cursor_pos != Some(target_pos) {
-                    self.write_buf.extend_from_slice(b"\x1b[");
-                    push_u16(&mut self.write_buf, target_pos.1);
-                    self.write_buf.push(b';');
-                    push_u16(&mut self.write_buf, target_pos.0);
-                    self.write_buf.push(b'H');
+                    if let Some((cx, cy)) = cursor_pos {
+                        if cy == target_pos.1 && target_pos.0 > cx && target_pos.0 - cx <= 4 {
+                            let dx = target_pos.0 - cx;
+                            self.write_buf.extend_from_slice(b"\x1b[");
+                            if dx > 1 {
+                                push_u16(&mut self.write_buf, dx);
+                            }
+                            self.write_buf.push(b'C');
+                        } else {
+                            self.write_buf.extend_from_slice(b"\x1b[");
+                            push_u16(&mut self.write_buf, target_pos.1);
+                            self.write_buf.push(b';');
+                            push_u16(&mut self.write_buf, target_pos.0);
+                            self.write_buf.push(b'H');
+                        }
+                    } else {
+                        self.write_buf.extend_from_slice(b"\x1b[");
+                        push_u16(&mut self.write_buf, target_pos.1);
+                        self.write_buf.push(b';');
+                        push_u16(&mut self.write_buf, target_pos.0);
+                        self.write_buf.push(b'H');
+                    }
                 }
 
                 let run_fg = cur.fg;
@@ -1367,49 +1597,73 @@ impl DiffRenderer {
                 let run_bold = cur.bold;
                 let run_underline = cur.underline;
 
-                if last_bold != Some(run_bold) || last_underline != Some(run_underline) {
+                // Non-destructive SGR attribute delta updates (\x1b[1m / \x1b[22m, \x1b[4m / \x1b[24m)
+                // Preserves active foreground and background colors without a full \x1b[0m reset!
+                if last_bold != Some(run_bold) {
                     last_bold = Some(run_bold);
-                    last_underline = Some(run_underline);
-
-                    self.write_buf.extend_from_slice(b"\x1b[0");
                     if run_bold {
-                        self.write_buf.extend_from_slice(b";1");
+                        self.write_buf.extend_from_slice(b"\x1b[1m");
+                    } else {
+                        self.write_buf.extend_from_slice(b"\x1b[22m");
                     }
+                }
+                if last_underline != Some(run_underline) {
+                    last_underline = Some(run_underline);
                     if run_underline {
-                        self.write_buf.extend_from_slice(b";4");
+                        self.write_buf.extend_from_slice(b"\x1b[4m");
+                    } else {
+                        self.write_buf.extend_from_slice(b"\x1b[24m");
                     }
-                    self.write_buf.push(b'm');
-                    last_fg = None;
-                    last_bg = None;
                 }
 
-                if last_fg != Some(run_fg) {
-                    last_fg = Some(run_fg);
-                    self.write_buf.extend_from_slice(b"\x1b[38;2;");
-                    push_u8(&mut self.write_buf, run_fg.r);
-                    self.write_buf.push(b';');
-                    push_u8(&mut self.write_buf, run_fg.g);
-                    self.write_buf.push(b';');
-                    push_u8(&mut self.write_buf, run_fg.b);
-                    self.write_buf.push(b'm');
-                }
+                if fast_256 {
+                    let fg_code = rgb_to_xterm256(run_fg);
+                    if last_fg_code != Some(fg_code) {
+                        last_fg_code = Some(fg_code);
+                        self.write_buf.extend_from_slice(b"\x1b[38;5;");
+                        push_u8(&mut self.write_buf, fg_code);
+                        self.write_buf.push(b'm');
+                    }
+                    let bg_code = rgb_to_xterm256(run_bg);
+                    if last_bg_code != Some(bg_code) {
+                        last_bg_code = Some(bg_code);
+                        self.write_buf.extend_from_slice(b"\x1b[48;5;");
+                        push_u8(&mut self.write_buf, bg_code);
+                        self.write_buf.push(b'm');
+                    }
+                } else {
+                    if !last_fg.map_or(false, |prev_fg| color_matches(prev_fg, run_fg, color_tol)) {
+                        last_fg = Some(run_fg);
+                        self.write_buf.extend_from_slice(b"\x1b[38;2;");
+                        push_u8(&mut self.write_buf, run_fg.r);
+                        self.write_buf.push(b';');
+                        push_u8(&mut self.write_buf, run_fg.g);
+                        self.write_buf.push(b';');
+                        push_u8(&mut self.write_buf, run_fg.b);
+                        self.write_buf.push(b'm');
+                    }
 
-                if last_bg != Some(run_bg) {
-                    last_bg = Some(run_bg);
-                    self.write_buf.extend_from_slice(b"\x1b[48;2;");
-                    push_u8(&mut self.write_buf, run_bg.r);
-                    self.write_buf.push(b';');
-                    push_u8(&mut self.write_buf, run_bg.g);
-                    self.write_buf.push(b';');
-                    push_u8(&mut self.write_buf, run_bg.b);
-                    self.write_buf.push(b'm');
+                    if !last_bg.map_or(false, |prev_bg| color_matches(prev_bg, run_bg, color_tol)) {
+                        last_bg = Some(run_bg);
+                        self.write_buf.extend_from_slice(b"\x1b[48;2;");
+                        push_u8(&mut self.write_buf, run_bg.r);
+                        self.write_buf.push(b';');
+                        push_u8(&mut self.write_buf, run_bg.g);
+                        self.write_buf.push(b';');
+                        push_u8(&mut self.write_buf, run_bg.b);
+                        self.write_buf.push(b'm');
+                    }
                 }
 
                 let mut run_len = 0;
                 while x < width {
                     let r_idx = row_offset + x;
                     let c = self.current[r_idx];
-                    if c.fg != run_fg || c.bg != run_bg || c.bold != run_bold || c.underline != run_underline {
+                    if c.bold != run_bold
+                        || c.underline != run_underline
+                        || !color_matches(c.fg, run_fg, color_tol)
+                        || !color_matches(c.bg, run_bg, color_tol)
+                    {
                         break;
                     }
 
@@ -1576,4 +1830,68 @@ mod tests {
         assert_eq!(dirty_second, 0);
         assert!(renderer.write_buf.is_empty());
     }
+
+    #[test]
+    fn test_carbonyl_quadrant_binarization() {
+        let hi = Color::new(240, 240, 240);
+        let lo = Color::new(20, 20, 20);
+
+        // Flat cell -> clean space
+        let (ch_flat, _, bg_flat) = binarize_quadrant(hi, hi, hi, hi);
+        assert_eq!(ch_flat, ' ');
+        assert_eq!(bg_flat, hi);
+
+        // Left half bright, right half dark -> '▌'
+        let (ch_left, fg_left, bg_left) = binarize_quadrant(hi, lo, hi, lo);
+        assert_eq!(ch_left, '▌');
+        assert_eq!(fg_left, hi);
+        assert_eq!(bg_left, lo);
+
+        // Right half bright, left half dark -> '▐'
+        let (ch_right, fg_right, bg_right) = binarize_quadrant(lo, hi, lo, hi);
+        assert_eq!(ch_right, '▐');
+        assert_eq!(fg_right, hi);
+        assert_eq!(bg_right, lo);
+
+        // Top half bright, bottom half dark -> '▀'
+        let (ch_top, fg_top, bg_top) = binarize_quadrant(hi, hi, lo, lo);
+        assert_eq!(ch_top, '▀');
+        assert_eq!(fg_top, hi);
+        assert_eq!(bg_top, lo);
+
+        // Diagonal quadrants -> '▚' and '▞'
+        let (ch_diag1, _, _) = binarize_quadrant(hi, lo, lo, hi);
+        assert_eq!(ch_diag1, '▚');
+        let (ch_diag2, _, _) = binarize_quadrant(lo, hi, hi, lo);
+        assert_eq!(ch_diag2, '▞');
+
+        // Corner quadrants -> '▘', '▝', '▖', '▗'
+        assert_eq!(binarize_quadrant(hi, lo, lo, lo).0, '▘');
+        assert_eq!(binarize_quadrant(lo, hi, lo, lo).0, '▝');
+        assert_eq!(binarize_quadrant(lo, lo, hi, lo).0, '▖');
+        assert_eq!(binarize_quadrant(lo, lo, lo, hi).0, '▗');
+    }
+
+    #[test]
+    fn test_sgr_delta_compression_and_xterm256() {
+        assert_eq!(rgb_to_xterm256(Color::BLACK), 16);
+        assert_eq!(rgb_to_xterm256(Color::WHITE), 231);
+        let gray_idx = rgb_to_xterm256(Color::new(128, 128, 128));
+        assert!((232..=255).contains(&gray_idx));
+
+        let mut renderer = DiffRenderer::new(10, 2);
+        let fg = Color::new(40, 120, 220);
+        let bg = Color::new(250, 250, 250);
+        // Cell 0: bold 'A', Cell 1: non-bold 'B' with identical fg and bg
+        renderer.put_str(0, 0, "A", fg, bg, true, false);
+        renderer.put_str(1, 0, "B", fg, bg, false, false);
+        let dirty = renderer.build_synchronized_frame();
+        assert!(dirty >= 2);
+        let frame_str = String::from_utf8_lossy(&renderer.write_buf);
+        // Must use \x1b[22m to turn off bold without re-emitting \x1b[38;2;40;120;220m a second time
+        assert!(frame_str.contains("\x1b[1m"));
+        assert!(frame_str.contains("\x1b[22m"));
+        assert_eq!(frame_str.matches("\x1b[38;2;40;120;220m").count(), 1);
+    }
 }
+

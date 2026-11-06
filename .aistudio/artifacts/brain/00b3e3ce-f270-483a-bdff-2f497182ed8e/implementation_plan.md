@@ -1,101 +1,107 @@
-# TermBlitz: Smooth Adaptive Scrolling, Direct Webpage Input Typing, Chrome-Style Google Search & Lag Optimization
+# TermBlitz Carbonyl-Grade Architectural Upgrade & Optimization Plan
 
-This plan resolves the four core usability and performance bottlenecks in TermBlitz: responsive adaptive scrolling across all web interfaces, direct typing into webpage input boxes without hijacking focus to the top URL bar, Chrome-style Google Search fallback in the address bar, and background CPU/WebSocket optimizations that eliminate frame lag.
+This plan cross-references every finding in `CARBONYL_VS_TERMBLITZ_ANALYSIS.md` against the current TermBlitz Rust codebase and defines a pure-Rust architectural upgrade to deliver **60 FPS butter-smooth scrolling**, **2x2 Unicode quadrant subpixel clarity**, **compressed differential ANSI emission**, and **zero-jank Hybrid DOM text synchronization**—without sacrificing TermBlitz's standalone portability or any existing features (2x/4x/8x Super-Resolution, JPEG Bilateral Denoising, Scale2x Pixel-Art mode, Sixel/Kitty protocols, AdBlock, Audio Mute, Direct Input Typing, and Google Search Omnibox).
+
+---
 
 ## User Review & Critical Decisions
 
 > [!IMPORTANT]
-> All three core UX and performance decisions have been confirmed and incorporated into the architecture below:
+> **Zero Feature Removal Guarantee**: All existing hotkeys, CLI flags, Super-Resolution modes (`u`), dithering (`d`), pixel-art Scale2x (`p`), audio mute (`a`), AdBlock (`b`), and Native/Hybrid/Raw modes (`m`) are preserved intact. The upgrades below eliminate the root bottlenecks identified in `CARBONYL_VS_TERMBLITZ_ANALYSIS.md`.
 
-- **Confirmed Decision 1 — Webpage Input Box Typing**: Tapping an `<input>`, `<textarea>`, or search box inside a webpage focuses the element on the page and lets you type directly into the web box via CDP (`Esc` or tapping outside exits page-input mode; `/` or `o` or tapping row 0 opens the top URL/Search bar).
-- **Confirmed Decision 2 — Adaptive Web-Interface Scrolling**: Scrolling dispatches both native CDP `mouseWheel` events at the pointer position and an adaptive DOM container scroller that detects nested scrollable containers (`overflow-y: auto/scroll`, YouTube mobile, modals, sidebars) before falling back to the document root.
-- **Confirmed Decision 3 — Background Lag Elimination**: Combines dirty-frame cell caching (never re-running Super-Resolution or cloning `PixelBuffer` when the CDP frame hasn't changed) with a 60 FPS fast-scroll motion bypass that refines to full Super-Resolution the moment scrolling stops.
-
----
-
-## 1. Overview & Core Concept
-
-- **What It Does**:
-  1. **Adaptive Smooth Scrolling**: Whether browsing a standard article, YouTube Mobile (`ytm-app`), a web app with nested scroll containers, or a modal dialog, scrolling adapts to the active container under the cursor/touch point with zero queue lag.
-  2. **Direct In-Page Form & Search Box Typing**: Clicking any input field on a webpage focuses that DOM element and forwards keystrokes (`Char`, `Backspace`, `Space`, `Enter`, `Tab`, arrows) directly into the webpage rather than redirecting text to the top URL bar.
-  3. **Chrome-Style Google Search Omnibox**: Entering normal words, phrases, or dotted terms that aren't valid domains/URLs in the top bar searches Google (`https://www.google.com/search?q=...`) instead of attempting broken `https://` navigation.
-  4. **Zero-Lag Background Pipeline**: Eliminates redundant per-tick Super-Resolution recomputation, removes the 12ms WebSocket read stall, and throttles heavy DOM TreeWalker scans during active scrolling.
-- **Target Audience / Persona**: Terminal power users and Android Termux / Linux users who want a fast, responsive browser experience with real page interaction.
-- **Key Value**: Instantaneous input response, 60 FPS tear-free scrolling, and dramatic reduction in idle and active CPU usage.
+- **Decision 1 — Motion-Adaptive Dual Rendering Pipeline**: During active scrolling (`last_scroll_instant.elapsed() < 220ms`) or active video playback, automatically bypass heavy multi-layer neural convolutions and synchronous DOM `TreeWalker` reflows, switching to a **Carbonyl-style integer ALU 2x2 Quadrant / Half-Block fast blitter**. The moment scrolling settles (`>= 220ms`), run the full selected Super-Resolution (`2x`/`4x`/`8x` + RCAS) and fresh occlusion-checked DOM extraction pass.
+- **Decision 2 — Predictive Scroll-Delta Overlay Sync (Instead of Blank Text During Scroll)**: Rather than hiding DOM text overlays during scrolling or blocking Chromium's main thread with a 140ms `TreeWalker` reflow lock, tag each extracted span with its capture-time `scroll_top` and `is_fixed` state. During active scroll motion, shift non-fixed spans in Rust by `-Δscroll_y` on every frame so text moves in 1:1 lockstep with the scrolling background at 0ms JS cost.
+- **Decision 3 — Carbonyl 2x2 Quadrant Subpixel Engine (`▖▗▘▙▚▛▜▝▞▟▀▄▌▐█ `)**: Upgrade the terminal subpixel blitter to sample a **2x4 pixel grid per cell** using Carbonyl's integer luminance formula `(R*77 + G*150 + B*29) >> 8` and dynamic midpoint binarization (`mid = min + (max - min) / 2`), doubling horizontal resolution for vertical borders, icons, and curves while preserving clean half-blocks (`▀`/`▄`) and flat spaces (`' '`) where appropriate.
 
 ---
 
-## 2. User Experience & Interaction Flows
+## 1. Cross-Referenced Root-Cause Diagnosis
 
-- **Flow 1 — Typing into a Webpage Input Box**:
-  1. User taps or clicks a search bar or form field on a webpage (e.g., Google, YouTube, Wikipedia, GitHub).
-  2. TermBlitz dispatches the click to Chromium to focus the input element and activates **Page Input Mode** (`[INPUT: typing on page | Esc to exit]` indicator in the top bar).
-  3. Every keystroke is sent directly to the webpage's focused input box; pressing `Enter` submits the form or triggers the site's search handler.
-  4. Pressing `Esc` or clicking outside an input box returns to normal navigation hotkeys.
-- **Flow 2 — Chrome-Style Omnibox (URL vs. Google Search)**:
-  1. User presses `/` or `o` (or taps the top bar) to open the Omnibox.
-  2. If the user enters a valid URL or domain with a known TLD (e.g., `wikipedia.org`, `https://rust-lang.org`, `localhost:8080`), TermBlitz navigates directly to that URL.
-  3. If the user enters natural text, multiple words, or non-domain dotted strings (e.g., `best rust tui libraries`, `python 3.12`, `what.is`), TermBlitz automatically queries Google Search.
-- **Flow 3 — Smooth Adaptive Scrolling**:
-  1. User scrolls via touch drag, mouse wheel, `j`/`k`, or `Space`/`PageDown`.
-  2. During motion, TermBlitz switches to a 60 FPS fast-scroll path and scrolls the exact scrollable container under the pointer.
-  3. Within 180ms of stopping, TermBlitz performs a single high-precision Super-Resolution pass and updates the cached frame buffer.
+| Bottleneck in `CARBONYL_VS_TERMBLITZ_ANALYSIS.md` | Current TermBlitz Code Location | Root-Cause Impact | Planned Pure-Rust Fix |
+| :--- | :--- | :--- | :--- |
+| **1. 140ms DOM `TreeWalker` Reflow Lock During Scroll** | `engine.rs` (`request_text_extraction` called immediately inside `coalesced_scroll_delta != 0` and every `140ms` during scroll) | Forces Chromium to run `getComputedStyle`, `getClientRects`, and `elementFromPoint` on 400+ nodes mid-scroll, freezing Skia screencast generation for 50–120ms. | **Scroll-Gated Extraction + Predictive Rust Scroll Shift**: Suspend `TreeWalker` during active scroll (`< 220ms`); shift existing non-sticky overlays by `-Δy` in Rust; run full `TreeWalker` once on scroll settle. |
+| **2. Synchronous JS Scroll Evaluation Overhead** | `engine.rs` (`scroll_js` running a 100-node `querySelectorAll` + `getComputedStyle` loop on every scroll tick) | Evaluates a heavy DOM search script on V8's main thread every tick instead of letting Chromium's compositor thread handle wheel scroll. | **Native CDP `Input.dispatchMouseEvent` (`mouseWheel`) + Cached O(1) Scroll Offset Sync**: Dispatch hardware-accelerated CDP `mouseWheel` events and read back `scrollY` in O(1) without DOM tree scans. |
+| **3. 1x2 Half-Block Horizontal Resolution Limit** | `renderer.rs` (`sample_subpixel_box` + `blit_pixel_buffer` emitting only `'▀'` and `' '`) | Only 1 horizontal sample per column; vertical 1px lines and diagonal edges become blocky or require heavy RCAS sharpening. | **Carbonyl 2x4 -> 2x2 Quadrant Binarizer (`binarize_quadrant`)**: Sample 4 quadrants (`TL, TR, BL, BR`) per cell using `(R*77 + G*150 + B*29) >> 8` and 16-state quadrant lookup table with UI border preservation. |
+| **4. Uncompressed 24-Bit SGR Flood & Full `\x1b[0m` Resets** | `renderer.rs` (`build_synchronized_frame` lines 1370–1406) | Emits 38 bytes of TrueColor SGR per cell change and resets both `last_fg` and `last_bg` whenever `bold`/`underline` toggles, flooding the Termux PTY buffer with 120–200 KB/frame. | **Targeted SGR Attribute Diffing (`\x1b[22m`/`\x1b[24m`), Perceptual Color Tolerance During Motion, Relative Cursor Moves (`\x1b[nC`), and Optional Fast 256-Color Mode (`rgb_to_xterm256`)**. |
+| **5. Main Loop `thread::sleep` Frame Pacing Drift** | `main.rs` (`std::thread::sleep(target_frame_time - elapsed)` at line 995) | Fixed sleep granularity misses asynchronous CDP screencast frame arrivals by 4–12ms. | **Event-Driven Saturating Deadline Pacer**: Wake immediately when input arrives or when `cdp_engine.get_frame_count()` increments. |
 
 ---
 
-## 3. Key Product Decisions & Trade-Offs
-
-- **Decision 1: Dirty-Frame Cell Cache + Motion Fast-Path**
-  - *Chosen Approach*: Store the last rendered CDP `frame_id` and terminal cell snapshot inside `DiffRenderer`. Skip `get_frame()` cloning and Super-Resolution upscaling entirely when `frame_id` and renderer settings are unchanged. While scrolling is active (`< 180ms` since last scroll event), bypass heavy multi-pass neural convolution and refine once scrolling pauses.
-  - *Why*: Previously, the main loop re-cloned the frame and re-ran full neural/FSR upscaling 30 times per second even on a static page, saturating the CPU and causing input lag.
-- **Decision 2: Dual Native Wheel + DOM Scrollable Container Discovery**
-  - *Chosen Approach*: Combine CDP `Input.dispatchMouseEvent` (`mouseWheel`) with an injected adaptive scroll function that checks `document.elementFromPoint(x, y)` for scrollable ancestors (`scrollHeight > clientHeight` with `overflow-y: auto | scroll | overlay`) or the largest scrollable container on screen.
-  - *Why*: `window.scrollBy` fails on single-page apps and mobile layouts whose main feed lives inside a scrollable `<div>` or custom element.
-- **Decision 3: Event-Driven Style Injection & Non-Blocking WebSocket Reads**
-  - *Chosen Approach*: Lower WebSocket poll read timeout to `2ms` when idle and return immediately upon frame assembly; only inject `build_page_style_js` on navigation or mode changes instead of every 90ms.
-  - *Why*: Eliminates unnecessary main-thread JS evaluation in Chromium and removes socket read stalls in the Rust worker thread.
-
----
-
-## 4. Technical Architecture & Data Strategy
-
-### Architecture & Event Flow Diagram
+## 2. Step-by-Step Architectural Upgrade Plan
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                        Terminal Input & Gesture Layer                      │
-│  • Event Drain & Scroll Coalescer (tracks pointer col/row & drag delta)    │
-│  • Mode Router:                                                            │
-│     ├─ Top Omnibox Mode (`/`, `o`, row 0 tap) -> Chrome-style URL/Google   │
-│     ├─ Page Input Mode (tap on <input>/<textarea>) -> Direct CDP Keystrokes│
-│     └─ Browser Command Mode -> Scroll, Click, Zoom, SR/Dither/PixelArt     │
-└───────────────────┬────────────────────────────────────┬───────────────────┘
-                    │                                    │
-                    ▼                                    ▼
-┌───────────────────────────────────────┐  ┌─────────────────────────────────┐
-│      Non-Blocking CDP Worker          │  │   Cached Super-Res Renderer     │
-│  • 2ms Socket Poll (no 12ms stall)    │  │  • Frame-ID Dirty Check (O(1)   │
-│  • Adaptive Scroll Engine:            │  │    skip when frame unchanged)   │
-│    - CDP mouseWheel at pointer (x,y)  │  │  • 60 FPS Motion Fast-Path      │
-│    - DOM scrollable ancestor lookup   │  │    during active scroll bursts  │
-│  • Direct DOM Input Dispatcher:       │  │  • Full SR + RCAS refinement    │
-│    - Input.insertText / KeyEvents     │  │    180ms after scroll settles   │
-│    - Enter -> form submit / keydown   │  │  • DEC Mode 2026 Sync Output    │
-└───────────────────────────────────────┘  └─────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                   UPGRADED TERMBLITZ 60-FPS RENDERING ARCHITECTURE                 │
+│                                                                                    │
+│  [Input Thread / Batcher]                                                          │
+│     │ Coalesced Scroll Delta + Pointer Pos                                         │
+│     ▼                                                                              │
+│  [CDP Worker Thread (engine.rs)]                                                   │
+│     ├─► 1. Native Compositor Wheel (`Input.dispatchMouseEvent: mouseWheel`)        │
+│     │      + O(1) Cached Scroll Target Fallback & `scroll_y` Readback              │
+│     ├─► 2. Latest-Frame Screencast Drain (Immediate `screencastFrameAck`,          │
+│     │      discard stale queued frames, zero-copy `as_rgb8()` decode)              │
+│     └─► 3. Scroll-Gated DOM Extraction:                                            │
+│            • While Scrolling (<220ms): ZERO `TreeWalker` calls; shift non-fixed    │
+│              `TextOverlaySpan.px_y` in lockstep with live `scroll_y` delta         │
+│            • On Scroll Settle (>=220ms): Run full occlusion-checked `TreeWalker`   │
+│                                                                                    │
+│  [DiffRenderer (renderer.rs)]                                                      │
+│     ├─► Motion Fast-Path: Direct 2x4 Integer ALU Quadrant Sampler                  │
+│     ├─► Static Settle Pass: Full 2x/4x/8x Neural SR + Bilateral Denoise + RCAS     │
+│     ├─► 2x2 Quadrant Binarizer (`▖▗▘▙▚▛▜▝▞▟▀▄▌▐█ `) + UI Border Accentuation       │
+│     └─► Compressed Differential ANSI Writer:                                       │
+│            • Specific SGR Off-Codes (`\x1b[22m`, `\x1b[24m`) — No `\x1b[0m` Wipe   │
+│            • Perceptual Color Delta Gate + Fast xterm-256 Motion Quantizer         │
+│            • Relative Cursor Jumps (`\x1b[nC`) + Atomic DEC 2026 Single Write      │
+└────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Interactive State & Handler Mapping
+### Pillar 1: Butter-Smooth 60FPS Scrolling & Dynamic Motion Fast-Path
+1. **Native Compositor Wheel + O(1) Scroll Sync**:
+   - Dispatch CDP `Input.dispatchMouseEvent` (`type: "mouseWheel"`, `deltaX: 0`, `deltaY: pixel_delta`) so Chromium's compositor thread scrolls layers natively at 60 FPS.
+   - Replace the 100-element `querySelectorAll` loop on every scroll tick with a cached scroll target reference (`window.__termblitz_scroll_el`) that only scans for a scrollable container if the cached element cannot scroll in `dy`'s direction, and returns the updated `[scrollTop, scrollPct]` in O(1) time.
+2. **Scroll-Gated `TreeWalker` Suppression**:
+   - While `last_scroll_instant.elapsed() < Duration::from_millis(220)`, completely suppress `request_text_extraction` (`TreeWalker` + `getComputedStyle` + `elementFromPoint`) so Chromium's main thread never pauses compositor frame production during scrolling.
+   - As soon as scrolling pauses for `220ms`, automatically fire `request_text_extraction` once to refresh newly revealed DOM nodes.
+3. **Screencast Queue Draining & Motion Quality Scaling**:
+   - In the WebSocket poll loop, acknowledge every `Page.screencastFrame` immediately (`Page.screencastFrameAck`) while retaining only the final `latest_screencast_b64` payload in the batch so stale intermediate frames are never decoded.
+   - When `scroll_fast_path` is active, bypass multi-layer YCbCr convolutions and RCAS passes altogether, running only the single-pass integer ALU subpixel sampler, then triggering a crisp high-resolution settle render as soon as `scroll_fast_path` expires.
 
-1. **Omnibox URL vs. Google Search Classifier (`resolve_input_to_url`)**:
-   - Validates explicit schemes (`http://`, `https://`, `about:`), `localhost`, IPv4 addresses, and single-token hostnames with valid TLDs.
-   - Routes all other queries (spaces, questions, numeric versions like `1.20`, unknown dotted strings) to `https://www.google.com/search?q=<urlencoded>`.
-2. **In-Page Input Focus & Typing (`is_typing_in_page`)**:
-   - Clicking a webpage input field sends `CdpWorkerCommand::FocusAndClickInput(col, row)` which clicks and focuses the underlying `<input>`/`<textarea>`/`[contenteditable]` element.
-   - Keystrokes emit `AppAction::TypeInPage(String)` (`Input.insertText` + input event), `AppAction::PageKey(PageKeyAction::Backspace | Enter | Tab | Left | Right | Escape)`.
-   - `Enter` dispatches `keydown`/`keypress`/`keyup` (`Enter`, keyCode 13) and triggers form submission if inside a `<form>`, automatically unfocusing `is_typing_in_page` when navigation starts.
-3. **Adaptive Scroll Container Engine (`CdpWorkerCommand::ScrollAt`)**:
-   - Passes `(delta, pointer_col, pointer_row)` to the CDP worker.
-   - Executes native `Input.dispatchMouseEvent` (`type: "mouseWheel"`) and adaptive container scroll in JS that locates the active scrollable element at `(px_x, px_y)` or the primary scrollable feed container, scrolling it instantaneously and reporting accurate `scroll_pct`.
-4. **Dirty-Frame Caching & Background Optimization**:
-   - Tracks `last_rendered_frame_id`, `last_rendered_mode`, and `scroll_fast_until` in the main loop and `DiffRenderer`.
-   - Avoids cloning `PixelBuffer` or running `blit_frame` when no new frame or state change has occurred, and pauses DOM `TreeWalker` extraction during active scroll frames until scrolling settles.
+### Pillar 2: Carbonyl-Grade 2x2 Quadrant Subpixel & Color ALU Engine
+1. **Fast Integer Luminance & Color Averaging ALU**:
+   - Implement `luma_fast_u32(c: Color) -> u32` using `(c.r as u32 * 77 + c.g as u32 * 150 + c.b as u32 * 29) >> 8` and `avg_color(c1, c2)` using `((c1 + c2) >> 1)` integer bit-shifts.
+2. **2x4 Subpixel Sampling -> 16-State Quadrant Binarizer (`binarize_quadrant`)**:
+   - For each terminal cell `(col, row)`, sample a **2x2 quadrant grid** (`tl, tr, bl, br`), where each quadrant averages its vertical pixel pair from the source/upscaled buffer while preserving 1px light-gray UI borders (`#dfe1e5`).
+   - Compute `min`, `max`, and `mid = min + (max - min) / 2` across `(tl, tr, bl, br)`:
+     - If `max - min < 6` (flat region): emit `' '` with the averaged background color (maximizing run-length batching and eliminating Bayer noise on flat surfaces).
+     - If left and right columns match (`tl == tr && bl == br`): emit clean horizontal half-blocks (`'▀'`) with exact top/bottom TrueColor values.
+     - Otherwise: classify the 4-bit quadrant mask `((a > mid) << 3) | ((b > mid) << 2) | ((c > mid) << 1) | (d > mid)` into the 16 Unicode quadrant glyphs (`▖`, `▗`, `▄`, `▝`, `▐`, `▞`, `▟`, `▘`, `▚`, `▌`, `▙`, `▀`, `▜`, `▛`, `█`, `' '`) with cluster-averaged foreground and background colors.
+
+### Pillar 3: Zero-Tearing Differential ANSI Emitter & SGR State Compression
+1. **Eliminate Destructive `\x1b[0m` Resets**:
+   - Currently, toggling `bold` or `underline` emits `\x1b[0...m`, which wipes the terminal's active foreground and background colors and forces 38 bytes of `\x1b[38;2;...m\x1b[48;2;...m` to be re-sent.
+   - Replace `\x1b[0m` with targeted SGR attribute transitions: `\x1b[1m` (bold on), `\x1b[22m` (bold off), `\x1b[4m` (underline on), `\x1b[24m` (underline off), preserving active `last_fg` and `last_bg` across the entire frame.
+2. **Perceptual SGR Color Delta Gate & Fast xterm-256 Option**:
+   - Add `color_dist_sq(c1, c2)` and `rgb_to_xterm256(c: Color) -> u8`.
+   - During active scroll/video fast-path (or when `TERMBLITZ_FAST_COLOR=1` is set), coalesce SGR color updates when adjacent cells differ by less than a sub-perceptual RGB threshold (`max_channel_diff <= 2`), cutting ANSI escape sequence byte volume by 35–55% without visible degradation.
+3. **Minimal Cursor Movement Encoding**:
+   - When the next dirty cell is on the **same row** and only `1..=4` columns ahead of `cursor_pos`, emit `\x1b[{n}C` (Cursor Forward, 4 bytes) instead of `\x1b[{row};{col}H` (7–10 bytes).
+
+### Pillar 4: Zero-Jank Hybrid DOM Overlay Sync & Frame Pacing
+1. **Capture-Time Scroll Offset Tagging & Predictive Shift**:
+   - Extend `request_text_extraction` to include the exact `scrollTop` in the `META` header and a `fixed` flag (`1` if the element or an ancestor has `position: fixed` or `position: sticky`, `0` otherwise) on each extracted item.
+   - Store `overlay_capture_scroll_y: AtomicI32` and `live_scroll_y: AtomicI32` in `CdpEngine`.
+   - When rendering Hybrid overlays in `main.rs`, compute `scroll_diff = live_scroll_y - overlay_capture_scroll_y`. For any span where `!span.is_fixed`, adjust its vertical pixel coordinate by `effective_px_y = span.px_y - scroll_diff` before mapping to terminal rows!
+   - This guarantees that as the user scrolls, DOM text overlays glide synchronously with the background bitmap at 60 FPS with zero lag and zero `TreeWalker` stalls.
+2. **Saturating Deadline Frame Pacer**:
+   - Upgrade the main event/render loop in `main.rs` so input polling waits only up to `deadline.saturating_duration_since(Instant::now())` and wakes early whenever a new CDP screencast frame arrives, Triggering an immediate high-resolution settle redraw the instant `scroll_fast_until` completes.
+
+---
+
+## 3. Verification & Diagnostic Test Suite Additions
+
+We will add unit tests verifying every new subsystem so `cargo test --verbose` validates:
+1. `test_carbonyl_quadrant_binarization`: Verifies all 16 quadrant bitmask states (`▖▗▘▙▚▛▜▝▞▟▀▄▌▐█ `), integer luminance `(R*77 + G*150 + B*29) >> 8`, and flat-cell space emission.
+2. `test_sgr_delta_compression_and_xterm256`: Verifies that toggling `bold`/`underline` uses `\x1b[22m`/`\x1b[24m` without resetting `fg`/`bg`, and validates `rgb_to_xterm256` grayscale and 6x6x6 cube mapping.
+3. `test_predictive_scroll_overlay_shift`: Verifies that non-fixed `TextOverlaySpan` items shift by `-Δscroll_y` during active scrolling while `is_fixed` sticky headers/footers remain anchored.
