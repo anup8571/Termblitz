@@ -354,7 +354,7 @@ impl Cell {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PixelBuffer {
     pub width: usize,
     pub height: usize,
@@ -1352,7 +1352,7 @@ impl DiffRenderer {
         if self.subpixel_buf.width != sub_w || self.subpixel_buf.height != target_h {
             self.subpixel_buf.width = sub_w;
             self.subpixel_buf.height = target_h;
-            self.subpixel_buf.pixels.resize(sub_total, Color::BLACK);
+            self.subpixel_buf.data.resize(sub_total, Color::BLACK);
         }
 
         let step_x_fp = ((active_buf.width << 16) / sub_w.max(1)).max(1);
