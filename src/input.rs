@@ -11,6 +11,7 @@ pub enum AppAction {
     ToggleMute,
     CycleUpscale,
     ToggleDither,
+    TogglePixelArt,
     HistoryBack,
     HistoryForward,
     Reload,
@@ -211,11 +212,12 @@ impl InputHandler {
             return AppAction::Exit;
         }
 
-        // Alt+u, Alt+d, and Alt+m work globally, even when focused inside the URL/search input bar
+        // Alt+u, Alt+d, Alt+p, and Alt+m work globally, even when focused inside the URL/search input bar
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
                 KeyCode::Char('u') | KeyCode::Char('U') => return AppAction::CycleUpscale,
                 KeyCode::Char('d') | KeyCode::Char('D') => return AppAction::ToggleDither,
+                KeyCode::Char('p') | KeyCode::Char('P') => return AppAction::TogglePixelArt,
                 KeyCode::Char('m') | KeyCode::Char('M') => return AppAction::ToggleMute,
                 _ => {}
             }
@@ -253,6 +255,7 @@ impl InputHandler {
                 KeyCode::Char('q') | KeyCode::Esc => AppAction::Exit,
                 KeyCode::Char('u') | KeyCode::Char('U') => AppAction::CycleUpscale,
                 KeyCode::Char('d') | KeyCode::Char('D') => AppAction::ToggleDither,
+                KeyCode::Char('p') | KeyCode::Char('P') => AppAction::TogglePixelArt,
                 KeyCode::Char('o') | KeyCode::Char('/') => {
                     self.is_entering_url = true;
                     self.url_input_buffer.clear();
@@ -473,5 +476,22 @@ mod tests {
             }),
         ];
         assert_eq!(handler.process_event_batch(tap_mute), AppAction::ToggleMute);
+    }
+
+    #[test]
+    fn test_pixel_art_hotkey() {
+        let mut handler = InputHandler::new();
+        let key_p = Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(
+            handler.process_event_batch(vec![key_p]),
+            AppAction::TogglePixelArt
+        );
+
+        handler.is_entering_url = true;
+        let alt_p = Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert_eq!(
+            handler.process_event_batch(vec![alt_p]),
+            AppAction::TogglePixelArt
+        );
     }
 }

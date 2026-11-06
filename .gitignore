@@ -2,3 +2,11 @@
 /logs
 *.log
 *.tmp
+package.json
+vite.config.ts
+tsconfig.json
+tsconfig.tsbuildinfo
+index.html
+bun.lock
+/src/*.tsx
+/src/*.css

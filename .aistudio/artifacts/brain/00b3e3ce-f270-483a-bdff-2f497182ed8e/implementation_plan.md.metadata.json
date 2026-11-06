@@ -1,6 +1,6 @@
 {
-  "summary": "Implementation plan for fixing the 4 critical runtime issues in TermBlitz: (1) Infinite/loop scrolling coalescing & touch state reset, (2) Headless Chromium & Termux PulseAudio media output with Alt+m / M / status-bar mute toggle, (3) YouTube network + DOM MutationObserver ad-shield & auto-skipper, and (4) DEC Synchronized Output (?2026h/?2026l) + Active Video Bounding-Box Fast-Path for tear-free video playback.",
-  "updatedAt": "2026-11-05T22:19:23.929847701Z",
+  "summary": "Implementation plan for TermBlitz Advanced Super-Resolution and Dithering Pipeline Upgrades:\n- Multi-pass recursive chaining for 4x/8x deep-zoom scaling with reusable scratch buffers.\n- Fast adaptive JPEG 8x8 DCT block artifact removal and edge-preserving bilateral denoising filter.\n- Content-aware pixel art and vector graphics detector with pure Rust Scale2x / AdvMame2x engine, CLI flag (--pixel-art), and p hotkey.\n- Comprehensive unit test suite in src/upscale.rs.",
+  "updatedAt": "2026-11-05T23:36:32.763038957Z",
   "requestFeedback": true,
   "userFacing": true
 }

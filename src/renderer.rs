@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 #[allow(unused_imports)]
 use std::io::{self, Write};
-use crate::upscale::{apply_terminal_subpixel_rcas, apply_upscale_pipeline, UpscaleMode};
+use crate::upscale::{
+    apply_terminal_subpixel_rcas, apply_upscale_pipeline, apply_upscale_pipeline_ex,
+    detect_pixel_art, UpscaleMode,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Color {
@@ -386,6 +389,7 @@ pub struct DiffRenderer {
     pub upscale_mode: UpscaleMode,
     pub dithering_enabled: bool,
     pub video_fast_path: bool,
+    pub pixel_art_mode: bool,
     current: Vec<Cell>,
     previous: Vec<Cell>,
     write_buf: Vec<u8>,
@@ -401,6 +405,7 @@ impl DiffRenderer {
             upscale_mode: UpscaleMode::FsrOnly,
             dithering_enabled: true,
             video_fast_path: false,
+            pixel_art_mode: false,
             current: vec![Cell::EMPTY; size],
             previous: vec![Cell::INVALID; size],
             write_buf: Vec::with_capacity(65536),
@@ -903,22 +908,34 @@ impl DiffRenderer {
             return;
         }
 
+        let is_pixel_art = !self.video_fast_path
+            && (self.pixel_art_mode
+                || (self.upscale_mode != UpscaleMode::Off && detect_pixel_art(px_buf)));
+
         // Video-Box Fast-Path: when an active <video> is playing (`self.video_fast_path`),
         // bypass heavy multi-layer CPU convolutions on the full source frame and apply single-pass
         // terminal-subpixel RCAS after downsampling to maintain maximum tear-free video FPS.
         let upscaled_storage;
-        let active_buf = if self.upscale_mode == UpscaleMode::Off || self.video_fast_path {
+        let active_buf = if (self.upscale_mode == UpscaleMode::Off && !self.pixel_art_mode)
+            || self.video_fast_path
+        {
             px_buf
         } else {
             let mut sr_w = (target_w * 2).max(px_buf.width);
             let mut sr_h = (target_h * 2).max(px_buf.height);
-            // Ensure EASU directional 12-tap reconstruction never no-ops when Chromium's
+            // Ensure EASU directional 12-tap reconstruction or Scale2x never no-ops when Chromium's
             // buffer is already larger than 2x the terminal half-block grid
             if sr_w == px_buf.width && sr_h == px_buf.height {
                 sr_w = ((px_buf.width * 3) / 2).max(px_buf.width + 1);
                 sr_h = ((px_buf.height * 3) / 2).max(px_buf.height + 1);
             }
-            upscaled_storage = apply_upscale_pipeline(px_buf, self.upscale_mode, sr_w, sr_h);
+            upscaled_storage = apply_upscale_pipeline_ex(
+                px_buf,
+                self.upscale_mode,
+                sr_w,
+                sr_h,
+                self.pixel_art_mode,
+            );
             &upscaled_storage
         };
 
@@ -936,8 +953,22 @@ impl DiffRenderer {
                 let x0 = (col * active_buf.width) / target_w;
                 let x1 = ((col + 1) * active_buf.width) / target_w;
 
-                let raw_top = Self::sample_subpixel_box(active_buf, x0, x1, top_y0, top_y1);
-                let raw_bot = Self::sample_subpixel_box(active_buf, x0, x1, bot_y0, bot_y1);
+                let (raw_top, raw_bot) = if is_pixel_art {
+                    let cx = (x0 + (x1.saturating_sub(x0)) / 2).min(active_buf.width - 1);
+                    let cy_top =
+                        (top_y0 + (top_y1.saturating_sub(top_y0)) / 2).min(active_buf.height - 1);
+                    let cy_bot =
+                        (bot_y0 + (bot_y1.saturating_sub(bot_y0)) / 2).min(active_buf.height - 1);
+                    (
+                        active_buf.get_pixel(cx, cy_top),
+                        active_buf.get_pixel(cx, cy_bot),
+                    )
+                } else {
+                    (
+                        Self::sample_subpixel_box(active_buf, x0, x1, top_y0, top_y1),
+                        Self::sample_subpixel_box(active_buf, x0, x1, bot_y0, bot_y1),
+                    )
+                };
                 subpixel_buf.set_pixel(col, sub_y_top, raw_top);
                 subpixel_buf.set_pixel(col, sub_y_bot, raw_bot);
             }
@@ -945,8 +976,11 @@ impl DiffRenderer {
 
         // Pass 1b: Run Contrast-Adaptive Sharpening (RCAS) directly on the terminal subpixel grid
         // so 1px sharpening lobes crisp up half-block (`▀`) edges, video frames, and thumbnails.
+        // Bypass RCAS when in crisp Pixel-Art Scale2x mode so retro sprites have zero ringing.
         let rcas_storage;
-        let final_subpixels = if self.video_fast_path {
+        let final_subpixels = if is_pixel_art {
+            &subpixel_buf
+        } else if self.video_fast_path {
             let fast_mode = if self.upscale_mode == UpscaleMode::Off {
                 UpscaleMode::FsrOnly
             } else {
@@ -1028,17 +1062,18 @@ impl DiffRenderer {
         }
 
         let upscaled_storage;
-        let active_buf = if self.upscale_mode == UpscaleMode::Off {
+        let active_buf = if self.upscale_mode == UpscaleMode::Off && !self.pixel_art_mode {
             px_buf
         } else if self.video_fast_path {
             upscaled_storage = apply_terminal_subpixel_rcas(px_buf, UpscaleMode::FsrOnly);
             &upscaled_storage
         } else {
-            upscaled_storage = apply_upscale_pipeline(
+            upscaled_storage = apply_upscale_pipeline_ex(
                 px_buf,
                 self.upscale_mode,
                 px_buf.width * 2,
                 px_buf.height * 2,
+                self.pixel_art_mode,
             );
             &upscaled_storage
         };
@@ -1113,17 +1148,18 @@ impl DiffRenderer {
         }
 
         let upscaled_storage;
-        let active_buf = if self.upscale_mode == UpscaleMode::Off {
+        let active_buf = if self.upscale_mode == UpscaleMode::Off && !self.pixel_art_mode {
             px_buf
         } else if self.video_fast_path {
             upscaled_storage = apply_terminal_subpixel_rcas(px_buf, UpscaleMode::FsrOnly);
             &upscaled_storage
         } else {
-            upscaled_storage = apply_upscale_pipeline(
+            upscaled_storage = apply_upscale_pipeline_ex(
                 px_buf,
                 self.upscale_mode,
                 px_buf.width * 2,
                 px_buf.height * 2,
+                self.pixel_art_mode,
             );
             &upscaled_storage
         };

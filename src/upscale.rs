@@ -422,31 +422,43 @@ pub fn pixel_shuffle_2x(subpixels: &[[f32; 4]], w: usize, h: usize, out: &mut [f
     }
 }
 
-/// Runs the 4-layer Hybrid FSRCNN-ESPCN super-resolution network on a normalized `Y` luminance plane
-/// (`w x h`), returning a `(w * 2) x (h * 2)` luminance plane.
-/// Uses the Content-Aware Sparse Skip Engine (`should_enhance_pixel` & 8x8 tile gating) so flat
-/// backgrounds (`luma_range < 0.015`) completely bypass all 4 convolutional layers and output
-/// `center_y` untouched with 0% neural bias drift.
-pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
+/// Reusable scratch buffers for multi-pass recursive neural super-resolution (`2x -> 4x -> 8x`).
+/// Eliminates repeated heap allocations across recursive stages by resizing flat vectors in-place.
+#[derive(Default)]
+pub struct NeuralScratch {
+    pub active_px: Vec<bool>,
+    pub feat_l2: Vec<[f32; 4]>,
+    pub feat_l3: Vec<[f32; 4]>,
+    pub subpixels: Vec<[f32; 4]>,
+    pub y_ping: Vec<f32>,
+    pub y_pong: Vec<f32>,
+}
+
+/// Runs the 4-layer Hybrid FSRCNN-ESPCN super-resolution network on `y_plane` (`w x h`)
+/// and writes the `(w * 2) x (h * 2)` output into `out_y` using reusable `scratch` slices.
+pub fn upscale_y_neural_2x_into(
+    y_plane: &[f32],
+    w: usize,
+    h: usize,
+    out_y: &mut Vec<f32>,
+    scratch: &mut NeuralScratch,
+) {
     if w == 0 || h == 0 || y_plane.len() < w * h {
-        return Vec::new();
+        out_y.clear();
+        return;
     }
 
     let num_px = w * h;
+    let out_len = (w * 2) * (h * 2);
+    out_y.resize(out_len, 0.0);
 
-    // Fast whole-plane / 8x8 tile variance pre-pass + per-pixel 3x3 gradient gate:
-    // Any pixel with 3x3 `luma_range < 0.015` is marked inactive (`false`) and skips all conv math.
-    let mut active_px = vec![false; num_px];
+    scratch.active_px.clear();
+    scratch.active_px.resize(num_px, false);
+    scratch.feat_l2.resize(num_px, [0.0f32; 4]);
+
     let mut any_active = false;
     let max_x = w - 1;
     let max_y = h - 1;
-
-    // -------------------------------------------------------------------------
-    // Layer 1 (Feature Extraction: 3x3 Conv, 1 -> 8 channels + PReLU)
-    // combined with Layer 2 (FSRCNN Shrinking: 1x1 Conv, 8 -> 4 channels + PReLU)
-    // Fused per-pixel so the 8-channel intermediate stays in CPU registers!
-    // -------------------------------------------------------------------------
-    let mut feat_l2 = vec![[0.0f32; 4]; num_px];
 
     for y in 0..h {
         let ym1 = y.saturating_sub(1);
@@ -455,8 +467,8 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
         let r_top = &y_plane[ym1 * w..ym1 * w + w];
         let r_mid = &y_plane[y * w..y * w + w];
         let r_bot = &y_plane[yp1 * w..yp1 * w + w];
-        let dst_row = &mut feat_l2[y * w..(y + 1) * w];
-        let act_row = &mut active_px[y * w..(y + 1) * w];
+        let dst_row = &mut scratch.feat_l2[y * w..(y + 1) * w];
+        let act_row = &mut scratch.active_px[y * w..(y + 1) * w];
 
         for x in 0..w {
             let xm1 = x.saturating_sub(1);
@@ -470,7 +482,6 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
 
             let (min_y, max_y_val) = patch_min_max_9(&patch);
             if !should_enhance_pixel(min_y, max_y_val) {
-                // Content-Aware Sparse Skip: flat 3x3 region -> bypass Layer 1 & Layer 2!
                 dst_row[x] = [patch[4], 0.0, 0.0, 0.0];
                 continue;
             }
@@ -478,7 +489,6 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
             act_row[x] = true;
             any_active = true;
 
-            // Layer 1: 1 -> 8 channels + PReLU (kept entirely in registers)
             let mut l1_out = [0.0f32; 8];
             for oc in 0..8 {
                 let w_k = &L1_WEIGHTS[oc];
@@ -495,7 +505,6 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
                 l1_out[oc] = prelu(sum, L1_PRELU[oc]);
             }
 
-            // Layer 2: 1x1 Shrinking (8 -> 4 channels) + PReLU
             let mut l2_out = [0.0f32; 4];
             for oc in 0..4 {
                 let w_1x1 = &L2_WEIGHTS[oc];
@@ -515,9 +524,7 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
         }
     }
 
-    // Fast path: if the entire frame is flat (e.g., blank/solid canvas), bypass Layer 3 & Layer 4 completely
     if !any_active {
-        let mut out_y = vec![0.0f32; (w * 2) * (h * 2)];
         let out_w = w * 2;
         for y in 0..h {
             let src_row = &y_plane[y * w..(y + 1) * w];
@@ -534,28 +541,22 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
                 bot_part[dx + 1] = clamped;
             }
         }
-        return out_y;
+        return;
     }
 
-    // -------------------------------------------------------------------------
-    // Layer 3 (Non-Linear Mapping: 3x3 Conv, 4 -> 4 channels + PReLU + Residual Skip)
-    // out = prelu(conv3x3(feat_l2)) + feat_l2
-    // -------------------------------------------------------------------------
-    let mut feat_l3 = vec![[0.0f32; 4]; num_px];
-
+    scratch.feat_l3.resize(num_px, [0.0f32; 4]);
     for y in 0..h {
         let ym1 = y.saturating_sub(1);
         let yp1 = (y + 1).min(max_y);
 
-        let r_top = &feat_l2[ym1 * w..ym1 * w + w];
-        let r_mid = &feat_l2[y * w..y * w + w];
-        let r_bot = &feat_l2[yp1 * w..yp1 * w + w];
-        let act_row = &active_px[y * w..(y + 1) * w];
-        let dst_row = &mut feat_l3[y * w..(y + 1) * w];
+        let r_top = &scratch.feat_l2[ym1 * w..ym1 * w + w];
+        let r_mid = &scratch.feat_l2[y * w..y * w + w];
+        let r_bot = &scratch.feat_l2[yp1 * w..yp1 * w + w];
+        let act_row = &scratch.active_px[y * w..(y + 1) * w];
+        let dst_row = &mut scratch.feat_l3[y * w..(y + 1) * w];
 
         for x in 0..w {
             if !act_row[x] {
-                // Flat pixel: bypass Layer 3 3x3 conv completely
                 dst_row[x] = r_mid[x];
                 continue;
             }
@@ -589,25 +590,20 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Layer 4 (ESPCN Sub-Pixel Expansion: 3x3 Conv, 4 -> 4 channels + 2x PixelShuffle)
-    // -------------------------------------------------------------------------
-    let mut subpixels = vec![[0.0f32; 4]; num_px];
-
+    scratch.subpixels.resize(num_px, [0.0f32; 4]);
     for y in 0..h {
         let ym1 = y.saturating_sub(1);
         let yp1 = (y + 1).min(max_y);
 
-        let r_top = &feat_l3[ym1 * w..ym1 * w + w];
-        let r_mid = &feat_l3[y * w..y * w + w];
-        let r_bot = &feat_l3[yp1 * w..yp1 * w + w];
+        let r_top = &scratch.feat_l3[ym1 * w..ym1 * w + w];
+        let r_mid = &scratch.feat_l3[y * w..y * w + w];
+        let r_bot = &scratch.feat_l3[yp1 * w..yp1 * w + w];
         let y_row = &y_plane[y * w..(y + 1) * w];
-        let act_row = &active_px[y * w..(y + 1) * w];
-        let dst_row = &mut subpixels[y * w..(y + 1) * w];
+        let act_row = &scratch.active_px[y * w..(y + 1) * w];
+        let dst_row = &mut scratch.subpixels[y * w..(y + 1) * w];
 
         for x in 0..w {
             if !act_row[x] {
-                // Content-Aware Sparse Skip: output exact source pixel luminance `center_y` untouched
                 let center_y = y_row[x];
                 dst_row[x] = [center_y, center_y, center_y, center_y];
                 continue;
@@ -641,10 +637,22 @@ pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
         }
     }
 
-    let mut out_y = vec![0.0f32; (w * 2) * (h * 2)];
-    pixel_shuffle_2x(&subpixels, w, h, &mut out_y);
+    pixel_shuffle_2x(&scratch.subpixels, w, h, out_y);
+}
+
+/// Runs the 4-layer Hybrid FSRCNN-ESPCN super-resolution network on a normalized `Y` luminance plane
+/// (`w x h`), returning a `(w * 2) x (h * 2)` luminance plane.
+/// Uses the Content-Aware Sparse Skip Engine (`should_enhance_pixel` & 8x8 tile gating) so flat
+/// backgrounds (`luma_range < 0.015`) completely bypass all 4 convolutional layers and output
+/// `center_y` untouched with 0% neural bias drift.
+pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
+    let mut out_y = Vec::new();
+    let mut scratch = NeuralScratch::default();
+    upscale_y_neural_2x_into(y_plane, w, h, &mut out_y, &mut scratch);
     out_y
 }
+
+
 
 /// Public Entrypoint: Upscales a `PixelBuffer` by 2x using the Hybrid FSRCNN-ESPCN
 /// neural pipeline on the luminance (`Y`) channel and fast bilinear interpolation on `Cb`/`Cr`.
@@ -1117,22 +1125,408 @@ impl UpscaleMode {
     }
 }
 
-/// Upscales `buf` using the YCbCr Hybrid FSRCNN-ESPCN neural pipeline and dynamically bridges
-/// scales beyond `2x`:
-/// - For `>= 4x` target scales (`out_w >= buf.width * 4` or `out_h >= buf.height * 4`), runs
-///   `upscale_y_neural_2x` twice on the luminance (`Y`) plane (4x neural super-resolution) with
-///   4x bilinear chroma upscaling.
-/// - Whenever `out_w > neural.width` or `out_h > neural.height` (e.g., `2.5x`, `3x`, `5x`, or
-///   non-multiple terminal aspect ratios), feeds the neural output into `fsr_easu` to bridge
-///   the remaining scale to the exact `(out_w, out_h)` target terminal resolution.
+// =============================================================================
+// Task 4: Fast JPEG Denoising / 8x8 DCT Block Artifact Removal Pre-Filter
+// =============================================================================
+
+/// Detects whether `buf` exhibits 8x8 JPEG DCT block quantization discontinuities
+/// (where block boundary jumps at `x % 8 == 0` or `y % 8 == 0` significantly exceed
+/// intra-block smooth variance within each 8x8 tile).
+pub fn has_jpeg_block_artifacts(buf: &PixelBuffer) -> bool {
+    let w = buf.width;
+    let h = buf.height;
+    if w < 16 || h < 16 || buf.data.len() < w * h {
+        return false;
+    }
+
+    let mut boundary_sum: u64 = 0;
+    let mut boundary_cnt: u64 = 0;
+    let mut interior_sum: u64 = 0;
+    let mut interior_cnt: u64 = 0;
+
+    // Sample vertical 8x8 boundaries (x = 8, 16, 24...) vs block midpoints (x = 4, 12, 20...)
+    let step_y = (h / 32).max(1);
+    let mut y = 0;
+    while y < h {
+        let row = &buf.data[y * w..(y + 1) * w];
+        let mut bx = 8;
+        while bx < w {
+            let l0 = row[bx - 1].luma_fast() as i32;
+            let l1 = row[bx].luma_fast() as i32;
+            let diff = (l1 - l0).unsigned_abs() as u64;
+            // Count quantization-scale steps (2..=28), ignoring huge structural object edges
+            if (2..=28).contains(&diff) {
+                boundary_sum += diff;
+                boundary_cnt += 1;
+            }
+            let mx = bx - 4;
+            let m0 = row[mx - 1].luma_fast() as i32;
+            let m1 = row[mx].luma_fast() as i32;
+            let mdiff = (m1 - m0).unsigned_abs() as u64;
+            if mdiff <= 28 {
+                interior_sum += mdiff;
+                interior_cnt += 1;
+            }
+            bx += 8;
+        }
+        y += step_y;
+    }
+
+    // Sample horizontal 8x8 boundaries (y = 8, 16, 24...) vs block midpoints (y = 4, 12, 20...)
+    let step_x = (w / 32).max(1);
+    let mut by = 8;
+    while by < h {
+        let row_prev = &buf.data[(by - 1) * w..by * w];
+        let row_curr = &buf.data[by * w..(by + 1) * w];
+        let my = by - 4;
+        let row_m0 = &buf.data[(my - 1) * w..my * w];
+        let row_m1 = &buf.data[my * w..(my + 1) * w];
+
+        let mut x = 0;
+        while x < w {
+            let l0 = row_prev[x].luma_fast() as i32;
+            let l1 = row_curr[x].luma_fast() as i32;
+            let diff = (l1 - l0).unsigned_abs() as u64;
+            if (2..=28).contains(&diff) {
+                boundary_sum += diff;
+                boundary_cnt += 1;
+            }
+            let m0 = row_m0[x].luma_fast() as i32;
+            let m1 = row_m1[x].luma_fast() as i32;
+            let mdiff = (m1 - m0).unsigned_abs() as u64;
+            if mdiff <= 28 {
+                interior_sum += mdiff;
+                interior_cnt += 1;
+            }
+            x += step_x;
+        }
+        by += 8;
+    }
+
+    if boundary_cnt < 4 {
+        return false;
+    }
+
+    let avg_boundary_x10 = (boundary_sum * 10) / boundary_cnt.max(1);
+    let avg_interior_x10 = (interior_sum * 10) / interior_cnt.max(1);
+
+    // Trigger when 8x8 boundary discontinuity is >= 25% higher than interior gradient
+    avg_boundary_x10 >= 25 && avg_boundary_x10 * 4 > avg_interior_x10.max(8) * 5
+}
+
+/// Fast single-pass Bilateral / Box-Sigma Edge-Preserving Denoising Filter (`remove_jpeg_artifacts`).
+/// Smooths 8x8 DCT grid blocking and mosquito ringing noise while strictly preserving high-contrast
+/// text glyphs, UI borders, and vector edges (`max_channel_diff > sigma`).
+pub fn remove_jpeg_artifacts(buf: &mut PixelBuffer) {
+    let w = buf.width;
+    let h = buf.height;
+    if w < 3 || h < 3 || buf.data.len() < w * h {
+        return;
+    }
+
+    let src = buf.data.clone();
+    let max_x = w - 1;
+    let max_y = h - 1;
+
+    // 3x3 spatial Gaussian-like integer weights: center = 4, axial = 2, diagonal = 1
+    const SPATIAL_W: [u32; 9] = [1, 2, 1, 2, 4, 2, 1, 2, 1];
+
+    for y in 0..h {
+        let ym1 = y.saturating_sub(1);
+        let yp1 = (y + 1).min(max_y);
+        let r_top = &src[ym1 * w..ym1 * w + w];
+        let r_mid = &src[y * w..y * w + w];
+        let r_bot = &src[yp1 * w..yp1 * w + w];
+        let dst_row = &mut buf.data[y * w..(y + 1) * w];
+
+        let on_y_block_edge = (y & 7) == 0 || (y & 7) == 7;
+
+        for x in 0..w {
+            let xm1 = x.saturating_sub(1);
+            let xp1 = (x + 1).min(max_x);
+            let center = r_mid[x];
+
+            let neighbors = [
+                r_top[xm1], r_top[x], r_top[xp1],
+                r_mid[xm1], center,   r_mid[xp1],
+                r_bot[xm1], r_bot[x], r_bot[xp1],
+            ];
+
+            // Fast flat-region skip: if all 4 axial neighbors equal center, no denoising needed
+            if neighbors[1] == center
+                && neighbors[3] == center
+                && neighbors[5] == center
+                && neighbors[7] == center
+            {
+                continue;
+            }
+
+            let on_x_block_edge = (x & 7) == 0 || (x & 7) == 7;
+            // Use wider bilateral range threshold (24) on 8x8 DCT block boundaries,
+            // and tighter range threshold (14) inside blocks for mosquito ringing removal.
+            // Any high-contrast edge (diff > threshold, such as text or icons) gets weight 0!
+            let sigma_thresh: u8 = if on_x_block_edge || on_y_block_edge { 24 } else { 14 };
+
+            let mut sum_r: u32 = 0;
+            let mut sum_g: u32 = 0;
+            let mut sum_b: u32 = 0;
+            let mut sum_w: u32 = 0;
+
+            for k in 0..9 {
+                let nk = neighbors[k];
+                let dr = center.r.abs_diff(nk.r);
+                let dg = center.g.abs_diff(nk.g);
+                let db = center.b.abs_diff(nk.b);
+                let max_d = dr.max(dg).max(db);
+
+                if max_d <= sigma_thresh {
+                    // Range weight: 2 for very close values (<= sigma/2), 1 up to sigma_thresh
+                    let range_w = if max_d <= (sigma_thresh >> 1) { 2 } else { 1 };
+                    let w_k = SPATIAL_W[k] * range_w;
+                    sum_r += (nk.r as u32) * w_k;
+                    sum_g += (nk.g as u32) * w_k;
+                    sum_b += (nk.b as u32) * w_k;
+                    sum_w += w_k;
+                }
+            }
+
+            if sum_w > 0 {
+                let half_w = sum_w >> 1;
+                dst_row[x] = Color::new(
+                    ((sum_r + half_w) / sum_w) as u8,
+                    ((sum_g + half_w) / sum_w) as u8,
+                    ((sum_b + half_w) / sum_w) as u8,
+                );
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Task 5: True Pixel Art / Vector Mode Detector & Scale2x / HQ2x Scaler
+// =============================================================================
+
+/// Content classifier that detects whether `buf` is Pixel Art, retro game graphics, or crisp
+/// low-palette vector iconography:
+/// 1. Samples up to 1024 pixels across the buffer and counts unique quantized RGB colors (`< 64`).
+/// 2. Verifies high sharp grid alignment: adjacent pixel transitions are dominated by either
+///    exact flat runs (`delta == 0`) or crisp step edges (`delta >= 20`), with minimal
+///    continuous photographic gradient ramps (`1 <= delta <= 12`).
+pub fn detect_pixel_art(buf: &PixelBuffer) -> bool {
+    let w = buf.width;
+    let h = buf.height;
+    let total = w * h;
+    if w < 4 || h < 4 || buf.data.len() < total {
+        return false;
+    }
+
+    // 12-bit quantized color presence bitset (4096 bits = 64 x u64 words on the stack, zero heap alloc!)
+    let mut color_bitset = [0u64; 64];
+    let mut unique_colors = 0usize;
+
+    let sample_step = (total / 1024).max(1);
+    let mut idx = 0;
+    while idx < total {
+        let c = buf.data[idx];
+        // Quantize to 4 bits per channel (16x16x16 = 4096 buckets)
+        let bucket = (((c.r >> 4) as usize) << 8)
+            | (((c.g >> 4) as usize) << 4)
+            | ((c.b >> 4) as usize);
+        let word = bucket >> 6;
+        let bit = 1u64 << (bucket & 63);
+        if (color_bitset[word] & bit) == 0 {
+            color_bitset[word] |= bit;
+            unique_colors += 1;
+            if unique_colors >= 64 {
+                return false;
+            }
+        }
+        idx += sample_step;
+    }
+
+    // Require at least 2 distinct colors (a 1-color solid blank canvas doesn't need special pixel-art scaling)
+    if unique_colors < 2 {
+        return false;
+    }
+
+    // Measure sharp grid alignment vs smooth photographic gradients
+    let mut flat_runs: u32 = 0;
+    let mut sharp_steps: u32 = 0;
+    let mut smooth_ramps: u32 = 0;
+
+    let row_step = (h / 32).max(1);
+    let col_step = (w / 32).max(1);
+    let mut y = 0;
+    while y < h {
+        let row = &buf.data[y * w..(y + 1) * w];
+        let mut x = 0;
+        while x + 1 < w {
+            let c0 = row[x];
+            let c1 = row[x + 1];
+            let delta = c0
+                .r
+                .abs_diff(c1.r)
+                .max(c0.g.abs_diff(c1.g))
+                .max(c0.b.abs_diff(c1.b));
+            if delta == 0 {
+                flat_runs += 1;
+            } else if delta >= 20 {
+                sharp_steps += 1;
+            } else if delta <= 12 {
+                smooth_ramps += 1;
+            }
+            x += col_step;
+        }
+        y += row_step;
+    }
+
+    let total_pairs = (flat_runs + sharp_steps + smooth_ramps).max(1);
+    // Pixel art has >= 1 sharp edge, < 64 unique colors, and < 20% smooth photographic gradient transitions
+    sharp_steps >= 1 && (smooth_ramps * 5 < total_pairs)
+}
+
+/// Pure-Rust **Scale2x (AdvMame2x)** directional 2x pixel-art scaler.
+/// Expands each pixel `P` into a `2x2` quad `[E0, E1, E2, E3]` using 4-connected neighbors
+/// `B` (north), `D` (west), `F` (east), `H` (south) with zero interpolation blur:
+/// - `E0 = D == B && B != H && D != F ? D : P`
+/// - `E1 = B == F && B != H && D != F ? F : P`
+/// - `E2 = D == H && B != H && D != F ? D : P`
+/// - `E3 = H == F && B != H && D != F ? F : P`
+pub fn scale2x(buf: &PixelBuffer) -> PixelBuffer {
+    let w = buf.width;
+    let h = buf.height;
+    if w == 0 || h == 0 || buf.data.len() < w * h {
+        return PixelBuffer::new(0, 0, Color::BLACK);
+    }
+
+    let out_w = w * 2;
+    let out_h = h * 2;
+    let mut out_data = vec![Color::BLACK; out_w * out_h];
+    let max_x = w - 1;
+    let max_y = h - 1;
+
+    for y in 0..h {
+        let ym1 = y.saturating_sub(1);
+        let yp1 = (y + 1).min(max_y);
+
+        let r_top = &buf.data[ym1 * w..ym1 * w + w];
+        let r_mid = &buf.data[y * w..y * w + w];
+        let r_bot = &buf.data[yp1 * w..yp1 * w + w];
+
+        let top_out_start = (y * 2) * out_w;
+        let bot_out_start = (y * 2 + 1) * out_w;
+        let (out_top_row, rest) = out_data[top_out_start..bot_out_start + out_w].split_at_mut(out_w);
+        let out_bot_row = &mut rest[..out_w];
+
+        for x in 0..w {
+            let xm1 = x.saturating_sub(1);
+            let xp1 = (x + 1).min(max_x);
+
+            let b = r_top[x];
+            let d = r_mid[xm1];
+            let p = r_mid[x];
+            let f = r_mid[xp1];
+            let h_px = r_bot[x];
+
+            let (e0, e1, e2, e3) = if b != h_px && d != f {
+                (
+                    if d == b { d } else { p },
+                    if b == f { f } else { p },
+                    if d == h_px { d } else { p },
+                    if h_px == f { f } else { p },
+                )
+            } else {
+                (p, p, p, p)
+            };
+
+            let dx = x * 2;
+            out_top_row[dx] = e0;
+            out_top_row[dx + 1] = e1;
+            out_bot_row[dx] = e2;
+            out_bot_row[dx + 1] = e3;
+        }
+    }
+
+    PixelBuffer {
+        width: out_w,
+        height: out_h,
+        data: out_data,
+    }
+}
+
+/// Scales `buf` to `(target_w, target_h)` using recursive **Scale2x / HQ2x** passes (`2x -> 4x -> 8x`)
+/// followed by exact integer nearest-neighbor grid mapping so pixel-art and vector sprites retain
+/// 100% razor-sharp blocky edges without bilinear/Lanczos smoothing.
+pub fn hq2x_scale(buf: &PixelBuffer, target_w: usize, target_h: usize) -> PixelBuffer {
+    if buf.width == 0 || buf.height == 0 || buf.data.is_empty() {
+        return PixelBuffer::new(0, 0, Color::BLACK);
+    }
+    let out_w = if target_w > 0 { target_w } else { buf.width * 2 };
+    let out_h = if target_h > 0 { target_h } else { buf.height * 2 };
+
+    let mut curr = scale2x(buf);
+    if out_w >= buf.width * 4 || out_h >= buf.height * 4 {
+        curr = scale2x(&curr);
+    }
+    if out_w >= buf.width * 8 || out_h >= buf.height * 8 {
+        curr = scale2x(&curr);
+    }
+
+    if curr.width == out_w && curr.height == out_h {
+        return curr;
+    }
+
+    // Nearest-neighbor grid snap to exact (out_w, out_h)
+    let mut final_data = vec![Color::BLACK; out_w * out_h];
+    for oy in 0..out_h {
+        let sy = ((oy * curr.height) + (curr.height >> 1)) / out_h;
+        let sy_clamped = sy.min(curr.height - 1);
+        let src_row = &curr.data[sy_clamped * curr.width..(sy_clamped + 1) * curr.width];
+        let dst_row = &mut final_data[oy * out_w..(oy + 1) * out_w];
+        for (ox, dst_px) in dst_row.iter_mut().enumerate() {
+            let sx = ((ox * curr.width) + (curr.width >> 1)) / out_w;
+            *dst_px = src_row[sx.min(curr.width - 1)];
+        }
+    }
+
+    PixelBuffer {
+        width: out_w,
+        height: out_h,
+        data: final_data,
+    }
+}
+
+/// Upscales `buf` using the YCbCr Hybrid FSRCNN-ESPCN neural pipeline and dynamically chains
+/// recursive passes for deep zooming (`2x -> 4x -> 8x`) using reusable `NeuralScratch` buffers:
+/// - For `>= 8x` target scales (`out_w >= buf.width * 8` or `out_h >= buf.height * 8`), chains
+///   `upscale_y_neural_2x_into` three times (`1x -> 2x -> 4x -> 8x`) with zero intermediate heap churn.
+/// - For `>= 4x` target scales (`out_w >= buf.width * 4` or `out_h >= buf.height * 4`), chains
+///   `upscale_y_neural_2x_into` twice (`1x -> 2x -> 4x`).
+/// - Whenever `out_w != neural.width` or `out_h != neural.height`, feeds the neural output into
+///   `fsr_easu` to bridge to the exact `(out_w, out_h)` target resolution.
 fn upscale_neural_adaptive(buf: &PixelBuffer, out_w: usize, out_h: usize) -> PixelBuffer {
     let w = buf.width;
     let h = buf.height;
 
-    let neural_buf = if out_w >= w * 4 || out_h >= h * 4 {
+    let neural_buf = if out_w >= w * 8 || out_h >= h * 8 {
         let (y_plane, cb_plane, cr_plane) = rgb_to_ycbcr(buf);
-        let y_2x = upscale_y_neural_2x(&y_plane, w, h);
-        let y_4x = upscale_y_neural_2x(&y_2x, w * 2, h * 2);
+        let mut scratch = NeuralScratch::default();
+        let mut y_2x = Vec::new();
+        let mut y_4x = Vec::new();
+        let mut y_8x = Vec::new();
+        upscale_y_neural_2x_into(&y_plane, w, h, &mut y_2x, &mut scratch);
+        upscale_y_neural_2x_into(&y_2x, w * 2, h * 2, &mut y_4x, &mut scratch);
+        upscale_y_neural_2x_into(&y_4x, w * 4, h * 4, &mut y_8x, &mut scratch);
+        let cb_8x = upscale_chroma_bilinear(&cb_plane, w, h, 8);
+        let cr_8x = upscale_chroma_bilinear(&cr_plane, w, h, 8);
+        ycbcr_to_rgb(&y_8x, &cb_8x, &cr_8x, w * 8, h * 8)
+    } else if out_w >= w * 4 || out_h >= h * 4 {
+        let (y_plane, cb_plane, cr_plane) = rgb_to_ycbcr(buf);
+        let mut scratch = NeuralScratch::default();
+        let mut y_2x = Vec::new();
+        let mut y_4x = Vec::new();
+        upscale_y_neural_2x_into(&y_plane, w, h, &mut y_2x, &mut scratch);
+        upscale_y_neural_2x_into(&y_2x, w * 2, h * 2, &mut y_4x, &mut scratch);
         let cb_4x = upscale_chroma_bilinear(&cb_plane, w, h, 4);
         let cr_4x = upscale_chroma_bilinear(&cr_plane, w, h, 4);
         ycbcr_to_rgb(&y_4x, &cb_4x, &cr_4x, w * 4, h * 4)
@@ -1140,29 +1534,25 @@ fn upscale_neural_adaptive(buf: &PixelBuffer, out_w: usize, out_h: usize) -> Pix
         upscale_neural_2x(buf)
     };
 
-    if out_w > w * 2 || out_h > h * 2 || (out_w != neural_buf.width || out_h != neural_buf.height) {
-        if out_w == neural_buf.width && out_h == neural_buf.height {
-            neural_buf
-        } else {
-            fsr_easu(&neural_buf, out_w, out_h)
-        }
+    if out_w != neural_buf.width || out_h != neural_buf.height {
+        fsr_easu(&neural_buf, out_w, out_h)
     } else {
         neural_buf
     }
 }
 
-/// Master Super-Resolution Dispatcher: processes `buf` according to the selected `UpscaleMode`.
-///
-/// - `UpscaleMode::Off`: Returns `buf` unchanged so the renderer uses fast `sample_subpixel_box`.
-/// - `UpscaleMode::FsrOnly`: Runs AMD FSR 1.0 `fsr_easu` to `(target_w, target_h)` followed by `fsr_rcas`.
-/// - `UpscaleMode::NeuralOnly`: Runs `upscale_neural_adaptive` (1x or 2x `upscale_y_neural_2x` + `fsr_easu` bridge to `target_w x target_h`).
-/// - `UpscaleMode::Combined`: Runs `upscale_neural_adaptive` to `(target_w, target_h)` followed by `fsr_rcas` contrast sharpening.
-/// - `UpscaleMode::MultiPass`: Runs `1.5x fsr_easu` directional pre-scale -> `2x upscale_neural_2x` detail pass (+ `fsr_easu` bridge) -> `fsr_rcas` sharpening.
-pub fn upscale_frame(
+/// Master Super-Resolution Dispatcher with Pixel-Art Override & Adaptive JPEG Denoising:
+/// - Automatically detects (or honors `force_pixel_art`) pixel-art / low-palette sprites and switches
+///   to crisp `hq2x_scale` (`Scale2x` recursive 2x/4x/8x + nearest-neighbor snap).
+/// - Automatically detects 8x8 JPEG DCT block artifacts (`has_jpeg_block_artifacts`) and runs
+///   `remove_jpeg_artifacts` before neural/FSR upscaling so compression blocks are never sharpened.
+/// - Supports 2x, 4x, and 8x deep-zoom recursive neural chaining.
+pub fn upscale_frame_with_options(
     buf: &PixelBuffer,
     mode: UpscaleMode,
     target_w: usize,
     target_h: usize,
+    force_pixel_art: bool,
 ) -> PixelBuffer {
     if buf.width == 0 || buf.height == 0 || buf.data.is_empty() {
         return PixelBuffer::new(0, 0, Color::BLACK);
@@ -1171,21 +1561,54 @@ pub fn upscale_frame(
     let out_w = if target_w > 0 { target_w } else { buf.width * 2 };
     let out_h = if target_h > 0 { target_h } else { buf.height * 2 };
 
+    if mode == UpscaleMode::Off && !force_pixel_art {
+        return buf.clone();
+    }
+
+    // 1. Pixel-Art / Vector Mode Bypass: preserve crisp blocky pixel grids via Scale2x
+    if force_pixel_art || detect_pixel_art(buf) {
+        return hq2x_scale(buf, out_w, out_h);
+    }
+
+    // 2. Adaptive JPEG 8x8 Block Artifact Denoising Pre-Filter
+    let denoised_storage;
+    let clean_buf = if has_jpeg_block_artifacts(buf) {
+        let mut copy = buf.clone();
+        remove_jpeg_artifacts(&mut copy);
+        denoised_storage = copy;
+        &denoised_storage
+    } else {
+        buf
+    };
+
     match mode {
-        UpscaleMode::Off => buf.clone(),
+        UpscaleMode::Off => clean_buf.clone(),
         UpscaleMode::FsrOnly => {
-            let easu = fsr_easu(buf, out_w, out_h);
+            let easu = fsr_easu(clean_buf, out_w, out_h);
             fsr_rcas(&easu, 0.85)
         }
-        UpscaleMode::NeuralOnly => upscale_neural_adaptive(buf, out_w, out_h),
+        UpscaleMode::NeuralOnly => upscale_neural_adaptive(clean_buf, out_w, out_h),
         UpscaleMode::Combined => {
-            let neural = upscale_neural_adaptive(buf, out_w, out_h);
+            let neural = upscale_neural_adaptive(clean_buf, out_w, out_h);
             fsr_rcas(&neural, 0.80)
         }
         UpscaleMode::MultiPass => {
-            if out_w >= buf.width * 4 || out_h >= buf.height * 4 {
+            if out_w >= clean_buf.width * 8 || out_h >= clean_buf.height * 8 {
+                // For >= 8x deep zoom: chain two 2x neural passes (4x) -> 1.5x EASU -> third 2x neural pass -> exact EASU bridge -> RCAS
+                let stage1_4x = upscale_neural_adaptive(clean_buf, clean_buf.width * 4, clean_buf.height * 4);
+                let mid_w = ((stage1_4x.width * 3) / 2).max(out_w / 2).max(stage1_4x.width + 1);
+                let mid_h = ((stage1_4x.height * 3) / 2).max(out_h / 2).max(stage1_4x.height + 1);
+                let easu_mid = fsr_easu(&stage1_4x, mid_w, mid_h);
+                let stage2_neural = upscale_neural_2x(&easu_mid);
+                let bridged = if stage2_neural.width != out_w || stage2_neural.height != out_h {
+                    fsr_easu(&stage2_neural, out_w, out_h)
+                } else {
+                    stage2_neural
+                };
+                fsr_rcas(&bridged, 0.85)
+            } else if out_w >= clean_buf.width * 4 || out_h >= clean_buf.height * 4 {
                 // For >= 4x scales: run 2x neural detail pass -> 1.5x EASU pre-bridge -> second 2x neural pass -> exact EASU bridge -> RCAS
-                let stage1_neural = upscale_neural_2x(buf);
+                let stage1_neural = upscale_neural_2x(clean_buf);
                 let mid_w = ((stage1_neural.width * 3) / 2).max(out_w / 2).max(stage1_neural.width + 1);
                 let mid_h = ((stage1_neural.height * 3) / 2).max(out_h / 2).max(stage1_neural.height + 1);
                 let easu_mid = fsr_easu(&stage1_neural, mid_w, mid_h);
@@ -1198,9 +1621,9 @@ pub fn upscale_frame(
                 fsr_rcas(&bridged, 0.85)
             } else {
                 // Stage 1: 1.5x Edge-Adaptive Spatial Upsampling (never no-ops even when out_w == buf.width * 2)
-                let mid_w = ((buf.width * 3) / 2).max(buf.width + 1);
-                let mid_h = ((buf.height * 3) / 2).max(buf.height + 1);
-                let easu = fsr_easu(buf, mid_w, mid_h);
+                let mid_w = ((clean_buf.width * 3) / 2).max(clean_buf.width + 1);
+                let mid_h = ((clean_buf.height * 3) / 2).max(clean_buf.height + 1);
+                let easu = fsr_easu(clean_buf, mid_w, mid_h);
                 // Stage 2: YCbCr Hybrid FSRCNN-ESPCN 2x sub-pixel detail synthesis (reaches 3.0x intermediate)
                 let neural = upscale_neural_2x(&easu);
                 // Stage 2b: Bridge to exact (out_w, out_h)
@@ -1216,8 +1639,18 @@ pub fn upscale_frame(
     }
 }
 
+/// Master Super-Resolution Dispatcher: processes `buf` according to the selected `UpscaleMode`.
+pub fn upscale_frame(
+    buf: &PixelBuffer,
+    mode: UpscaleMode,
+    target_w: usize,
+    target_h: usize,
+) -> PixelBuffer {
+    upscale_frame_with_options(buf, mode, target_w, target_h, false)
+}
+
 /// Entrypoint for the renderer pipeline: checks `target_w` and `target_h` and runs `upscale_frame`
-/// (including double `upscale_y_neural_2x` for `>= 4x` or `fsr_easu` scale bridging for `> 2x`)
+/// (including recursive `upscale_y_neural_2x_into` for `>= 4x` / `>= 8x` or `fsr_easu` scale bridging)
 /// before subpixel sampling or protocol encoding.
 #[inline]
 pub fn apply_upscale_pipeline(
@@ -1226,7 +1659,19 @@ pub fn apply_upscale_pipeline(
     target_w: usize,
     target_h: usize,
 ) -> PixelBuffer {
-    upscale_frame(buf, mode, target_w, target_h)
+    upscale_frame_with_options(buf, mode, target_w, target_h, false)
+}
+
+/// Extended entrypoint for the renderer pipeline allowing explicit manual `force_pixel_art` override.
+#[inline]
+pub fn apply_upscale_pipeline_ex(
+    buf: &PixelBuffer,
+    mode: UpscaleMode,
+    target_w: usize,
+    target_h: usize,
+    force_pixel_art: bool,
+) -> PixelBuffer {
+    upscale_frame_with_options(buf, mode, target_w, target_h, force_pixel_art)
 }
 
 /// Applies AMD FSR 1.0 Robust Contrast-Adaptive Sharpening (`RCAS`) directly at the terminal
@@ -1342,18 +1787,27 @@ mod tests {
 
     #[test]
     fn test_edge_contrast_improvement() {
-        // Synthetic 16x16 vertical blurred step-edge:
-        // Left half = 0.2 (51), transition col 7 = 0.42 (107), col 8 = 0.58 (148), Right half = 0.8 (204)
+        // Synthetic 16x16 photographic vertical blurred step-edge (> 64 unique colors so it uses continuous SR)
         let mut buf = PixelBuffer::new(16, 16, Color::new(51, 51, 51));
         for y in 0..16 {
-            buf.set_pixel(7, y, Color::new(107, 107, 107));
-            buf.set_pixel(8, y, Color::new(148, 148, 148));
-            for x in 9..16 {
-                buf.set_pixel(x, y, Color::new(204, 204, 204));
+            for x in 0..16 {
+                let base: u8 = if x < 7 {
+                    51
+                } else if x == 7 {
+                    107
+                } else if x == 8 {
+                    148
+                } else {
+                    204
+                };
+                // Add subtle per-row/col chroma variation so unique color count >= 64 (photographic image)
+                let r = base.saturating_add((y as u8) * 2);
+                let g = base;
+                let b = base.saturating_sub((x as u8) * 2);
+                buf.set_pixel(x, y, Color::new(r, g, b));
             }
         }
 
-        // Bilinear baseline slope across the center transition at 32x32
         let (y_plane, _, _) = rgb_to_ycbcr(&buf);
         let bilin_y = upscale_chroma_bilinear(&y_plane, 16, 16, 2);
         let row_mid = 16 * 32;
@@ -1421,6 +1875,105 @@ mod tests {
     }
 
     #[test]
+    fn test_recursive_chaining_4x_and_8x() {
+        // Create an 8x8 photographic patch (> 64 colors) and test 4x (32x32) and 8x (64x64) recursive neural chaining
+        let mut buf = PixelBuffer::new(8, 8, Color::BLACK);
+        for y in 0..8 {
+            for x in 0..8 {
+                buf.set_pixel(
+                    x,
+                    y,
+                    Color::new((x * 30 + 10) as u8, (y * 30 + 15) as u8, ((x + y) * 16) as u8),
+                );
+            }
+        }
+
+        for mode in [UpscaleMode::NeuralOnly, UpscaleMode::Combined, UpscaleMode::MultiPass] {
+            let out_4x = apply_upscale_pipeline(&buf, mode, 32, 32);
+            assert_eq!(out_4x.width, 32);
+            assert_eq!(out_4x.height, 32);
+            assert_eq!(out_4x.data.len(), 32 * 32);
+
+            let out_8x = apply_upscale_pipeline(&buf, mode, 64, 64);
+            assert_eq!(out_8x.width, 64);
+            assert_eq!(out_8x.height, 64);
+            assert_eq!(out_8x.data.len(), 64 * 64);
+        }
+    }
+
+    #[test]
+    fn test_jpeg_artifact_removal_and_edge_preservation() {
+        // Construct a 16x16 image with synthetic 8x8 DCT block step artifact (100 vs 114 at x=8)
+        // plus a sharp 1px high-contrast text stroke (value 10 on 114 background at x=12).
+        let mut buf = PixelBuffer::new(16, 16, Color::new(100, 100, 100));
+        for y in 0..16 {
+            for x in 8..16 {
+                buf.set_pixel(x, y, Color::new(114, 114, 114));
+            }
+            // High-contrast dark stroke at x = 12 (diff = 104 >> sigma_thresh)
+            buf.set_pixel(12, y, Color::new(10, 10, 10));
+        }
+
+        assert!(
+            has_jpeg_block_artifacts(&buf),
+            "Should detect synthetic 8x8 JPEG block boundary jump"
+        );
+
+        let before_jump = buf.get_pixel(8, 4).r.abs_diff(buf.get_pixel(7, 4).r);
+        remove_jpeg_artifacts(&mut buf);
+        let after_jump = buf.get_pixel(8, 4).r.abs_diff(buf.get_pixel(7, 4).r);
+
+        assert!(
+            after_jump < before_jump,
+            "8x8 JPEG block boundary jump should be smoothed: before={}, after={}",
+            before_jump,
+            after_jump
+        );
+        // High-contrast 1px stroke at x = 12 must remain crisp (unblurred)
+        assert_eq!(buf.get_pixel(12, 4), Color::new(10, 10, 10));
+    }
+
+    #[test]
+    fn test_pixel_art_detector_and_scale2x() {
+        // 1. Construct a 16x16 4-color pixel-art sprite
+        let bg = Color::new(20, 24, 46);
+        let fg = Color::new(255, 80, 40);
+        let accent = Color::new(250, 220, 60);
+        let mut sprite = PixelBuffer::new(16, 16, bg);
+        for y in 4..12 {
+            for x in 4..12 {
+                sprite.set_pixel(x, y, fg);
+            }
+        }
+        sprite.set_pixel(5, 5, accent);
+        sprite.set_pixel(10, 5, accent);
+
+        assert!(
+            detect_pixel_art(&sprite),
+            "4-color sharp sprite should be classified as pixel art"
+        );
+
+        let scaled_2x = scale2x(&sprite);
+        assert_eq!(scaled_2x.width, 32);
+        assert_eq!(scaled_2x.height, 32);
+        // Scale2x never invents interpolated blended colors; every output pixel must belong to the original palette!
+        for px in &scaled_2x.data {
+            assert!(
+                *px == bg || *px == fg || *px == accent,
+                "Scale2x invented non-palette color {:?}",
+                px
+            );
+        }
+
+        let scaled_4x = hq2x_scale(&sprite, 64, 64);
+        assert_eq!(scaled_4x.width, 64);
+        assert_eq!(scaled_4x.height, 64);
+        for px in &scaled_4x.data {
+            assert!(*px == bg || *px == fg || *px == accent);
+        }
+    }
+
+    #[test]
     fn test_dither_stability_and_flat_suppression() {
         let c = Color::new(140, 160, 180);
         for y in 0..8 {
@@ -1435,3 +1988,4 @@ mod tests {
         assert_eq!(dither_truecolor_cell(Color::BLACK, 3, 1), Color::BLACK);
     }
 }
+

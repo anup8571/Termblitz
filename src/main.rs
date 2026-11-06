@@ -159,6 +159,7 @@ fn main() -> io::Result<()> {
     let start_in_raw = args.iter().any(|a| a == "--raw" || a == "--cdp-raw");
     let start_in_native = args.iter().any(|a| a == "--native");
     let no_dither = args.iter().any(|a| a == "--no-dither" || a == "--no-dithering");
+    let start_pixel_art = args.iter().any(|a| a == "--pixel-art");
 
     let mut initial_upscale_mode = UpscaleMode::FsrOnly;
     let mut arg_iter = args.iter().skip(1).peekable();
@@ -187,6 +188,7 @@ fn main() -> io::Result<()> {
     let mut renderer = DiffRenderer::new(cols, rows);
     renderer.upscale_mode = initial_upscale_mode;
     renderer.dithering_enabled = !no_dither;
+    renderer.pixel_art_mode = start_pixel_art;
 
     if enable_kitty {
         renderer.protocol = GraphicsProtocol::Kitty;
@@ -369,6 +371,18 @@ fn main() -> io::Result<()> {
                             "OFF"
                         }
                     ),
+                    Instant::now() + Duration::from_secs(2),
+                ));
+            }
+            AppAction::TogglePixelArt => {
+                renderer.pixel_art_mode = !renderer.pixel_art_mode;
+                renderer.force_redraw();
+                status_banner = Some((
+                    if renderer.pixel_art_mode {
+                        "👾 Pixel-Art Scale2x Mode [p]: ON (Forced Scale2x)".to_string()
+                    } else {
+                        "👾 Pixel-Art Scale2x Mode [p]: AUTO (Content-Aware)".to_string()
+                    },
                     Instant::now() + Duration::from_secs(2),
                 ));
             }
@@ -804,10 +818,11 @@ fn main() -> io::Result<()> {
                 format!("{:0.0}fps", fps)
             };
             let dither_state = if renderer.dithering_enabled { "ON" } else { "OFF" };
+            let pix_tag = if renderer.pixel_art_mode { "+PIX" } else { "" };
             let sr_part = if is_compact {
-                format!("[SR:{}", renderer.upscale_mode.short_name())
+                format!("[SR:{}{}", renderer.upscale_mode.short_name(), pix_tag)
             } else {
-                format!("[SR: {}", renderer.upscale_mode.badge_name())
+                format!("[SR: {}{}", renderer.upscale_mode.badge_name(), pix_tag)
             };
             let dither_part = if is_compact {
                 format!("|D:{}]", dither_state)
