@@ -541,7 +541,7 @@ fn main() -> io::Result<()> {
                     }
                 } else {
                     let (ptr_col, ptr_row) = input_handler.last_pointer_pos;
-                    cdp_engine.scroll_at(delta * (rows as i32 / 3).max(2), ptr_col, ptr_row);
+                    cdp_engine.scroll_at(delta * 3, ptr_col, ptr_row);
                     scroll_fast_until = Instant::now() + Duration::from_millis(180);
                 }
             }
@@ -678,7 +678,20 @@ fn main() -> io::Result<()> {
                         // 2. In Hybrid Mode: Overlay razor-sharp native terminal characters at 1:1 CSS viewport coordinates
                         // while suppressing stale DOM text overlays inside any actively playing <video> bounding box.
                         if mode == RenderMode::CdpHybrid {
-                            let overlays = cdp_engine.get_text_overlays();
+                            let mut overlays = cdp_engine.get_text_overlays();
+                            // Prioritize inputs first, then bold/navigation/link elements, then body text
+                            // so sticky headers, footers, and search boxes claim their terminal cells first
+                            // and scrolled body text can never overwrite or merge into them.
+                            overlays.sort_by_key(|s| {
+                                if s.is_input {
+                                    0u8
+                                } else if s.bold || s.is_link {
+                                    1u8
+                                } else {
+                                    2u8
+                                }
+                            });
+
                             let (vw, vh) = cdp_engine.get_viewport_dims();
                             let pw = vw.max(1) as f32;
                             let ph = vh.max(1) as f32;
@@ -687,6 +700,9 @@ fn main() -> io::Result<()> {
                                 .iter()
                                 .map(|vr| vr.to_terminal_bounds(cols, rows, vw, vh))
                                 .collect();
+
+                            let cols_usize = cols as usize;
+                            let mut occupied = vec![false; cols_usize * (rows as usize)];
 
                             for span in &overlays {
                                 let start_col = ((span.px_x.max(0) as f32 * cols as f32) / pw)
@@ -703,14 +719,14 @@ fn main() -> io::Result<()> {
 
                                 if term_row >= view_start_y && term_row < view_max_y && start_col < cols {
                                     let available_cols = (cols - start_col) as usize;
-                                    let is_multiline = box_rows >= 2 && span.px_h >= 24;
+                                    let is_multiline = !span.is_input && box_rows >= 2 && span.px_h >= 30;
                                     let text_disp_w = display_width(&span.text);
                                     let wrap_w = if is_multiline {
                                         span_cols.min(available_cols).max(8)
                                     } else {
                                         span_cols.max(text_disp_w).min(available_cols)
                                     };
-                                    let max_lines = if is_multiline { box_rows.min(6) } else { 1 };
+                                    let max_lines = if is_multiline { box_rows.min(2) } else { 1 };
                                     let wrapped_lines = wrap_overlay_text(&span.text, wrap_w, max_lines);
 
                                     let link_fg = if span.is_input {
@@ -726,7 +742,11 @@ fn main() -> io::Result<()> {
                                         if target_y >= view_max_y {
                                             break;
                                         }
-                                        let line_end_col = start_col.saturating_add(display_width(line_text) as u16);
+                                        let line_w = display_width(line_text) as u16;
+                                        if line_w == 0 {
+                                            continue;
+                                        }
+                                        let line_end_col = start_col.saturating_add(line_w).min(cols);
                                         let inside_video = video_term_boxes.iter().any(|&(vc0, vr0, vc1, vr1)| {
                                             target_y >= vr0
                                                 && target_y < vr1
@@ -734,6 +754,18 @@ fn main() -> io::Result<()> {
                                                 && line_end_col > vc0
                                         });
                                         if inside_video {
+                                            continue;
+                                        }
+
+                                        let row_base = (target_y as usize) * cols_usize;
+                                        let check_c0 = (start_col.saturating_sub(1) as usize).min(cols_usize);
+                                        let check_c1 = ((line_end_col + 1) as usize).min(cols_usize);
+                                        if check_c0 < check_c1
+                                            && occupied[row_base + check_c0..row_base + check_c1]
+                                                .iter()
+                                                .any(|&occ| occ)
+                                        {
+                                            // Prevent text spans mapped to the same terminal row from merging
                                             continue;
                                         }
 
@@ -753,6 +785,12 @@ fn main() -> io::Result<()> {
                                             span.bold,
                                             should_underline,
                                         );
+
+                                        let mark_c0 = (start_col as usize).min(cols_usize);
+                                        let mark_c1 = (line_end_col as usize).min(cols_usize);
+                                        for cell_occ in &mut occupied[row_base + mark_c0..row_base + mark_c1] {
+                                            *cell_occ = true;
+                                        }
                                     }
                                 }
                             }

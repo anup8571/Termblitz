@@ -273,12 +273,7 @@ impl InputHandler {
                 AppAction::None => {}
                 AppAction::Scroll(delta) => {
                     has_scroll = true;
-                    // Preserve intentional Home/End full-document jumps (-100000 / +100000)
-                    if delta.abs() >= 10_000 {
-                        coalesced_scroll = delta;
-                    } else if coalesced_scroll.abs() < 10_000 {
-                        coalesced_scroll = (coalesced_scroll + delta).clamp(-12, 12);
-                    }
+                    coalesced_scroll = (coalesced_scroll + delta).clamp(-3, 3);
                 }
                 AppAction::TypeInPage(ch_str) => {
                     typed_buffer.push_str(&ch_str);
@@ -435,11 +430,11 @@ impl InputHandler {
                 }
                 KeyCode::Char('g') | KeyCode::Home => {
                     self.reset_drag_state();
-                    AppAction::Scroll(-100000)
+                    AppAction::Scroll(-3)
                 }
                 KeyCode::Char('G') | KeyCode::End => {
                     self.reset_drag_state();
-                    AppAction::Scroll(100000)
+                    AppAction::Scroll(3)
                 }
                 _ => AppAction::None,
             }
@@ -466,10 +461,11 @@ impl InputHandler {
                 }
                 if let Some(last_y) = self.last_drag_y {
                     let diff = (last_y as i32) - (mouse.row as i32);
-                    // Update anchor row immediately and clamp per-event drag step
-                    self.last_drag_y = Some(mouse.row);
-                    if diff != 0 {
-                        return AppAction::Scroll(diff.clamp(-6, 6));
+                    // Require 2 rows of vertical drag per scroll unit to prevent hyper-sensitive jumps
+                    let step = (diff / 2).clamp(-2, 2);
+                    if step != 0 {
+                        self.last_drag_y = Some((last_y as i32 - step * 2).max(0) as u16);
+                        return AppAction::Scroll(step);
                     }
                 }
                 AppAction::None
@@ -530,12 +526,12 @@ impl InputHandler {
             MouseEventKind::ScrollDown => {
                 // Reset any active touch/drag state immediately after emitting ScrollDown
                 self.reset_drag_state();
-                AppAction::Scroll(3)
+                AppAction::Scroll(1)
             }
             MouseEventKind::ScrollUp => {
                 // Reset any active touch/drag state immediately after emitting ScrollUp
                 self.reset_drag_state();
-                AppAction::Scroll(-3)
+                AppAction::Scroll(-1)
             }
             MouseEventKind::Up(_) => {
                 self.reset_drag_state();
@@ -637,12 +633,12 @@ mod tests {
         }
 
         let action = handler.process_event_batch(burst);
-        // Must be coalesced and clamped to a single bounded scroll step (+12)
-        assert_eq!(action, AppAction::Scroll(12));
+        // Must be coalesced and clamped to a single bounded scroll step (+3)
+        assert_eq!(action, AppAction::Scroll(3));
         assert!(handler.drag_start.is_none());
         assert!(handler.last_drag_y.is_none());
 
-        // Simulate touch Down -> Drag -> Up and verify drag state is completely cleared on Up
+        // Simulate touch Down -> Drag (4 rows up) -> Up and verify drag state is completely cleared on Up
         let touch_seq = vec![
             Event::Mouse(MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
@@ -665,7 +661,7 @@ mod tests {
         ];
 
         let drag_action = handler.process_event_batch(touch_seq);
-        assert_eq!(drag_action, AppAction::Scroll(4));
+        assert_eq!(drag_action, AppAction::Scroll(2));
         assert!(handler.drag_start.is_none(), "drag_start must be cleared after Up");
         assert!(handler.last_drag_y.is_none(), "last_drag_y must be cleared after Up");
         assert!(!handler.has_dragged, "has_dragged must be cleared after Up");

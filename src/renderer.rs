@@ -207,12 +207,16 @@ impl PixelBuffer {
     pub fn from_image(img: &image::DynamicImage) -> Self {
         use image::GenericImageView;
         let (w, h) = img.dimensions();
-        let rgba = img.to_rgba8();
-        let mut data = Vec::with_capacity((w * h) as usize);
-        for py in 0..h {
-            for px in 0..w {
-                let p = rgba.get_pixel(px, py);
-                data.push(Color::new(p[0], p[1], p[2]));
+        let len = (w as usize) * (h as usize);
+        let mut data = Vec::with_capacity(len);
+        if let Some(rgb) = img.as_rgb8() {
+            for chunk in rgb.as_raw().chunks_exact(3) {
+                data.push(Color::new(chunk[0], chunk[1], chunk[2]));
+            }
+        } else {
+            let rgb = img.to_rgb8();
+            for chunk in rgb.as_raw().chunks_exact(3) {
+                data.push(Color::new(chunk[0], chunk[1], chunk[2]));
             }
         }
         Self {
