@@ -244,6 +244,7 @@ fn main() -> io::Result<()> {
     let mut fps_timer = Instant::now();
     let mut cdp_last_count = 0;
     let mut cdp_fps = 0.0;
+    let mut scroll_fast_until = Instant::now() - Duration::from_secs(1);
 
     loop {
         let frame_start = Instant::now();
@@ -453,8 +454,24 @@ fn main() -> io::Result<()> {
                     cdp_engine.navigate(&resolved, cols, rows);
                 }
             }
+            AppAction::TypeInPage(text) => {
+                if mode.is_cdp() {
+                    cdp_engine.type_text(&text);
+                }
+            }
+            AppAction::PageKey(page_key) => {
+                if mode.is_cdp() {
+                    cdp_engine.send_page_key(page_key);
+                }
+            }
+            AppAction::UnfocusPageInput => {
+                if mode.is_cdp() {
+                    cdp_engine.blur_input();
+                }
+            }
             AppAction::Click(click_x, click_y) => {
                 if mode == RenderMode::Native {
+                    input_handler.is_typing_in_page = false;
                     if let Some(target) = native_engine.hit_test(click_x, click_y) {
                         let resolved = if target.starts_with('/') {
                             if let Ok(base) = url_base(&native_engine.current_url) {
@@ -483,10 +500,12 @@ fn main() -> io::Result<()> {
                 } else {
                     let (hit_link, hit_input) = cdp_engine.hit_test_overlay(click_x, click_y, cols, rows);
                     if hit_input {
-                        // Tapping a search bar or input field on the page opens the search/URL input bar!
-                        input_handler.is_entering_url = true;
-                        input_handler.url_input_buffer.clear();
+                        // Focus the DOM input element on the page and type directly into the webpage box
+                        input_handler.is_entering_url = false;
+                        input_handler.is_typing_in_page = true;
+                        cdp_engine.focus_input(click_x, click_y);
                     } else if let Some(url) = hit_link {
+                        input_handler.is_typing_in_page = false;
                         if !url.starts_with("javascript:") && !url.is_empty() {
                             native_engine.current_url = url.clone();
                             cdp_engine.navigate(&url, cols, rows);
@@ -494,6 +513,7 @@ fn main() -> io::Result<()> {
                             cdp_engine.click(click_x, click_y);
                         }
                     } else {
+                        input_handler.is_typing_in_page = false;
                         cdp_engine.click(click_x, click_y);
                     }
                 }
@@ -506,7 +526,9 @@ fn main() -> io::Result<()> {
                         native_engine.scroll_y = native_engine.scroll_y.saturating_sub((-delta) as usize);
                     }
                 } else {
-                    cdp_engine.scroll(delta);
+                    let (ptr_col, ptr_row) = input_handler.last_pointer_pos;
+                    cdp_engine.scroll_at(delta, ptr_col, ptr_row);
+                    scroll_fast_until = Instant::now() + Duration::from_millis(180);
                 }
             }
             AppAction::PageScroll(delta) => {
@@ -518,10 +540,13 @@ fn main() -> io::Result<()> {
                         native_engine.scroll_y = native_engine.scroll_y.saturating_sub(half_page);
                     }
                 } else {
-                    cdp_engine.scroll(delta * (rows as i32 / 2));
+                    let (ptr_col, ptr_row) = input_handler.last_pointer_pos;
+                    cdp_engine.scroll_at(delta * (rows as i32 / 3).max(2), ptr_col, ptr_row);
+                    scroll_fast_until = Instant::now() + Duration::from_millis(180);
                 }
             }
             AppAction::Reload => {
+                input_handler.is_typing_in_page = false;
                 renderer.force_redraw();
                 let curr = native_engine.current_url.clone();
                 if mode == RenderMode::Native {
@@ -583,12 +608,14 @@ fn main() -> io::Result<()> {
         match mode {
             RenderMode::Native => {
                 renderer.video_fast_path = false;
+                renderer.scroll_fast_path = false;
                 native_engine.render_to(&mut renderer, view_start_y, view_max_y);
             }
             RenderMode::CdpHybrid | RenderMode::CdpRaw => {
                 let cdp_err = cdp_engine.get_error();
                 if let Some(ref err) = cdp_err {
                     renderer.video_fast_path = false;
+                    renderer.scroll_fast_path = false;
                     let box_w = (cols.saturating_sub(4)).min(70).max(28);
                     let start_x = (cols.saturating_sub(box_w)) / 2;
                     let start_y = (rows.saturating_sub(10)) / 2;
@@ -626,20 +653,27 @@ fn main() -> io::Result<()> {
                     renderer.put_str(start_x + 1, start_y + 8, &prompt2, Color::CYAN, err_bg, false, false);
                     renderer.put_str(start_x, start_y + 9, &bot_border, err_border, err_bg, true, false);
                 } else {
-                    let px_buf = cdp_engine.get_frame();
+                    let (fw, fh) = cdp_engine.get_frame_dims();
                     let is_loading = cdp_engine.is_loading();
                     let count = cdp_engine.get_frame_count();
                     let video_rects = cdp_engine.get_video_rects();
                     renderer.video_fast_path = !video_rects.is_empty();
+                    renderer.scroll_fast_path = Instant::now() < scroll_fast_until;
 
                     if count == 0 || (is_loading && count < 2) {
                         let msg = " 🌐 Connecting & Loading Visual Web Page... ⏳ ";
                         let msg_x = cols.saturating_sub(msg.len() as u16) / 2;
                         let msg_y = rows / 2;
                         renderer.put_str(msg_x, msg_y, msg, Color::CYAN, Color::new(28, 32, 42), true, false);
-                    } else if px_buf.width > 0 && px_buf.height > 0 {
-                        // 1. Blit visual background frame (cards, buttons, logos, images, or fast-path video)
-                        renderer.blit_frame(&px_buf, view_start_y, view_max_y);
+                    } else if fw > 0 && fh > 0 {
+                        // 1. Blit visual background frame using dirty-frame cell cache (only runs Super-Resolution
+                        // or clones PixelBuffer when `count` or renderer fast-path/settings change)
+                        renderer.blit_frame_cached(
+                            count,
+                            || cdp_engine.get_frame(),
+                            view_start_y,
+                            view_max_y,
+                        );
 
                         // 2. In Hybrid Mode: Overlay razor-sharp native terminal characters at 1:1 CSS viewport coordinates
                         // while suppressing stale DOM text overlays inside any actively playing <video> bounding box.
@@ -854,9 +888,21 @@ fn main() -> io::Result<()> {
 
             if !has_active_banner && metrics_x > addr_x + 2 {
                 let max_url_w = (metrics_x - addr_x) as usize;
-                let clean_u = format!(" {}", format_clean_url(&native_engine.current_url));
-                let truncated_url = truncate_by_display_width(&clean_u, max_url_w.saturating_sub(1));
-                renderer.put_str(addr_x, 0, &truncated_url, Color::WHITE, bar_bg, false, false);
+                if input_handler.is_typing_in_page {
+                    let hint = if is_compact {
+                        " [INPUT: Enter/Esc] "
+                    } else {
+                        " [INPUT: typing in page box | Enter=Submit, Esc=Exit] "
+                    };
+                    let truncated_hint =
+                        truncate_by_display_width(hint, max_url_w.saturating_sub(1));
+                    renderer.put_str(addr_x, 0, &truncated_hint, Color::CYAN, bar_bg, true, false);
+                } else {
+                    let clean_u = format!(" {}", format_clean_url(&native_engine.current_url));
+                    let truncated_url =
+                        truncate_by_display_width(&clean_u, max_url_w.saturating_sub(1));
+                    renderer.put_str(addr_x, 0, &truncated_url, Color::WHITE, bar_bg, false, false);
+                }
             }
 
             if !has_active_banner {
@@ -892,7 +938,7 @@ fn main() -> io::Result<()> {
         }
 
         let elapsed = frame_start.elapsed();
-        let target_frame_time = if renderer.video_fast_path {
+        let target_frame_time = if renderer.video_fast_path || renderer.scroll_fast_path || input_handler.is_typing_in_page {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(33)

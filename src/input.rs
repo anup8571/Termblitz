@@ -1,11 +1,26 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageKey {
+    Backspace,
+    Enter,
+    Tab,
+    Left,
+    Right,
+    Delete,
+    Home,
+    End,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppAction {
     Scroll(i32),
     PageScroll(i32),
     Navigate(String),
+    TypeInPage(String),
+    PageKey(PageKey),
+    UnfocusPageInput,
     ToggleMode,
     ToggleAdBlock,
     ToggleMute,
@@ -50,6 +65,95 @@ fn url_encode_query(q: &str) -> String {
     out
 }
 
+/// Checks if a single-token string without scheme looks like a real browser hostname/URL
+/// (e.g. `google.com`, `en.wikipedia.org/wiki/Rust`, `localhost:8080`, `127.0.0.1:3000`)
+/// vs. normal search text or dotted terms (`rust 1.80`, `v1.2.3`, `node.js`, `main.rs`, `what.is`).
+fn looks_like_direct_url(trimmed: &str) -> bool {
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_whitespace()) {
+        return false;
+    }
+
+    // Split off path, query, or fragment to inspect the authority/host
+    let authority = trimmed
+        .split(&['/', '?', '#'][..])
+        .next()
+        .unwrap_or(trimmed);
+    if authority.is_empty() {
+        return false;
+    }
+
+    // Strip optional :port
+    let (host, port_opt) = if let Some((h, p)) = authority.rsplit_once(':') {
+        if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() {
+            (h, Some(p))
+        } else {
+            return false;
+        }
+    } else {
+        (authority, None)
+    };
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    // Check valid IPv4 address (e.g. 127.0.0.1 or 192.168.1.1)
+    let octets: Vec<&str> = host.split('.').collect();
+    if octets.len() == 4 && octets.iter().all(|o| o.parse::<u8>().is_ok()) {
+        return true;
+    }
+
+    // Hostname must have at least two labels separated by '.'
+    if octets.len() < 2 {
+        return false;
+    }
+
+    for label in &octets {
+        if label.is_empty()
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return false;
+        }
+    }
+
+    let tld = octets.last().copied().unwrap_or("").to_ascii_lowercase();
+    // Common file/code extensions that users search for on Google rather than visiting as TLDs
+    // (unless explicitly followed by a `/` path or `:port`)
+    let has_explicit_path_or_port = trimmed.contains('/') || port_opt.is_some();
+    if !has_explicit_path_or_port
+        && matches!(
+            tld.as_str(),
+            "js" | "ts" | "rs" | "py" | "rb" | "go" | "c" | "cpp" | "h" | "java"
+                | "kt" | "swift" | "css" | "html" | "json" | "toml" | "yaml" | "yml"
+                | "md" | "txt" | "pdf" | "zip" | "tar" | "gz" | "exe" | "apk" | "so"
+        )
+    {
+        return false;
+    }
+
+    const KNOWN_TLDS: &[&str] = &[
+        "com", "org", "net", "edu", "gov", "mil", "int", "io", "co", "ai", "app", "dev", "me",
+        "tv", "gg", "sh", "xyz", "info", "biz", "tech", "online", "site", "store", "blog",
+        "cloud", "page", "link", "news", "live", "pro", "club", "design", "wiki", "fm", "to",
+        "ly", "gl", "is", "it", "us", "uk", "ca", "au", "de", "fr", "in", "jp", "cn", "br",
+        "ru", "es", "nl", "se", "no", "fi", "dk", "pl", "ch", "at", "be", "ie", "nz", "sg",
+        "kr", "tw", "hk", "mx", "ar", "za", "id", "my", "ph", "th", "vn", "tr", "ua", "cz",
+        "gr", "pt", "hu", "ro", "il", "ae", "sa", "eg", "pk", "bd", "ng", "ke", "asia", "mobi",
+        "name", "museum", "coop", "aero", "xxx", "idv", "ovh", "one", "icu", "top", "vip",
+        "work", "beer", "art", "fun", "space", "website", "press", "host", "world", "today",
+        "digital", "media", "network", "systems", "solutions", "services", "company", "group",
+        "studio", "agency", "center", "academy", "institute", "foundation", "gle", "youtube",
+        "google",
+    ];
+
+    KNOWN_TLDS.contains(&tld.as_str()) || (has_explicit_path_or_port && tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()))
+}
+
+/// Chrome-style Omnibox resolver:
+/// - Explicit schemes (`https://`, `http://`, `about:`) or recognized domains/URLs navigate directly.
+/// - Normal words, sentences, questions, or non-URL terms search on Google (`https://www.google.com/search?q=...`).
 pub fn resolve_input_to_url(raw_input: &str) -> String {
     let trimmed = raw_input.trim();
     if trimmed.is_empty() {
@@ -61,17 +165,18 @@ pub fn resolve_input_to_url(raw_input: &str) -> String {
     {
         return trimmed.to_string();
     }
-    // Treat as search query if it contains spaces or has no domain dot (unless localhost)
-    if trimmed.contains(' ') || (!trimmed.contains('.') && !trimmed.starts_with("localhost")) {
-        format!("https://www.google.com/search?q={}", url_encode_query(trimmed))
-    } else {
+    if looks_like_direct_url(trimmed) {
         format!("https://{}", trimmed)
+    } else {
+        format!("https://www.google.com/search?q={}", url_encode_query(trimmed))
     }
 }
 
 pub struct InputHandler {
     pub is_entering_url: bool,
+    pub is_typing_in_page: bool,
     pub url_input_buffer: String,
+    pub last_pointer_pos: (u16, u16),
     pub sr_hit_range: Option<(u16, u16)>,
     pub dither_hit_range: Option<(u16, u16)>,
     pub mute_hit_range: Option<(u16, u16)>,
@@ -84,7 +189,9 @@ impl InputHandler {
     pub fn new() -> Self {
         Self {
             is_entering_url: false,
+            is_typing_in_page: false,
             url_input_buffer: String::new(),
+            last_pointer_pos: (40, 12),
             sr_hit_range: None,
             dither_hit_range: None,
             mute_hit_range: None,
@@ -152,11 +259,12 @@ impl InputHandler {
         self.process_event_batch(events)
     }
 
-    /// Processes a batch of events from a single frame tick, coalescing scroll deltas into a
-    /// bounded step while immediately returning high-priority discrete actions.
+    /// Processes a batch of events from a single frame tick, coalescing scroll deltas and
+    /// consecutive in-page typed characters while immediately returning high-priority actions.
     pub fn process_event_batch(&mut self, events: impl IntoIterator<Item = Event>) -> AppAction {
         let mut coalesced_scroll: i32 = 0;
         let mut has_scroll = false;
+        let mut typed_buffer = String::new();
         let mut pending_action = AppAction::None;
 
         for ev in events {
@@ -172,10 +280,17 @@ impl InputHandler {
                         coalesced_scroll = (coalesced_scroll + delta).clamp(-12, 12);
                     }
                 }
+                AppAction::TypeInPage(ch_str) => {
+                    typed_buffer.push_str(&ch_str);
+                }
                 discrete => {
-                    // Discrete action (Click, Navigate, ToggleMode, ToggleMute, Exit, etc.)
-                    // supersedes accumulated scroll in this frame and resets drag latching.
+                    // Discrete action supersedes accumulated scroll in this frame and resets drag latching.
                     self.reset_drag_state();
+                    if !typed_buffer.is_empty() && matches!(discrete, AppAction::PageKey(PageKey::Enter)) {
+                        // Keep typed characters if user hit Enter right after typing in same batch
+                        pending_action = discrete;
+                        break;
+                    }
                     pending_action = discrete;
                     if matches!(pending_action, AppAction::Exit | AppAction::Navigate(_)) {
                         return pending_action;
@@ -184,7 +299,9 @@ impl InputHandler {
             }
         }
 
-        if pending_action != AppAction::None {
+        if !typed_buffer.is_empty() && pending_action == AppAction::None {
+            AppAction::TypeInPage(typed_buffer)
+        } else if pending_action != AppAction::None {
             pending_action
         } else if has_scroll && coalesced_scroll != 0 {
             AppAction::Scroll(coalesced_scroll)
@@ -212,7 +329,7 @@ impl InputHandler {
             return AppAction::Exit;
         }
 
-        // Alt+u, Alt+d, Alt+p, and Alt+m work globally, even when focused inside the URL/search input bar
+        // Alt+u, Alt+d, Alt+p, and Alt+m work globally, even when focused inside the URL bar or page input
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
                 KeyCode::Char('u') | KeyCode::Char('U') => return AppAction::CycleUpscale,
@@ -227,6 +344,7 @@ impl InputHandler {
             match key.code {
                 KeyCode::Enter => {
                     self.is_entering_url = false;
+                    self.is_typing_in_page = false;
                     let raw = std::mem::take(&mut self.url_input_buffer);
                     let target = resolve_input_to_url(&raw);
                     if target.is_empty() {
@@ -250,6 +368,34 @@ impl InputHandler {
                 }
                 _ => AppAction::None,
             }
+        } else if self.is_typing_in_page {
+            match key.code {
+                KeyCode::Esc => {
+                    self.is_typing_in_page = false;
+                    AppAction::UnfocusPageInput
+                }
+                KeyCode::Enter => {
+                    self.is_typing_in_page = false;
+                    AppAction::PageKey(PageKey::Enter)
+                }
+                KeyCode::Backspace => AppAction::PageKey(PageKey::Backspace),
+                KeyCode::Delete => AppAction::PageKey(PageKey::Delete),
+                KeyCode::Tab => AppAction::PageKey(PageKey::Tab),
+                KeyCode::Left => AppAction::PageKey(PageKey::Left),
+                KeyCode::Right => AppAction::PageKey(PageKey::Right),
+                KeyCode::Home => AppAction::PageKey(PageKey::Home),
+                KeyCode::End => AppAction::PageKey(PageKey::End),
+                KeyCode::Up => {
+                    self.reset_drag_state();
+                    AppAction::Scroll(-1)
+                }
+                KeyCode::Down => {
+                    self.reset_drag_state();
+                    AppAction::Scroll(1)
+                }
+                KeyCode::Char(c) => AppAction::TypeInPage(c.to_string()),
+                _ => AppAction::None,
+            }
         } else {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => AppAction::Exit,
@@ -258,6 +404,7 @@ impl InputHandler {
                 KeyCode::Char('p') | KeyCode::Char('P') => AppAction::TogglePixelArt,
                 KeyCode::Char('o') | KeyCode::Char('/') => {
                     self.is_entering_url = true;
+                    self.is_typing_in_page = false;
                     self.url_input_buffer.clear();
                     AppAction::FocusUrlBar
                 }
@@ -301,6 +448,7 @@ impl InputHandler {
 
     /// Universal SGR 1006 mouse and touch gesture handling (vertical drag scroll, horizontal swipe back/forward, top-bar touch)
     fn handle_mouse(&mut self, mouse: MouseEvent) -> AppAction {
+        self.last_pointer_pos = (mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.drag_start = Some((mouse.column, mouse.row));
@@ -338,6 +486,7 @@ impl InputHandler {
 
                     // Horizontal swipe gesture (Swipe Right = Back, Swipe Left = Forward)
                     if dragged && dx.abs() >= 10 && dx.abs() > dy.abs() * 2 {
+                        self.is_typing_in_page = false;
                         if dx > 0 {
                             return AppAction::HistoryBack;
                         } else {
@@ -348,6 +497,7 @@ impl InputHandler {
                     // Single tap (without drag)
                     if !dragged && dx.abs() <= 2 && dy.abs() <= 1 {
                         if mouse.row == 0 {
+                            self.is_typing_in_page = false;
                             if mouse.column < 14 {
                                 return AppAction::ToggleMode;
                             }
@@ -370,6 +520,7 @@ impl InputHandler {
                             self.url_input_buffer.clear();
                             return AppAction::FocusUrlBar;
                         } else {
+                            self.is_entering_url = false;
                             return AppAction::Click(mouse.column, mouse.row);
                         }
                     }
@@ -398,6 +549,77 @@ impl InputHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_chrome_style_google_search_vs_url() {
+        // Direct URLs and known TLDs
+        assert_eq!(resolve_input_to_url("google.com"), "https://google.com");
+        assert_eq!(
+            resolve_input_to_url("https://en.wikipedia.org/wiki/Rust"),
+            "https://en.wikipedia.org/wiki/Rust"
+        );
+        assert_eq!(
+            resolve_input_to_url("localhost:3000"),
+            "https://localhost:3000"
+        );
+        assert_eq!(
+            resolve_input_to_url("127.0.0.1:8080/test"),
+            "https://127.0.0.1:8080/test"
+        );
+
+        // Normal text, queries with spaces, code files, and dotted non-domains must search Google
+        assert_eq!(
+            resolve_input_to_url("rust terminal browser"),
+            "https://www.google.com/search?q=rust+terminal+browser"
+        );
+        assert_eq!(
+            resolve_input_to_url("youtube"),
+            "https://www.google.com/search?q=youtube"
+        );
+        assert_eq!(
+            resolve_input_to_url("node.js"),
+            "https://www.google.com/search?q=node.js"
+        );
+        assert_eq!(
+            resolve_input_to_url("main.rs"),
+            "https://www.google.com/search?q=main.rs"
+        );
+        assert_eq!(
+            resolve_input_to_url("v1.2.3"),
+            "https://www.google.com/search?q=v1.2.3"
+        );
+    }
+
+    #[test]
+    fn test_in_page_input_typing_mode() {
+        let mut handler = InputHandler::new();
+        handler.is_typing_in_page = true;
+
+        // Typing 'r', 'u', 's', 't' in a single batch coalesces into TypeInPage("rust")
+        // instead of triggering Reload ('r') or CycleUpscale ('u')!
+        let batch = vec![
+            Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)),
+        ];
+        assert_eq!(
+            handler.process_event_batch(batch),
+            AppAction::TypeInPage("rust".to_string())
+        );
+        assert!(handler.is_typing_in_page);
+
+        // Pressing Enter submits the page input and exits typing mode
+        let enter_ev = vec![Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))];
+        assert_eq!(
+            handler.process_event_batch(enter_ev),
+            AppAction::PageKey(PageKey::Enter)
+        );
+        assert!(!handler.is_typing_in_page);
+    }
 
     #[test]
     fn test_scroll_coalescing_and_drag_unlatch() {

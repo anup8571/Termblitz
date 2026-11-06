@@ -389,9 +389,12 @@ pub struct DiffRenderer {
     pub upscale_mode: UpscaleMode,
     pub dithering_enabled: bool,
     pub video_fast_path: bool,
+    pub scroll_fast_path: bool,
     pub pixel_art_mode: bool,
     current: Vec<Cell>,
     previous: Vec<Cell>,
+    cached_bg_cells: Vec<Cell>,
+    cached_frame_sig: Option<(usize, u16, u16, UpscaleMode, bool, bool, bool)>,
     write_buf: Vec<u8>,
 }
 
@@ -405,9 +408,12 @@ impl DiffRenderer {
             upscale_mode: UpscaleMode::FsrOnly,
             dithering_enabled: true,
             video_fast_path: false,
+            scroll_fast_path: false,
             pixel_art_mode: false,
             current: vec![Cell::EMPTY; size],
             previous: vec![Cell::INVALID; size],
+            cached_bg_cells: Vec::new(),
+            cached_frame_sig: None,
             write_buf: Vec::with_capacity(65536),
         }
     }
@@ -418,11 +424,14 @@ impl DiffRenderer {
         let size = (width as usize) * (height as usize);
         self.current = vec![Cell::EMPTY; size];
         self.previous = vec![Cell::INVALID; size];
+        self.cached_bg_cells.clear();
+        self.cached_frame_sig = None;
         self.write_buf.clear();
     }
 
     pub fn force_redraw(&mut self) {
         self.previous.fill(Cell::INVALID);
+        self.cached_frame_sig = None;
     }
 
     pub fn clear(&mut self, bg: Color) {
@@ -596,6 +605,66 @@ impl DiffRenderer {
             }
             GraphicsProtocol::HalfBlockAnsi => {
                 self.blit_pixel_buffer(px_buf, start_y, max_y);
+            }
+        }
+    }
+
+    /// Dirty-frame cached blitter: avoids cloning `PixelBuffer` or re-running Super-Resolution and dithering
+    /// on ticks where the CDP frame counter and renderer configuration have not changed.
+    pub fn blit_frame_cached<F>(
+        &mut self,
+        frame_id: usize,
+        get_px_buf: F,
+        start_y: u16,
+        max_y: u16,
+    ) where
+        F: FnOnce() -> PixelBuffer,
+    {
+        let fast_path = self.video_fast_path || self.scroll_fast_path;
+        let sig = (
+            frame_id,
+            self.width,
+            self.height,
+            self.upscale_mode,
+            self.dithering_enabled,
+            self.pixel_art_mode,
+            fast_path,
+        );
+
+        match self.protocol {
+            GraphicsProtocol::HalfBlockAnsi => {
+                if self.cached_frame_sig == Some(sig)
+                    && self.cached_bg_cells.len() == self.current.len()
+                {
+                    let start_idx =
+                        (start_y as usize).saturating_mul(self.width as usize).min(self.current.len());
+                    let end_idx =
+                        (max_y as usize).saturating_mul(self.width as usize).min(self.current.len());
+                    if start_idx < end_idx {
+                        self.current[start_idx..end_idx]
+                            .copy_from_slice(&self.cached_bg_cells[start_idx..end_idx]);
+                    }
+                    return;
+                }
+                let px_buf = get_px_buf();
+                if px_buf.width == 0 || px_buf.height == 0 {
+                    return;
+                }
+                self.blit_pixel_buffer(&px_buf, start_y, max_y);
+                self.cached_bg_cells.clear();
+                self.cached_bg_cells.extend_from_slice(&self.current);
+                self.cached_frame_sig = Some(sig);
+            }
+            GraphicsProtocol::Kitty | GraphicsProtocol::Sixel => {
+                if self.cached_frame_sig == Some(sig) {
+                    return;
+                }
+                let px_buf = get_px_buf();
+                if px_buf.width == 0 || px_buf.height == 0 {
+                    return;
+                }
+                self.blit_frame(&px_buf, start_y, max_y);
+                self.cached_frame_sig = Some(sig);
             }
         }
     }
@@ -908,16 +977,17 @@ impl DiffRenderer {
             return;
         }
 
-        let is_pixel_art = !self.video_fast_path
+        let fast_path = self.video_fast_path || self.scroll_fast_path;
+        let is_pixel_art = !fast_path
             && (self.pixel_art_mode
                 || (self.upscale_mode != UpscaleMode::Off && detect_pixel_art(px_buf)));
 
-        // Video-Box Fast-Path: when an active <video> is playing (`self.video_fast_path`),
-        // bypass heavy multi-layer CPU convolutions on the full source frame and apply single-pass
-        // terminal-subpixel RCAS after downsampling to maintain maximum tear-free video FPS.
+        // Video-Box & Active-Scroll Fast-Path: when an active <video> is playing or the user is actively
+        // scrolling, bypass heavy multi-layer CPU convolutions on the full source frame and apply single-pass
+        // terminal-subpixel RCAS after downsampling to maintain maximum 60 FPS responsiveness.
         let upscaled_storage;
         let active_buf = if (self.upscale_mode == UpscaleMode::Off && !self.pixel_art_mode)
-            || self.video_fast_path
+            || fast_path
         {
             px_buf
         } else {
@@ -980,7 +1050,7 @@ impl DiffRenderer {
         let rcas_storage;
         let final_subpixels = if is_pixel_art {
             &subpixel_buf
-        } else if self.video_fast_path {
+        } else if fast_path {
             let fast_mode = if self.upscale_mode == UpscaleMode::Off {
                 UpscaleMode::FsrOnly
             } else {
@@ -1064,7 +1134,7 @@ impl DiffRenderer {
         let upscaled_storage;
         let active_buf = if self.upscale_mode == UpscaleMode::Off && !self.pixel_art_mode {
             px_buf
-        } else if self.video_fast_path {
+        } else if self.video_fast_path || self.scroll_fast_path {
             upscaled_storage = apply_terminal_subpixel_rcas(px_buf, UpscaleMode::FsrOnly);
             &upscaled_storage
         } else {
@@ -1150,7 +1220,7 @@ impl DiffRenderer {
         let upscaled_storage;
         let active_buf = if self.upscale_mode == UpscaleMode::Off && !self.pixel_art_mode {
             px_buf
-        } else if self.video_fast_path {
+        } else if self.video_fast_path || self.scroll_fast_path {
             upscaled_storage = apply_terminal_subpixel_rcas(px_buf, UpscaleMode::FsrOnly);
             &upscaled_storage
         } else {

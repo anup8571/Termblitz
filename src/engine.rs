@@ -7,6 +7,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::input::PageKey;
 use crate::renderer::{display_width, Cell, Color, DiffRenderer, PixelBuffer};
 use crate::upscale::UpscaleMode;
 
@@ -1179,8 +1180,12 @@ pub fn find_unescaped_quote(s: &str) -> Option<usize> {
 pub enum CdpWorkerCommand {
     Navigate(String),
     Resize { cols: u16, rows: u16 },
-    Scroll(i32),
+    Scroll { delta: i32, col: u16, row: u16 },
     Click(u16, u16),
+    FocusInput(u16, u16),
+    TypeText(String),
+    SendKey(PageKey),
+    BlurInput,
     SetZoom(f32),
     SetHideText(bool),
     SetAdBlock(bool),
@@ -1232,7 +1237,7 @@ impl WsConnection {
             return Err("WebSocket upgrade failed: HTTP 101 missing".to_string());
         }
 
-        stream.set_read_timeout(Some(Duration::from_millis(12))).ok();
+        stream.set_read_timeout(Some(Duration::from_millis(2))).ok();
 
         Ok(Self {
             stream,
@@ -1319,17 +1324,21 @@ impl WsConnection {
         }
     }
 
-    /// Reads all available socket chunks until a full WebSocket frame is assembled or socket times out
+    /// Reads available socket bytes until a full WebSocket frame is assembled without stalling
+    /// when a frame is already buffered.
     fn poll_message(&mut self) -> Option<String> {
-        loop {
-            if let Some(msg) = self.try_extract_frame() {
-                return Some(msg);
-            }
+        if let Some(msg) = self.try_extract_frame() {
+            return Some(msg);
+        }
 
-            let mut chunk = [0u8; 65536];
+        let mut chunk = [0u8; 65536];
+        loop {
             match self.stream.read(&mut chunk) {
                 Ok(n) if n > 0 => {
                     self.buf.extend_from_slice(&chunk[..n]);
+                    if let Some(msg) = self.try_extract_frame() {
+                        return Some(msg);
+                    }
                 }
                 _ => break,
             }
@@ -1423,9 +1432,12 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
         var T=String.fromCharCode(9),N=String.fromCharCode(10),r=[],items=[];\
         if(!document.body)return '';\
         var vw=window.innerWidth||360,vh=window.innerHeight||640;\
-        var docH=Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0,vh);\
-        var maxS=Math.max(1,docH-vh);\
-        var pct=Math.min(100,Math.max(0,Math.round(((window.scrollY||0)*100)/maxS)));\
+        var scEl=window.__termblitz_scroll_el||document.scrollingElement||document.documentElement||document.body;\
+        var scTop=(scEl&&scEl!==document.body&&scEl!==document.documentElement&&scEl.scrollTop>0)?scEl.scrollTop:(window.scrollY||document.documentElement.scrollTop||document.body.scrollTop||0);\
+        var scH=(scEl&&scEl.scrollHeight>vh)?scEl.scrollHeight:Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0,vh);\
+        var scClient=(scEl&&scEl.clientHeight>0&&scEl.clientHeight<vh)?scEl.clientHeight:vh;\
+        var maxS=Math.max(1,scH-scClient);\
+        var pct=Math.min(100,Math.max(0,Math.round((scTop*100)/maxS)));\
         var vRects=[];\
         var vids=document.querySelectorAll('video');\
         for(var vi=0;vi<vids.length;vi++){\
@@ -1489,7 +1501,7 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             items.push({txt:txt,l:l,top:top,w:w,h:h,col:s.color,bold:(s.fontWeight==='bold'||+s.fontWeight>=600?1:0),link:(a?1:0),bg:bg,inp:0,href:href});\
             if(items.length>450)break;\
         }\
-        var inputs=document.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]),textarea,[role=searchbox],[role=combobox]');\
+        var inputs=document.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]),textarea,[contenteditable=true],[role=searchbox],[role=combobox]');\
         for(var j=0;j<inputs.length;j++){\
             var el=inputs[j];\
             var es=getComputedStyle(el);\
@@ -1497,20 +1509,30 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             var erc=el.getBoundingClientRect();\
             if(!erc||erc.width<24||erc.height<10||erc.bottom<0||erc.top>vh)continue;\
             var ity=~~(erc.top+Math.max(0,(erc.height-16)/2));\
+            var isFocused=(el===document.activeElement||el===window.__termblitz_active_input);\
+            var rawVal=(typeof el.value==='string')?el.value:(el.isContentEditable?(el.textContent||''):'');\
             var matched=false;\
             for(var k=0;k<items.length;k++){\
                 var it=items[k];\
                 if(it.l>=erc.left-6&&it.l<=erc.right&&it.top>=erc.top-6&&it.top<=erc.bottom){\
                     it.top=ity;\
                     it.inp=1;\
-                    if(el.value&&el.value.trim())it.txt=el.value.trim();\
+                    if(rawVal&&rawVal.trim()){\
+                        it.txt=isFocused?(rawVal+'▏'):rawVal.trim();\
+                    }else if(isFocused){\
+                        it.txt='▏';\
+                    }\
                     matched=true;\
                 }\
             }\
             if(!matched){\
-                var val=(el.value||el.placeholder||el.getAttribute('aria-label')||el.getAttribute('title')||'Search or type...').split(T).join(' ').split(N).join(' ').trim();\
-                if(!val)val='Search or type...';\
-                items.push({txt:val,l:~~(erc.left+8),top:ity,w:~~Math.max(16,erc.width-16),h:18,col:es.color,bold:0,link:0,bg:getBg(el),inp:1,href:''});\
+                var val=(rawVal||el.placeholder||el.getAttribute('aria-label')||el.getAttribute('title')||'Search or type...').split(T).join(' ').split(N).join(' ').trim();\
+                if(isFocused){\
+                    val=rawVal?(rawVal.split(T).join(' ').split(N).join(' ')+'▏'):'▏';\
+                }else if(!val){\
+                    val='Search or type...';\
+                }\
+                items.push({txt:val,l:~~(erc.left+8),top:ity,w:~~Math.max(16,erc.width-16),h:18,col:es.color,bold:isFocused?1:0,link:0,bg:getBg(el),inp:1,href:''});\
             }\
         }\
         for(var m=0;m<items.length;m++){\
@@ -1678,11 +1700,13 @@ fn spawn_cdp_worker(
         let _ = ws.send_text(&sc_cmd);
 
         let mut last_text_extract = Instant::now() - Duration::from_secs(1);
+        let mut last_scroll_instant = Instant::now() - Duration::from_secs(5);
         let mut pending_extract = true;
         let mut active_until = Instant::now() + Duration::from_secs(3);
 
         loop {
             let mut coalesced_scroll_delta: i32 = 0;
+            let mut scroll_pointer: (u16, u16) = (curr_cols / 2, curr_rows / 2);
 
             while let Ok(cmd) = command_rx.try_recv() {
                 match cmd {
@@ -1780,8 +1804,13 @@ fn spawn_cdp_worker(
                         pending_extract = true;
                         active_until = Instant::now() + Duration::from_millis(1000);
                     }
-                    CdpWorkerCommand::Scroll(delta) => {
-                        coalesced_scroll_delta = (coalesced_scroll_delta + delta).clamp(-24, 24);
+                    CdpWorkerCommand::Scroll { delta, col, row } => {
+                        scroll_pointer = (col, row);
+                        if delta.abs() >= 10_000 {
+                            coalesced_scroll_delta = delta;
+                        } else if coalesced_scroll_delta.abs() < 10_000 {
+                            coalesced_scroll_delta = (coalesced_scroll_delta + delta).clamp(-24, 24);
+                        }
                     }
                     CdpWorkerCommand::Click(col, row) => {
                         coalesced_scroll_delta = 0;
@@ -1802,6 +1831,214 @@ fn spawn_cdp_worker(
                         let _ = ws.send_text(&release);
                         pending_extract = true;
                         active_until = Instant::now() + Duration::from_secs(2);
+                    }
+                    CdpWorkerCommand::FocusInput(col, row) => {
+                        coalesced_scroll_delta = 0;
+                        let px_x = (((col as f32 + 0.5) * width_px as f32) / curr_cols.max(1) as f32) as u32;
+                        let px_y = ((((row.saturating_sub(1) as f32) + 0.5) * height_px as f32)
+                            / (curr_rows.saturating_sub(1)).max(1) as f32) as u32;
+                        seq += 1;
+                        let press = format!(
+                            r#"{{"id":{},"method":"Input.dispatchMouseEvent","params":{{"type":"mousePressed","x":{},"y":{},"button":"left","clickCount":1}}}}"#,
+                            seq, px_x, px_y
+                        );
+                        let _ = ws.send_text(&press);
+                        seq += 1;
+                        let release = format!(
+                            r#"{{"id":{},"method":"Input.dispatchMouseEvent","params":{{"type":"mouseReleased","x":{},"y":{},"button":"left","clickCount":1}}}}"#,
+                            seq, px_x, px_y
+                        );
+                        let _ = ws.send_text(&release);
+                        seq += 1;
+                        let focus_js = format!(
+                            "(function(){{\
+                                var el=document.elementFromPoint({0},{1});\
+                                var inp=el?el.closest('input,textarea,[contenteditable=true],[role=searchbox],[role=combobox]'):null;\
+                                if(!inp){{\
+                                    var all=document.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]),textarea,[contenteditable=true],[role=searchbox],[role=combobox]');\
+                                    var best=null,bestD=999999;\
+                                    for(var i=0;i<all.length;i++){{\
+                                        var r=all[i].getBoundingClientRect();\
+                                        if(r.width<16||r.height<8)continue;\
+                                        var cx=r.left+r.width/2,cy=r.top+r.height/2;\
+                                        var d=Math.abs(cx-{0})+Math.abs(cy-{1});\
+                                        if(d<bestD){{bestD=d;best=all[i];}}\
+                                    }}\
+                                    if(bestD<140)inp=best;\
+                                }}\
+                                if(inp){{\
+                                    window.__termblitz_active_input=inp;\
+                                    try{{inp.focus();if(typeof inp.selectionStart==='number'){{var l=(inp.value||'').length;inp.setSelectionRange(l,l);}}}}catch(_e){{}}\
+                                }}\
+                            }})()",
+                            px_x, px_y
+                        );
+                        let eval_cmd = format!(
+                            r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
+                            seq,
+                            json_escape(&focus_js)
+                        );
+                        let _ = ws.send_text(&eval_cmd);
+                        pending_extract = true;
+                        active_until = Instant::now() + Duration::from_secs(2);
+                    }
+                    CdpWorkerCommand::TypeText(text) => {
+                        if !text.is_empty() {
+                            seq += 1;
+                            let refocus_js = "(function(){var a=window.__termblitz_active_input;if(a&&document.activeElement!==a){try{a.focus();}catch(_e){}}})()";
+                            let _ = ws.send_text(&format!(
+                                r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
+                                seq,
+                                json_escape(refocus_js)
+                            ));
+                            seq += 1;
+                            let insert_cmd = format!(
+                                r#"{{"id":{},"method":"Input.insertText","params":{{"text":"{}"}}}}"#,
+                                seq,
+                                json_escape(&text)
+                            );
+                            let _ = ws.send_text(&insert_cmd);
+                            pending_extract = true;
+                            active_until = Instant::now() + Duration::from_millis(1200);
+                        }
+                    }
+                    CdpWorkerCommand::SendKey(page_key) => {
+                        seq += 1;
+                        let refocus_js = "(function(){var a=window.__termblitz_active_input;if(a&&document.activeElement!==a){try{a.focus();}catch(_e){}}})()";
+                        let _ = ws.send_text(&format!(
+                            r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
+                            seq,
+                            json_escape(refocus_js)
+                        ));
+                        match page_key {
+                            PageKey::Backspace => {
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"rawKeyDown","key":"Backspace","code":"Backspace","windowsVirtualKeyCode":8,"nativeVirtualKeyCode":8}}}}"#,
+                                    seq
+                                ));
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"keyUp","key":"Backspace","code":"Backspace","windowsVirtualKeyCode":8,"nativeVirtualKeyCode":8}}}}"#,
+                                    seq
+                                ));
+                            }
+                            PageKey::Delete => {
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"rawKeyDown","key":"Delete","code":"Delete","windowsVirtualKeyCode":46,"nativeVirtualKeyCode":46}}}}"#,
+                                    seq
+                                ));
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"keyUp","key":"Delete","code":"Delete","windowsVirtualKeyCode":46,"nativeVirtualKeyCode":46}}}}"#,
+                                    seq
+                                ));
+                            }
+                            PageKey::Left => {
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"rawKeyDown","key":"ArrowLeft","code":"ArrowLeft","windowsVirtualKeyCode":37,"nativeVirtualKeyCode":37}}}}"#,
+                                    seq
+                                ));
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"keyUp","key":"ArrowLeft","code":"ArrowLeft","windowsVirtualKeyCode":37,"nativeVirtualKeyCode":37}}}}"#,
+                                    seq
+                                ));
+                            }
+                            PageKey::Right => {
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"rawKeyDown","key":"ArrowRight","code":"ArrowRight","windowsVirtualKeyCode":39,"nativeVirtualKeyCode":39}}}}"#,
+                                    seq
+                                ));
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"keyUp","key":"ArrowRight","code":"ArrowRight","windowsVirtualKeyCode":39,"nativeVirtualKeyCode":39}}}}"#,
+                                    seq
+                                ));
+                            }
+                            PageKey::Home => {
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"rawKeyDown","key":"Home","code":"Home","windowsVirtualKeyCode":36,"nativeVirtualKeyCode":36}}}}"#,
+                                    seq
+                                ));
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"keyUp","key":"Home","code":"Home","windowsVirtualKeyCode":36,"nativeVirtualKeyCode":36}}}}"#,
+                                    seq
+                                ));
+                            }
+                            PageKey::End => {
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"rawKeyDown","key":"End","code":"End","windowsVirtualKeyCode":35,"nativeVirtualKeyCode":35}}}}"#,
+                                    seq
+                                ));
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"keyUp","key":"End","code":"End","windowsVirtualKeyCode":35,"nativeVirtualKeyCode":35}}}}"#,
+                                    seq
+                                ));
+                            }
+                            PageKey::Tab => {
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"rawKeyDown","key":"Tab","code":"Tab","windowsVirtualKeyCode":9,"nativeVirtualKeyCode":9}}}}"#,
+                                    seq
+                                ));
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"keyUp","key":"Tab","code":"Tab","windowsVirtualKeyCode":9,"nativeVirtualKeyCode":9}}}}"#,
+                                    seq
+                                ));
+                            }
+                            PageKey::Enter => {
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"rawKeyDown","key":"Enter","code":"Enter","text":"\r","unmodifiedText":"\r","windowsVirtualKeyCode":13,"nativeVirtualKeyCode":13}}}}"#,
+                                    seq
+                                ));
+                                seq += 1;
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Input.dispatchKeyEvent","params":{{"type":"keyUp","key":"Enter","code":"Enter","windowsVirtualKeyCode":13,"nativeVirtualKeyCode":13}}}}"#,
+                                    seq
+                                ));
+                                seq += 1;
+                                let submit_js = "(function(){\
+                                    var a=document.activeElement||window.__termblitz_active_input;\
+                                    if(!a)return;\
+                                    try{\
+                                        var evOpts={key:'Enter',code:'Enter',keyCode:13,which:13,bubbles:true,cancelable:true};\
+                                        a.dispatchEvent(new KeyboardEvent('keydown',evOpts));\
+                                        a.dispatchEvent(new KeyboardEvent('keypress',evOpts));\
+                                        a.dispatchEvent(new KeyboardEvent('keyup',evOpts));\
+                                        var f=a.form||a.closest('form');\
+                                        if(f){if(typeof f.requestSubmit==='function')f.requestSubmit();else f.submit();}\
+                                    }catch(_e){}\
+                                    window.__termblitz_active_input=null;\
+                                })()";
+                                let _ = ws.send_text(&format!(
+                                    r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
+                                    seq,
+                                    json_escape(submit_js)
+                                ));
+                            }
+                        }
+                        pending_extract = true;
+                        active_until = Instant::now() + Duration::from_secs(2);
+                    }
+                    CdpWorkerCommand::BlurInput => {
+                        seq += 1;
+                        let blur_js = "(function(){if(window.__termblitz_active_input){try{window.__termblitz_active_input.blur();}catch(_e){}window.__termblitz_active_input=null;}if(document.activeElement&&document.activeElement!==document.body){try{document.activeElement.blur();}catch(_e){}}})()";
+                        let _ = ws.send_text(&format!(
+                            r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
+                            seq,
+                            json_escape(blur_js)
+                        ));
+                        pending_extract = true;
                     }
                     CdpWorkerCommand::SetZoom(new_zoom) => {
                         curr_zoom = new_zoom.clamp(0.5, 3.0);
@@ -1855,11 +2092,78 @@ fn spawn_cdp_worker(
             }
 
             if coalesced_scroll_delta != 0 {
-                let pixel_delta = coalesced_scroll_delta * 72;
+                let step_px = ((height_px as i32) / 9).clamp(48, 96);
+                let pixel_delta = if coalesced_scroll_delta.abs() >= 10_000 {
+                    coalesced_scroll_delta.signum() * 100_000
+                } else {
+                    coalesced_scroll_delta * step_px
+                };
+                let (sc_col, sc_row) = scroll_pointer;
+                let px_x = (((sc_col.min(curr_cols.saturating_sub(1)) as f32 + 0.5) * width_px as f32)
+                    / curr_cols.max(1) as f32)
+                    .round()
+                    .clamp(1.0, (width_px.saturating_sub(2)).max(1) as f32) as i32;
+                let px_y = ((((sc_row.max(1).saturating_sub(1) as f32) + 0.5) * height_px as f32)
+                    / (curr_rows.saturating_sub(1)).max(1) as f32)
+                    .round()
+                    .clamp(1.0, (height_px.saturating_sub(2)).max(1) as f32) as i32;
+
+                // 1. Dispatch native CDP mouseWheel event so web apps with custom wheel listeners respond
+                seq += 1;
+                let wheel_cmd = format!(
+                    r#"{{"id":{},"method":"Input.dispatchMouseEvent","params":{{"type":"mouseWheel","x":{},"y":{},"deltaX":0,"deltaY":{}}}}}"#,
+                    seq,
+                    px_x,
+                    pixel_delta.clamp(-2400, 2400)
+                );
+                let _ = ws.send_text(&wheel_cmd);
+
+                // 2. Adaptive DOM container discovery & immediate instant scroll
                 seq += 1;
                 let scroll_js = format!(
-                    "(function(){{window.scrollBy({{top:{0},left:0,behavior:'instant'}});if(document.scrollingElement){{document.scrollingElement.scrollTop+={0};}}}})()",
-                    pixel_delta
+                    "(function(){{\
+                        var dy={0},x={1},y={2};\
+                        function canScroll(el,dir){{\
+                            if(!el||el===document.documentElement||el===document.body)return false;\
+                            var s=getComputedStyle(el);\
+                            var ov=s.overflowY;\
+                            if(ov!=='auto'&&ov!=='scroll'&&ov!=='overlay')return false;\
+                            if(el.scrollHeight<=el.clientHeight+4)return false;\
+                            return dir>0?(el.scrollTop+el.clientHeight<el.scrollHeight-1):(el.scrollTop>0);\
+                        }}\
+                        var target=null;\
+                        var cur=document.elementFromPoint(x,y);\
+                        while(cur&&cur!==document.body&&cur!==document.documentElement){{\
+                            if(canScroll(cur,dy)){{target=cur;break;}}\
+                            cur=cur.parentElement;\
+                        }}\
+                        if(!target&&window.__termblitz_scroll_el&&canScroll(window.__termblitz_scroll_el,dy)){{\
+                            target=window.__termblitz_scroll_el;\
+                        }}\
+                        if(!target){{\
+                            var cands=document.querySelectorAll('main,[role=main],ytm-app,ytd-app,div,section');\
+                            var best=null,bestArea=0;\
+                            for(var i=0;i<cands.length&&i<120;i++){{\
+                                var c=cands[i];\
+                                if(c.clientWidth>160&&c.clientHeight>160&&canScroll(c,dy)){{\
+                                    var area=c.clientWidth*c.clientHeight;\
+                                    if(area>bestArea){{bestArea=area;best=c;}}\
+                                }}\
+                            }}\
+                            target=best;\
+                        }}\
+                        if(target){{\
+                            window.__termblitz_scroll_el=target;\
+                            var before=target.scrollTop;\
+                            target.scrollTop+=dy;\
+                            if(target.scrollTop!==before)return;\
+                        }}\
+                        var root=document.scrollingElement||document.documentElement||document.body;\
+                        window.__termblitz_scroll_el=root;\
+                        window.scrollBy({{top:dy,left:0,behavior:'instant'}});\
+                        if(root)root.scrollTop+=dy;\
+                    }})()",
+                    pixel_delta, px_x, px_y
                 );
                 let scroll_cmd = format!(
                     r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
@@ -1867,9 +2171,12 @@ fn spawn_cdp_worker(
                     json_escape(&scroll_js)
                 );
                 let _ = ws.send_text(&scroll_cmd);
+                last_scroll_instant = Instant::now();
                 pending_extract = true;
                 active_until = Instant::now() + Duration::from_millis(450);
             }
+
+            let mut latest_screencast_b64: Option<String> = None;
 
             while let Some(msg) = ws.poll_message() {
                 if msg.contains(r#""Page.loadEventFired""#) || msg.contains(r#""Page.frameNavigated""#) {
@@ -1985,22 +2292,12 @@ fn spawn_cdp_worker(
                         if let Some(q1) = rest.find('"') {
                             let after = &rest[q1 + 1..];
                             if let Some(q2) = after.find('"') {
-                                let b64 = &after[..q2];
-                                let jpeg_bytes = base64_decode(b64);
-                                if let Ok(img) = image::load_from_memory(&jpeg_bytes) {
-                                    let new_buf = PixelBuffer::from_image(&img);
-                                    *shared_buf.lock().unwrap() = new_buf;
-                                    let c = frame_counter.fetch_add(1, Ordering::Relaxed);
-                                    if c >= 1 {
-                                        is_loading.store(false, Ordering::Relaxed);
-                                    }
-                                    pending_extract = true;
-                                }
+                                latest_screencast_b64 = Some(after[..q2].to_string());
                             }
                         }
                     }
 
-                    // Always acknowledge frame immediately
+                    // Always acknowledge frame immediately so Chromium never stalls
                     seq += 1;
                     let ack = format!(
                         r#"{{"id":{},"method":"Page.screencastFrameAck","params":{{"sessionId":{}}}}}"#,
@@ -2010,19 +2307,30 @@ fn spawn_cdp_worker(
                 }
             }
 
-            // Throttled real-time DOM text & coordinate extraction during active updates
+            // Decode only the newest screencast frame in this batch, eliminating stale frame backlog lag
+            if let Some(b64) = latest_screencast_b64 {
+                let jpeg_bytes = base64_decode(&b64);
+                if let Ok(img) = image::load_from_memory(&jpeg_bytes) {
+                    let new_buf = PixelBuffer::from_image(&img);
+                    *shared_buf.lock().unwrap() = new_buf;
+                    let c = frame_counter.fetch_add(1, Ordering::Relaxed);
+                    if c >= 1 {
+                        is_loading.store(false, Ordering::Relaxed);
+                    }
+                    pending_extract = true;
+                }
+            }
+
+            // Throttled real-time DOM text & coordinate extraction
             let now = Instant::now();
+            let extract_interval = if last_scroll_instant.elapsed() < Duration::from_millis(150) {
+                Duration::from_millis(140)
+            } else {
+                Duration::from_millis(90)
+            };
             if (pending_extract || now < active_until)
-                && last_text_extract.elapsed() >= Duration::from_millis(90)
+                && last_text_extract.elapsed() >= extract_interval
             {
-                let setup_js = build_page_style_js(curr_hide_text, curr_adblock, curr_muted);
-                seq += 1;
-                let eval_cmd = format!(
-                    r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}"}}}}"#,
-                    seq,
-                    json_escape(&setup_js)
-                );
-                let _ = ws.send_text(&eval_cmd);
                 request_text_extraction(&mut ws, &mut seq);
                 last_text_extract = now;
                 pending_extract = false;
@@ -2503,14 +2811,42 @@ impl CdpEngine {
     }
 
     pub fn scroll(&mut self, delta: i32) {
+        self.scroll_at(delta, self.cols / 2, self.rows / 2);
+    }
+
+    pub fn scroll_at(&mut self, delta: i32, col: u16, row: u16) {
         if let Some(ref tx) = self.command_tx {
-            let _ = tx.send(CdpWorkerCommand::Scroll(delta));
+            let _ = tx.send(CdpWorkerCommand::Scroll { delta, col, row });
         }
     }
 
     pub fn click(&mut self, col: u16, row: u16) {
         if let Some(ref tx) = self.command_tx {
             let _ = tx.send(CdpWorkerCommand::Click(col, row));
+        }
+    }
+
+    pub fn focus_input(&mut self, col: u16, row: u16) {
+        if let Some(ref tx) = self.command_tx {
+            let _ = tx.send(CdpWorkerCommand::FocusInput(col, row));
+        }
+    }
+
+    pub fn type_text(&mut self, text: &str) {
+        if let Some(ref tx) = self.command_tx {
+            let _ = tx.send(CdpWorkerCommand::TypeText(text.to_string()));
+        }
+    }
+
+    pub fn send_page_key(&mut self, key: PageKey) {
+        if let Some(ref tx) = self.command_tx {
+            let _ = tx.send(CdpWorkerCommand::SendKey(key));
+        }
+    }
+
+    pub fn blur_input(&mut self) {
+        if let Some(ref tx) = self.command_tx {
+            let _ = tx.send(CdpWorkerCommand::BlurInput);
         }
     }
 
@@ -2524,6 +2860,11 @@ impl CdpEngine {
 
     pub fn get_frame(&self) -> PixelBuffer {
         self.frame_buffer.lock().unwrap().clone()
+    }
+
+    pub fn get_frame_dims(&self) -> (usize, usize) {
+        let guard = self.frame_buffer.lock().unwrap();
+        (guard.width, guard.height)
     }
 
     pub fn clear_error(&self) {
