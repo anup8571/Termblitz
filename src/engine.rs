@@ -2114,6 +2114,7 @@ fn spawn_cdp_worker(
                     r#"{{"id":{},"method":"Input.dispatchMouseEvent","params":{{"type":"mouseWheel","x":{},"y":{},"deltaX":0,"deltaY":{}}}}}"#,
                     seq,
                     px_x,
+                    px_y,
                     pixel_delta.clamp(-2400, 2400)
                 );
                 let _ = ws.send_text(&wheel_cmd);

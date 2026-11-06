@@ -2,8 +2,7 @@
 #[allow(unused_imports)]
 use std::io::{self, Write};
 use crate::upscale::{
-    apply_terminal_subpixel_rcas, apply_upscale_pipeline, apply_upscale_pipeline_ex,
-    detect_pixel_art, UpscaleMode,
+    apply_terminal_subpixel_rcas, apply_upscale_pipeline_ex, detect_pixel_art, UpscaleMode,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
