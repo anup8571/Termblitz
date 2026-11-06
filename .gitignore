@@ -2,6 +2,7 @@
 /logs
 *.log
 *.tmp
+Cargo.lock
 package.json
 vite.config.ts
 tsconfig.json
