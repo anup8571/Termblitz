@@ -1,6 +1,4 @@
-/src/*.tsx
-/src/*.css
-package.json
-vite.config.ts
-tsconfig.json
-index.html
+/target
+/logs
+node_modules
+dist

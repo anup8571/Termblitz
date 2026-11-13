@@ -1,0 +1,50 @@
+name: 2-Way Sync Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    name: Sync repositories
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Determine Target Repository
+        id: target
+        run: |
+          if [ "${{ github.repository }}" = "anup8571/Termblitz" ]; then
+            echo "repo=anup8571/Termblitzv2" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.repository }}" = "anup8571/Termblitzv2" ]; then
+            echo "repo=anup8571/Termblitz" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unknown repository: ${{ github.repository }}"
+            exit 1
+          fi
+
+      - name: Sync to Target Repository
+        run: |
+          TARGET_REPO="${{ steps.target.outputs.repo }}"
+          echo "Source Repository: ${{ github.repository }}"
+          echo "Target Repository: $TARGET_REPO"
+
+          LOCAL_SHA=$(git rev-parse HEAD)
+          REMOTE_SHA=$(git ls-remote "https://x-access-token:${{ secrets.SYNC_PAT }}@github.com/${TARGET_REPO}.git" refs/heads/main | awk '{print $1}')
+
+          echo "Local SHA:  $LOCAL_SHA"
+          echo "Remote SHA: $REMOTE_SHA"
+
+          if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
+            echo "Both repositories are already at identical commit $LOCAL_SHA. No sync needed."
+            exit 0
+          fi
+
+          echo "Synchronizing $TARGET_REPO main branch to $LOCAL_SHA..."
+          git push "https://x-access-token:${{ secrets.SYNC_PAT }}@github.com/${TARGET_REPO}.git" main:main --force
+          echo "Sync completed successfully!"

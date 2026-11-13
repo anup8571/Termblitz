@@ -2,12 +2,8 @@
 /logs
 *.log
 *.tmp
-Cargo.lock
-package.json
-vite.config.ts
-tsconfig.json
+node_modules
+dist
+.env
+.env.local
 tsconfig.tsbuildinfo
-index.html
-bun.lock
-/src/*.tsx
-/src/*.css
