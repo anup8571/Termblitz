@@ -2568,7 +2568,7 @@ fn eval_fsrcnn_espcn_canonical_patch(patch: &[f32; 9]) -> [i8; 4] {
 
     // Layer 4: ESPCN Sub-Pixel Convolution -> [TL, TR, BL, BR] residual deltas in [-64..=63]
     // Preserves sharp inter-pixel step edges while adding high-frequency unsharp micro-contrast.
-    let hp_anchor = l3_out[0] - y0;
+    let unsharp_hp = y0 - l1_out[0];
     let mut deltas = [0i8; 4];
     for sub_ch in 0..4 {
         let wk = &L4_WEIGHTS[sub_ch];
@@ -2577,11 +2577,11 @@ fn eval_fsrcnn_espcn_canonical_patch(patch: &[f32; 9]) -> [i8; 4] {
             spatial_y += patch[k] * wk[k][0];
         }
         let wc = &wk[4];
-        let detail = hp_anchor * wc[0]
+        let detail = unsharp_hp * wc[0]
             + l3_out[1] * wc[1]
             + l3_out[2] * wc[2]
             + l3_out[3] * wc[3];
-        let residual = (hp_anchor * 1.35 + (spatial_y - y0) * 0.20 + detail * 0.85) * 255.0;
+        let residual = (unsharp_hp * 1.80 - (spatial_y - y0) * 0.25 + detail * 0.35) * 255.0;
         deltas[sub_ch] = (residual.round() as i32).clamp(-64, 63) as i8;
     }
     deltas
