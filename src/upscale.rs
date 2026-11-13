@@ -2567,7 +2567,7 @@ fn eval_fsrcnn_espcn_canonical_patch(patch: &[f32; 9]) -> [i8; 4] {
     }
 
     // Layer 4: ESPCN Sub-Pixel Convolution -> [TL, TR, BL, BR] residual deltas in [-64..=63]
-    // Scaled by 2.0 so the cooperative average `(ds + dd) >> 1` preserves full neural edge contrast.
+    // Preserves sharp inter-pixel step edges while adding high-frequency unsharp micro-contrast.
     let hp_anchor = l3_out[0] - y0;
     let mut deltas = [0i8; 4];
     for sub_ch in 0..4 {
@@ -2581,7 +2581,7 @@ fn eval_fsrcnn_espcn_canonical_patch(patch: &[f32; 9]) -> [i8; 4] {
             + l3_out[1] * wc[1]
             + l3_out[2] * wc[2]
             + l3_out[3] * wc[3];
-        let residual = ((spatial_y - y0) * 0.45 + detail * 2.2) * 255.0 * 2.0;
+        let residual = (hp_anchor * 1.35 + (spatial_y - y0) * 0.20 + detail * 0.85) * 255.0;
         deltas[sub_ch] = (residual.round() as i32).clamp(-64, 63) as i8;
     }
     deltas
@@ -2649,25 +2649,21 @@ impl MuLutTables {
                         }
 
                         // Canonical 3x3 patch for lut_s: (I(x,y)=y0, I(x+1,y)=y1, I(x,y+1)=y2, I(x+1,y+1)=y3)
-                        // Extrapolates left/top symmetrically around center y0 so Laplacian high-pass is balanced:
-                        let left_s = (2.0 * y0 - y1).clamp(0.0, 1.0);
-                        let top_s = (2.0 * y0 - y2).clamp(0.0, 1.0);
-                        let tl_s = (2.0 * y0 - y3).clamp(0.0, 1.0);
+                        // Clamping left/top to y0 preserves non-zero Laplacian 2nd derivative on step edges:
                         let patch_s = [
-                            tl_s,   top_s, y1,
-                            left_s, y0,    y1,
-                            y2,     y2,    y3,
+                            y0, y0, y1,
+                            y0, y0, y1,
+                            y2, y2, y3,
                         ];
                         lut_s[idx] = eval_fsrcnn_espcn_canonical_patch(&patch_s);
 
                         // Canonical 3x3 patch for lut_d: (I(x,y)=y0, I(x+1,y+1)=y1, I(x+1,y-1)=y2, I(x-1,y+1)=y3)
-                        let tl_d = (2.0 * y0 - y1).clamp(0.0, 1.0);
                         let top_d = 0.5 * (y0 + y2);
                         let right_d = 0.5 * (y1 + y2);
                         let bot_d = 0.5 * (y1 + y3);
                         let left_d = 0.5 * (y0 + y3);
                         let patch_d = [
-                            tl_d,   top_d, y2,
+                            y0,     top_d, y2,
                             left_d, y0,    right_d,
                             y3,     bot_d, y1,
                         ];
@@ -3159,10 +3155,7 @@ mod tests {
             let y1 = (v1 as f32) * INV_255;
             let y2 = (v2 as f32) * INV_255;
             let y3 = (v3 as f32) * INV_255;
-            let left_s = (2.0 * y0 - y1).clamp(0.0, 1.0);
-            let top_s = (2.0 * y0 - y2).clamp(0.0, 1.0);
-            let tl_s = (2.0 * y0 - y3).clamp(0.0, 1.0);
-            let patch_s = [tl_s, top_s, y1, left_s, y0, y1, y2, y2, y3];
+            let patch_s = [y0, y0, y1, y0, y0, y1, y2, y2, y3];
             let ref_deltas = eval_fsrcnn_espcn_canonical_patch(&patch_s);
             let lut_deltas = interp_4d_simplex(&tables.lut_s, v0, v1, v2, v3);
             for sp in 0..4 {
