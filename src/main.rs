@@ -17,7 +17,10 @@ use crossterm::{
 
 use engine::{CdpEngine, NativeEngine, RenderMode};
 use input::{resolve_input_to_url, AppAction, InputHandler};
-use renderer::{display_width, has_complex_script, is_combining_char, Color, DiffRenderer, GraphicsProtocol, PixelBuffer};
+use renderer::{
+    display_width, has_complex_script, is_combining_char, Color, DiffRenderer, GraphicsProtocol,
+    PixelBuffer, SubCellMode,
+};
 use upscale::UpscaleMode;
 
 struct TerminalGuard;
@@ -150,8 +153,11 @@ fn print_help() {
     println!("  --sixel                      Force Sixel graphics protocol");
     println!("  --kitty                      Force Kitty graphics protocol");
     println!("  --ansi                       Force Half-Block TrueColor ANSI protocol");
-    println!("  --no-dither                  Disable 4x4 Bayer + Floyd-Steinberg dithering");
-    println!("  --upscale=<MODE>             Set Super-Resolution mode (off, fsr, rcas, photo, srmax)");
+    println!("  --sextant                    Enable Unicode 13.0 2x3 Sextant sub-cell blitter (6x density, ANSI-6X)");
+    println!("  --quadrant                   Enable Unicode 2x2 Quadrant sub-cell blitter (4x density, ANSI-4X)");
+    println!("  --auto-sextant               Enable Hybrid Auto-ROI 2x3 Sextant sub-cell blitter (ANSI-6X inside ROIs)");
+    println!("  --no-dither                  Disable 8x8 Blue Noise + Floyd-Steinberg dithering");
+    println!("  --upscale=<MODE>             Set Super-Resolution mode (off, fsr, neural, combined, multipass)");
     println!("  --pixel-art                  Enable forced Scale2x pixel-art super-resolution");
     println!("  -h, --help                   Show this help message");
 }
@@ -393,6 +399,15 @@ fn main() -> io::Result<()> {
     let start_in_native = args.iter().any(|a| a == "--native");
     let no_dither = args.iter().any(|a| a == "--no-dither" || a == "--no-dithering");
     let start_pixel_art = args.iter().any(|a| a == "--pixel-art");
+    let mut initial_subcell_mode = if args.iter().any(|a| a == "--sextant" || a == "--2x3") {
+        SubCellMode::Sextant2x3
+    } else if args.iter().any(|a| a == "--quadrant" || a == "--2x2") {
+        SubCellMode::Quadrant2x2
+    } else if args.iter().any(|a| a == "--auto-sextant" || a == "--roi-sextant") {
+        SubCellMode::AutoRoiSextant
+    } else {
+        SubCellMode::HalfBlock1x2
+    };
 
     let mut initial_upscale_mode = UpscaleMode::FsrOnly;
     let mut arg_iter = args.iter().skip(1).peekable();
@@ -406,6 +421,10 @@ fn main() -> io::Result<()> {
                 if let Some(parsed) = UpscaleMode::from_cli_value(next_val) {
                     initial_upscale_mode = parsed;
                 }
+            }
+        } else if let Some(val) = arg.strip_prefix("--subcell=") {
+            if let Some(parsed) = SubCellMode::from_cli_value(val) {
+                initial_subcell_mode = parsed;
             }
         }
     }
@@ -422,6 +441,7 @@ fn main() -> io::Result<()> {
     renderer.upscale_mode = initial_upscale_mode;
     renderer.dithering_enabled = !no_dither;
     renderer.pixel_art_mode = start_pixel_art;
+    renderer.subcell_mode = initial_subcell_mode;
 
     if enable_kitty {
         renderer.protocol = GraphicsProtocol::Kitty;
@@ -603,7 +623,7 @@ fn main() -> io::Result<()> {
                     format!(
                         "🎨 Dithering [d]: {}",
                         if next_dither {
-                            "ON (4x4 Bayer + Serpentine Floyd-Steinberg)"
+                            "ON (8x8 Blue Noise + Serpentine Floyd-Steinberg)"
                         } else {
                             "OFF"
                         }
@@ -620,6 +640,18 @@ fn main() -> io::Result<()> {
                     } else {
                         "👾 Pixel-Art Scale2x Mode [p]: AUTO (Content-Aware)".to_string()
                     },
+                    Instant::now() + Duration::from_secs(2),
+                ));
+            }
+            AppAction::CycleSubCell => {
+                renderer.subcell_mode = renderer.subcell_mode.next();
+                renderer.force_redraw();
+                status_banner = Some((
+                    format!(
+                        "🔲 Sub-Cell Blitter [s]: {} [{}]",
+                        renderer.subcell_mode.name(),
+                        renderer.protocol_badge()
+                    ),
                     Instant::now() + Duration::from_secs(2),
                 ));
             }
@@ -908,6 +940,8 @@ fn main() -> io::Result<()> {
                         renderer.invalidate_frame_cache();
                     }
                     renderer.scroll_fast_path = in_kinetic_motion;
+                    let scroll_delta_px = cdp_engine.get_pending_scroll_px();
+                    renderer.pending_scroll_px = scroll_delta_px;
 
                     if count == 0 || (is_loading && count < 2) {
                         let msg = " 🌐 Connecting & Loading Visual Web Page... ⏳ ";
@@ -930,7 +964,6 @@ fn main() -> io::Result<()> {
                         if mode == RenderMode::CdpHybrid {
                             let mut overlays = cdp_engine.get_text_overlays();
                             let rect_masks = cdp_engine.get_rect_masks();
-                            let scroll_delta_px = cdp_engine.get_pending_scroll_px();
                             // Prioritize inputs first, then sticky/fixed headers, then bold/navigation/link elements,
                             // then body text so sticky headers, footers, and search boxes claim their terminal cells first
                             // and scrolled body text can never overwrite or merge into them.
@@ -1196,7 +1229,7 @@ fn main() -> io::Result<()> {
                     mute_sep,
                     audio_icon,
                     shield_tag,
-                    renderer.protocol.short_name(),
+                    renderer.protocol_badge(),
                     mem,
                     fps_display,
                     scroll_pct

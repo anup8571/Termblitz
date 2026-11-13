@@ -12,6 +12,9 @@
 //!   4. ESPCN Sub-Pixel:    3x3 Conv (4 -> 4 channels) + 2x PixelShuffle (`pixel_shuffle_2x`)
 
 use crate::renderer::{Color, PixelBuffer};
+pub use crate::renderer::{
+    srgb_to_oklab_int, CBRT_U16_LUT, LINEAR_TO_SRGB_U8, SRGB_TO_LINEAR_U16,
+};
 
 /// Pre-baked Layer 1 (Feature Extraction): 3x3 Conv, 1 input channel -> 8 output channels.
 /// Layout: `L1_WEIGHTS[out_ch][ky * 3 + kx]`.
@@ -291,6 +294,89 @@ pub fn bt601_ycbcr_to_rgb_fixed(y: u8, cb: u8, cr: u8) -> Color {
     let g = (y_i - ((88 * cb_i + 183 * cr_i + 128) >> 8)).clamp(0, 255) as u8;
     let b = (y_i + ((454 * cb_i + 128) >> 8)).clamp(0, 255) as u8;
     Color::new(r, g, b)
+}
+
+/// Splits a `PixelBuffer` into three 8-bit `Y`, `Cb`, `Cr` planes (`Vec<u8>`).
+/// On `aarch64` (Android Termux / Apple Silicon / ARM64 Linux), uses hardware NEON intrinsics
+/// (`vld3_u8`, `vmull_u8`, `vmlal_u8`, `vshrn_n_u16`, `vst1_u8`) to deinterleave 8 RGB pixels
+/// per iteration in parallel. On `x86_64` and other targets, uses the matching scalar fixed-point loop.
+pub fn rgb_to_ycbcr_u8_planes(
+    buf: &PixelBuffer,
+    y_out: &mut Vec<u8>,
+    cb_out: &mut Vec<u8>,
+    cr_out: &mut Vec<u8>,
+) {
+    let len = (buf.width * buf.height).min(buf.data.len());
+    y_out.clear();
+    cb_out.clear();
+    cr_out.clear();
+    y_out.resize(len, 0);
+    cb_out.resize(len, 128);
+    cr_out.resize(len, 128);
+
+    let mut i = 0usize;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        // Color is #[repr(C)] or 3-byte (r, g, b) struct; verify size_of::<Color>() == 3 for direct vld3_u8
+        if core::mem::size_of::<Color>() == 3 {
+            let ptr_base = buf.data.as_ptr() as *const u8;
+            let w_yr = vdup_n_u8(77);
+            let w_yg = vdup_n_u8(150);
+            let w_yb = vdup_n_u8(29);
+
+            let w_cbr = vdup_n_u8(43);
+            let w_cbg = vdup_n_u8(85);
+            let w_cbb = vdup_n_u8(128);
+
+            let w_crr = vdup_n_u8(128);
+            let w_crg = vdup_n_u8(107);
+            let w_crb = vdup_n_u8(21);
+
+            let bias_128_q8 = vdupq_n_u16(128 << 8);
+
+            while i + 8 <= len {
+                let rgb = vld3_u8(ptr_base.add(i * 3));
+                let r = rgb.0;
+                let g = rgb.1;
+                let b = rgb.2;
+
+                // Y = (77*R + 150*G + 29*B) >> 8
+                let mut y_acc = vmull_u8(r, w_yr);
+                y_acc = vmlal_u8(y_acc, g, w_yg);
+                y_acc = vmlal_u8(y_acc, b, w_yb);
+                let y_u8 = vshrn_n_u16::<8>(y_acc);
+                vst1_u8(y_out.as_mut_ptr().add(i), y_u8);
+
+                // Cb = ((128<<8) + 128*B - 43*R - 85*G) >> 8
+                let cb_pos = vmlal_u8(bias_128_q8, b, w_cbb);
+                let mut cb_neg = vmull_u8(r, w_cbr);
+                cb_neg = vmlal_u8(cb_neg, g, w_cbg);
+                let cb_u16 = vsubq_u16(cb_pos, cb_neg);
+                let cb_u8 = vshrn_n_u16::<8>(cb_u16);
+                vst1_u8(cb_out.as_mut_ptr().add(i), cb_u8);
+
+                // Cr = ((128<<8) + 128*R - 107*G - 21*B) >> 8
+                let cr_pos = vmlal_u8(bias_128_q8, r, w_crr);
+                let mut cr_neg = vmull_u8(g, w_crg);
+                cr_neg = vmlal_u8(cr_neg, b, w_crb);
+                let cr_u16 = vsubq_u16(cr_pos, cr_neg);
+                let cr_u8 = vshrn_n_u16::<8>(cr_u16);
+                vst1_u8(cr_out.as_mut_ptr().add(i), cr_u8);
+
+                i += 8;
+            }
+        }
+    }
+
+    while i < len {
+        let (y, cb, cr) = bt601_rgb_to_ycbcr_fixed(buf.data[i]);
+        y_out[i] = y;
+        cb_out[i] = cb;
+        cr_out[i] = cr;
+        i += 1;
+    }
 }
 
 /// Splits a `PixelBuffer` into three pre-allocated `Vec<f32>` planes (`y_plane`, `cb_plane`, `cr_plane`)
@@ -2202,6 +2288,270 @@ pub fn apply_video_box_fast_rcas(subpixel_buf: &PixelBuffer) -> PixelBuffer {
     fsr_rcas(subpixel_buf, 0.82)
 }
 
+/// Precomputed 4D Simplex sorting and cumulative stride entry for branchless `MuLUT` interpolation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimplexEntry {
+    /// Sorted dimension permutation (`0..4` where `order[0]` has the largest fractional weight)
+    pub order: [u8; 4],
+    /// Cumulative 4D vertex strides in the `17x17x17x17` table (`[4913, 289, 17, 1]`)
+    pub v_strides: [u16; 4],
+}
+
+/// Stride along each of the 4 axes in a `17x17x17x17` (`83,521`-entry) 4D LUT:
+/// `[17^3, 17^2, 17^1, 17^0] = [4913, 289, 17, 1]`.
+pub const MULUT_DIM_STRIDES: [u16; 4] = [4913, 289, 17, 1];
+
+/// Total number of vertices in a 4D `17x17x17x17` MuLUT table (`17^4 = 83,521`).
+pub const MULUT_TABLE_LEN: usize = 17 * 17 * 17 * 17;
+
+const fn build_simplex_lut() -> [SimplexEntry; 64] {
+    let mut table = [SimplexEntry {
+        order: [0, 1, 2, 3],
+        v_strides: [4913, 5202, 5219, 5220],
+    }; 64];
+
+    let mut mask = 0usize;
+    while mask < 64 {
+        let b0 = (mask & 1) != 0;
+        let b1 = (mask & 2) != 0;
+        let b2 = (mask & 4) != 0;
+        let b3 = (mask & 8) != 0;
+        let b4 = (mask & 16) != 0;
+        let b5 = (mask & 32) != 0;
+
+        let dom0 = (b0 as usize) + (b1 as usize) + (b2 as usize);
+        let dom1 = ((!b0) as usize) + (b3 as usize) + (b4 as usize);
+        let dom2 = ((!b1) as usize) + ((!b3) as usize) + (b5 as usize);
+        let dom3 = ((!b2) as usize) + ((!b4) as usize) + ((!b5) as usize);
+
+        let r0 = 3 - dom0;
+        let r1 = 3 - dom1;
+        let r2 = 3 - dom2;
+        let r3 = 3 - dom3;
+
+        // Verify valid permutation (all 4 ranks distinct); unreachable masks fall back to [0, 1, 2, 3]
+        let valid = (1u8 << r0) | (1u8 << r1) | (1u8 << r2) | (1u8 << r3) == 0b1111;
+        if valid {
+            let mut order = [0u8; 4];
+            order[r0] = 0;
+            order[r1] = 1;
+            order[r2] = 2;
+            order[r3] = 3;
+
+            let s0 = MULUT_DIM_STRIDES[order[0] as usize];
+            let s1 = s0 + MULUT_DIM_STRIDES[order[1] as usize];
+            let s2 = s1 + MULUT_DIM_STRIDES[order[2] as usize];
+            let s3 = s2 + MULUT_DIM_STRIDES[order[3] as usize];
+
+            table[mask] = SimplexEntry {
+                order,
+                v_strides: [s0, s1, s2, s3],
+            };
+        }
+        mask += 1;
+    }
+    table
+}
+
+/// 64-entry branchless 4D Simplex lookup table mapping the 6-bit pairwise comparison mask `cmp_mask`
+/// to sorted dimension indices and cumulative `17x17x17x17` vertex strides.
+pub const SIMPLEX_LUT: [SimplexEntry; 64] = build_simplex_lut();
+
+/// Branchless 4D Simplex interpolation over a `17x17x17x17` (`83,521`-entry) table of `[i8; 4]` deltas:
+/// - Quantizes `(y0, y1, y2, y3)` into high nibbles (`0..=16`) and 4-bit fractional weights (`0..=15`, or `0` at `255`).
+/// - Builds a 6-bit comparison index `cmp_mask` without any `if/else` sorting branches.
+/// - Uses `SIMPLEX_LUT[cmp_mask]` to gather the 5 simplex vertices and interpolate `[i32; 4]` subpixel deltas.
+#[inline(always)]
+pub fn interp_4d_simplex(
+    lut: &[[i8; 4]; MULUT_TABLE_LEN],
+    y0: u8,
+    y1: u8,
+    y2: u8,
+    y3: u8,
+) -> [i32; 4] {
+    // Map 0..=255 into 16 intervals of width 16 (at 255, q=15, f=15; or exact grid knots at multiples of 16)
+    let q0 = (y0 >> 4) as usize;
+    let q1 = (y1 >> 4) as usize;
+    let q2 = (y2 >> 4) as usize;
+    let q3 = (y3 >> 4) as usize;
+
+    let f = [
+        (y0 & 0x0F) as i32,
+        (y1 & 0x0F) as i32,
+        (y2 & 0x0F) as i32,
+        (y3 & 0x0F) as i32,
+    ];
+
+    let base_idx = q0 * 4913 + q1 * 289 + q2 * 17 + q3;
+
+    let cmp_mask = ((f[0] >= f[1]) as usize)
+        | (((f[0] >= f[2]) as usize) << 1)
+        | (((f[0] >= f[3]) as usize) << 2)
+        | (((f[1] >= f[2]) as usize) << 3)
+        | (((f[1] >= f[3]) as usize) << 4)
+        | (((f[2] >= f[3]) as usize) << 5);
+
+    let entry = SIMPLEX_LUT[cmp_mask];
+    let wf0 = f[entry.order[0] as usize];
+    let wf1 = f[entry.order[1] as usize];
+    let wf2 = f[entry.order[2] as usize];
+    let wf3 = f[entry.order[3] as usize];
+
+    let w0 = 16 - wf0;
+    let w1 = wf0 - wf1;
+    let w2 = wf1 - wf2;
+    let w3 = wf2 - wf3;
+    let w4 = wf3;
+
+    let v0 = lut[base_idx];
+    let v1 = lut[base_idx + entry.v_strides[0] as usize];
+    let v2 = lut[base_idx + entry.v_strides[1] as usize];
+    let v3 = lut[base_idx + entry.v_strides[2] as usize];
+    let v4 = lut[base_idx + entry.v_strides[3] as usize];
+
+    let mut out = [0i32; 4];
+    let mut sp = 0usize;
+    while sp < 4 {
+        let sum = w0 * (v0[sp] as i32)
+            + w1 * (v1[sp] as i32)
+            + w2 * (v2[sp] as i32)
+            + w3 * (v3[sp] as i32)
+            + w4 * (v4[sp] as i32);
+        out[sp] = (sum + 8) >> 4;
+        sp += 1;
+    }
+    out
+}
+
+/// Pre-cached 4D Simplex `MuLUT` Super-Resolution Engine (`MuLutEngine`) mapping `17x17x17x17`
+/// quantized 4-bit luma inputs to `[i8; 4]` 2x2 subpixel deltas:
+/// - `lut_s`: Square 2x2 receptive field `(I(y,x), I(y,x+1), I(y+1,x), I(y+1,x+1))`
+/// - `lut_d`: Diagonal cross receptive field `(I(y,x), I(y-1,x+1), I(y+1,x-1), I(y+1,x+1))`
+#[derive(Clone)]
+pub struct MuLutEngine {
+    pub lut_s: Box<[[i8; 4]; MULUT_TABLE_LEN]>,
+    pub lut_d: Box<[[i8; 4]; MULUT_TABLE_LEN]>,
+}
+
+impl MuLutEngine {
+    /// Builds the `lut_s` (square 2x2) and `lut_d` (diagonal cross) 4D Simplex lookup tables (`83,521` entries each).
+    /// Guarantees zero delta (`[0, 0, 0, 0]`) whenever `q0 == q1 == q2 == q3` so flat regions have 0 LSB drift.
+    pub fn new() -> Self {
+        let mut lut_s = vec![[0i8; 4]; MULUT_TABLE_LEN]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap();
+        let mut lut_d = vec![[0i8; 4]; MULUT_TABLE_LEN]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap();
+
+        for q0 in 0..17usize {
+            let v0 = (q0 * 16).min(255) as i32;
+            for q1 in 0..17usize {
+                let v1 = (q1 * 16).min(255) as i32;
+                for q2 in 0..17usize {
+                    let v2 = (q2 * 16).min(255) as i32;
+                    for q3 in 0..17usize {
+                        let v3 = (q3 * 16).min(255) as i32;
+                        let idx = q0 * 4913 + q1 * 289 + q2 * 17 + q3;
+
+                        if q0 == q1 && q1 == q2 && q2 == q3 {
+                            lut_s[idx] = [0, 0, 0, 0];
+                            lut_d[idx] = [0, 0, 0, 0];
+                            continue;
+                        }
+
+                        // Square 2x2 neighborhood [TL=v0, TR=v1, BL=v2, BR=v3]:
+                        // Subpixel directional steering + unsharp high-pass relative to base v0
+                        let mean_s = (v0 + v1 + v2 + v3 + 2) >> 2;
+                        let hp0 = ((v0 - mean_s) * 3) >> 3;
+                        let s_tl = hp0.clamp(-64, 64) as i8;
+                        let s_tr = (((v1 - v0) * 3 + 4) >> 3).saturating_add(hp0 >> 1).clamp(-64, 64) as i8;
+                        let s_bl = (((v2 - v0) * 3 + 4) >> 3).saturating_add(hp0 >> 1).clamp(-64, 64) as i8;
+                        let s_br = (((v1 + v2 + v3 - 3 * v0) + 2) >> 2)
+                            .saturating_add(hp0 >> 1)
+                            .clamp(-64, 64) as i8;
+                        lut_s[idx] = [s_tl, s_tr, s_bl, s_br];
+
+                        // Diagonal cross neighborhood [C=v0, NE=v1, SW=v2, SE=v3]:
+                        let mean_d = (v0 + v1 + v2 + v3 + 2) >> 2;
+                        let d_hp = ((v0 - mean_d) * 3) >> 3;
+                        let d_tl = d_hp.clamp(-64, 64) as i8;
+                        let d_tr = (((v1 - v0) + d_hp) >> 2).clamp(-64, 64) as i8;
+                        let d_bl = (((v2 - v0) + d_hp) >> 2).clamp(-64, 64) as i8;
+                        let d_br = (((v3 - v0) + d_hp) >> 2).clamp(-64, 64) as i8;
+                        lut_d[idx] = [d_tl, d_tr, d_bl, d_br];
+                    }
+                }
+            }
+        }
+
+        Self { lut_s, lut_d }
+    }
+
+    /// Evaluates the cooperative `lut_s + lut_d` 4D Simplex `MuLUT` at pixel `(x, y)` and returns
+    /// the 2x2 upscaled luminance subpixels `[TL, TR, BL, BR]` clamped to `0..=255`.
+    #[inline]
+    pub fn eval_pixel_2x2(&self, y_plane: &[u8], w: usize, h: usize, x: usize, y: usize) -> [u8; 4] {
+        let xm1 = x.saturating_sub(1);
+        let xp1 = (x + 1).min(w - 1);
+        let ym1 = y.saturating_sub(1);
+        let yp1 = (y + 1).min(h - 1);
+
+        let c = y_plane[y * w + x];
+        let e = y_plane[y * w + xp1];
+        let s = y_plane[yp1 * w + x];
+        let se = y_plane[yp1 * w + xp1];
+        let ne = y_plane[ym1 * w + xp1];
+        let sw = y_plane[yp1 * w + xm1];
+
+        if c == e && c == s && c == se && c == ne && c == sw {
+            return [c, c, c, c];
+        }
+
+        let ds = interp_4d_simplex(&self.lut_s, c, e, s, se);
+        let dd = interp_4d_simplex(&self.lut_d, c, ne, sw, se);
+        let base = c as i32;
+
+        [
+            (base + ds[0] + dd[0]).clamp(0, 255) as u8,
+            (base + ds[1] + dd[1]).clamp(0, 255) as u8,
+            (base + ds[2] + dd[2]).clamp(0, 255) as u8,
+            (base + ds[3] + dd[3]).clamp(0, 255) as u8,
+        ]
+    }
+
+    /// Upscales an 8-bit luminance plane `(w x h)` by `2x` (`(w*2) x (h*2)`) using branchless 4D Simplex `MuLUT`.
+    pub fn upscale_luma_2x(&self, y_plane: &[u8], w: usize, h: usize) -> Vec<u8> {
+        if w == 0 || h == 0 || y_plane.len() < w * h {
+            return Vec::new();
+        }
+        let out_w = w * 2;
+        let out_h = h * 2;
+        let mut out = vec![0u8; out_w * out_h];
+        for y in 0..h {
+            let top_off = (y * 2) * out_w;
+            let bot_off = (y * 2 + 1) * out_w;
+            for x in 0..w {
+                let [tl, tr, bl, br] = self.eval_pixel_2x2(y_plane, w, h, x, y);
+                let dx = x * 2;
+                out[top_off + dx] = tl;
+                out[top_off + dx + 1] = tr;
+                out[bot_off + dx] = bl;
+                out[bot_off + dx + 1] = br;
+            }
+        }
+        out
+    }
+}
+
+impl Default for MuLutEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2494,12 +2844,82 @@ mod tests {
             for x in 0..8 {
                 let first = dither_truecolor_cell(c, x, y);
                 let second = dither_truecolor_cell(c, x, y);
-                assert_eq!(first, second, "Bayer dithering must be 100% deterministic");
+                assert_eq!(first, second, "Blue Noise dithering must be 100% deterministic");
             }
         }
         // Extremum suppression check
         assert_eq!(dither_truecolor_cell(Color::WHITE, 1, 2), Color::WHITE);
         assert_eq!(dither_truecolor_cell(Color::BLACK, 3, 1), Color::BLACK);
     }
+
+    #[test]
+    fn test_simplex_4d_mulut_super_resolution() {
+        // Verify SIMPLEX_LUT invariants across all 24 reachable permutations of 4 fractional weights
+        for f0 in [0i32, 4, 9, 15] {
+            for f1 in [1i32, 5, 10, 14] {
+                for f2 in [2i32, 6, 11, 13] {
+                    for f3 in [3i32, 7, 8, 12] {
+                        let cmp_mask = ((f0 >= f1) as usize)
+                            | (((f0 >= f2) as usize) << 1)
+                            | (((f0 >= f3) as usize) << 2)
+                            | (((f1 >= f2) as usize) << 3)
+                            | (((f1 >= f3) as usize) << 4)
+                            | (((f2 >= f3) as usize) << 5);
+                        let entry = SIMPLEX_LUT[cmp_mask];
+                        let f = [f0, f1, f2, f3];
+                        assert!(f[entry.order[0] as usize] >= f[entry.order[1] as usize]);
+                        assert!(f[entry.order[1] as usize] >= f[entry.order[2] as usize]);
+                        assert!(f[entry.order[2] as usize] >= f[entry.order[3] as usize]);
+                        assert_eq!(entry.v_strides[3], 5220);
+                    }
+                }
+            }
+        }
+
+        let engine = MuLutEngine::new();
+        // Flat patch -> strictly 0 delta
+        for v in [0u8, 64, 128, 192, 255] {
+            let delta_s = interp_4d_simplex(&engine.lut_s, v, v, v, v);
+            let delta_d = interp_4d_simplex(&engine.lut_d, v, v, v, v);
+            assert_eq!(delta_s, [0, 0, 0, 0]);
+            assert_eq!(delta_d, [0, 0, 0, 0]);
+        }
+
+        // Verify 2x luma upscaling on step edge
+        let mut y_in = vec![40u8; 8 * 8];
+        for y in 0..8 {
+            for x in 4..8 {
+                y_in[y * 8 + x] = 220;
+            }
+        }
+        let y_out = engine.upscale_luma_2x(&y_in, 8, 8);
+        assert_eq!(y_out.len(), 16 * 16);
+        assert_eq!(y_out[0], 40);
+        assert_eq!(y_out[15], 220);
+    }
+
+    #[test]
+    fn test_neon_scalar_ycbcr_u8_planes() {
+        let mut buf = PixelBuffer::new(20, 1, Color::BLACK);
+        for x in 0..20 {
+            buf.set_pixel(
+                x,
+                0,
+                Color::new((x * 11 + 15) as u8, (240 - x * 9) as u8, (x * 7 + 50) as u8),
+            );
+        }
+        let mut y_out = Vec::new();
+        let mut cb_out = Vec::new();
+        let mut cr_out = Vec::new();
+        rgb_to_ycbcr_u8_planes(&buf, &mut y_out, &mut cb_out, &mut cr_out);
+        assert_eq!(y_out.len(), 20);
+        for x in 0..20 {
+            let (ey, ecb, ecr) = bt601_rgb_to_ycbcr_fixed(buf.data[x]);
+            assert!(y_out[x].abs_diff(ey) <= 1);
+            assert!(cb_out[x].abs_diff(ecb) <= 1);
+            assert!(cr_out[x].abs_diff(ecr) <= 1);
+        }
+    }
 }
+
 

@@ -27,6 +27,7 @@ pub enum AppAction {
     CycleUpscale,
     ToggleDither,
     TogglePixelArt,
+    CycleSubCell,
     HistoryBack,
     HistoryForward,
     Reload,
@@ -334,12 +335,13 @@ impl InputHandler {
             return AppAction::Exit;
         }
 
-        // Alt+u, Alt+d, Alt+p, and Alt+m work globally, even when focused inside the URL bar or page input
+        // Alt+u, Alt+d, Alt+p, Alt+s, and Alt+m work globally, even when focused inside the URL bar or page input
         if key.modifiers.contains(KeyModifiers::ALT) {
             match key.code {
                 KeyCode::Char('u') | KeyCode::Char('U') => return AppAction::CycleUpscale,
                 KeyCode::Char('d') | KeyCode::Char('D') => return AppAction::ToggleDither,
                 KeyCode::Char('p') | KeyCode::Char('P') => return AppAction::TogglePixelArt,
+                KeyCode::Char('s') | KeyCode::Char('S') => return AppAction::CycleSubCell,
                 KeyCode::Char('m') | KeyCode::Char('M') => return AppAction::ToggleMute,
                 _ => {}
             }
@@ -407,6 +409,7 @@ impl InputHandler {
                 KeyCode::Char('u') | KeyCode::Char('U') => AppAction::CycleUpscale,
                 KeyCode::Char('d') | KeyCode::Char('D') => AppAction::ToggleDither,
                 KeyCode::Char('p') | KeyCode::Char('P') => AppAction::TogglePixelArt,
+                KeyCode::Char('s') | KeyCode::Char('S') => AppAction::CycleSubCell,
                 KeyCode::Char('o') | KeyCode::Char('/') => {
                     self.is_entering_url = true;
                     self.is_typing_in_page = false;
@@ -721,5 +724,13 @@ mod tests {
             handler.process_event_batch(vec![alt_p]),
             AppAction::TogglePixelArt
         );
+
+        handler.is_entering_url = false;
+        let key_s = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(
+            handler.process_event_batch(vec![key_s]),
+            AppAction::CycleSubCell
+        );
     }
 }
+

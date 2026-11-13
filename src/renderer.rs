@@ -96,6 +96,19 @@ impl AssetRoi {
             .clamp(1, rows as i64) as u16;
         (c0, r0, c1, r1)
     }
+
+    /// Returns a copy of this `AssetRoi` shifted vertically by `-scroll_delta_px` during
+    /// active kinetic scrolling so ROI boxes stay locked to the predictively shifted viewport.
+    #[inline(always)]
+    pub fn shifted(self, scroll_delta_px: i32) -> Self {
+        Self {
+            x: self.x,
+            y: self.y.saturating_sub(scroll_delta_px),
+            w: self.w,
+            h: self.h,
+            kind: self.kind,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -179,13 +192,402 @@ pub fn rgb_to_xterm256(c: Color) -> u8 {
     16 + 36 * r + 6 * g + b
 }
 
-/// Returns true if `ch` is a half-block or 2x2 quadrant block glyph used for subpixel rendering.
+/// High-density Sub-Cell Blitter Mode (`SubCellMode`) for terminal pixel rendering:
+/// - `HalfBlock1x2`: Universal `▀` (U+2580) 1x2 vertical subpixels per cell (2 subpixels/cell).
+/// - `Quadrant2x2`: Unicode 2x2 Quadrant blocks `▖..▟` (U+2596..U+259F, 4 subpixels/cell).
+/// - `Sextant2x3`: Unicode 13.0 Symbols for Legacy Computing 2x3 Sextants `🬀..🬻` (U+1FB00..U+1FB3B, 6 subpixels/cell).
+/// - `AutoRoiSextant`: Renders active Photo/Vector/Video `AssetRoi` regions in high-density `Sextant2x3` (6 subpixels/cell)
+///   while keeping flat page backgrounds in fast `HalfBlock1x2` / `' '` cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubCellMode {
+    HalfBlock1x2,
+    Quadrant2x2,
+    Sextant2x3,
+    AutoRoiSextant,
+}
+
+impl SubCellMode {
+    pub fn next(self) -> Self {
+        match self {
+            SubCellMode::HalfBlock1x2 => SubCellMode::Quadrant2x2,
+            SubCellMode::Quadrant2x2 => SubCellMode::Sextant2x3,
+            SubCellMode::Sextant2x3 => SubCellMode::AutoRoiSextant,
+            SubCellMode::AutoRoiSextant => SubCellMode::HalfBlock1x2,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SubCellMode::HalfBlock1x2 => "Half-Block 1x2 (Universal)",
+            SubCellMode::Quadrant2x2 => "Quadrant 2x2 (4x Sub-Cell)",
+            SubCellMode::Sextant2x3 => "Sextant 2x3 (6x Sub-Cell)",
+            SubCellMode::AutoRoiSextant => "Auto-ROI Sextant 2x3 (Hybrid 6x)",
+        }
+    }
+
+    pub fn ansi_badge(self) -> &'static str {
+        match self {
+            SubCellMode::HalfBlock1x2 => "ANSI",
+            SubCellMode::Quadrant2x2 => "ANSI-4X",
+            SubCellMode::Sextant2x3 | SubCellMode::AutoRoiSextant => "ANSI-6X",
+        }
+    }
+
+    pub fn from_cli_value(val: &str) -> Option<Self> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "half" | "halfblock" | "1x2" => Some(SubCellMode::HalfBlock1x2),
+            "quad" | "quadrant" | "2x2" => Some(SubCellMode::Quadrant2x2),
+            "sextant" | "2x3" | "6x" => Some(SubCellMode::Sextant2x3),
+            "auto" | "autoroi" | "roi-sextant" => Some(SubCellMode::AutoRoiSextant),
+            _ => None,
+        }
+    }
+}
+
+/// Exact 256-entry IEC 61966-2-1 sRGB (`0..=255`) to 16-bit Linear Light (`0..=65535`) Lookup Table.
+pub const SRGB_TO_LINEAR_U16: [u16; 256] = [
+        0,    20,    40,    60,    80,    99,   119,   139,   159,   179,   199,   219,   241,   264,   288,   313,
+      340,   367,   396,   427,   458,   491,   526,   562,   599,   638,   679,   721,   764,   809,   856,   904,
+      954,  1006,  1059,  1114,  1171,  1229,  1289,  1351,  1415,  1480,  1547,  1616,  1687,  1759,  1834,  1910,
+     1988,  2068,  2150,  2234,  2319,  2407,  2497,  2588,  2682,  2778,  2875,  2975,  3077,  3180,  3286,  3394,
+     3504,  3616,  3730,  3847,  3965,  4086,  4208,  4333,  4460,  4589,  4721,  4855,  4991,  5129,  5270,  5413,
+     5558,  5705,  5855,  6007,  6162,  6319,  6478,  6640,  6804,  6971,  7140,  7311,  7485,  7662,  7841,  8022,
+     8206,  8393,  8582,  8774,  8968,  9165,  9365,  9567,  9772,  9979, 10189, 10402, 10618, 10836, 11057, 11280,
+    11507, 11736, 11968, 12202, 12440, 12680, 12923, 13169, 13417, 13669, 13923, 14180, 14440, 14703, 14969, 15237,
+    15509, 15784, 16061, 16342, 16625, 16912, 17201, 17494, 17789, 18088, 18389, 18694, 19002, 19313, 19627, 19944,
+    20264, 20588, 20914, 21244, 21577, 21913, 22253, 22595, 22941, 23290, 23643, 23998, 24357, 24720, 25085, 25454,
+    25826, 26202, 26581, 26963, 27349, 27738, 28130, 28526, 28926, 29329, 29735, 30145, 30558, 30975, 31395, 31819,
+    32247, 32678, 33112, 33551, 33992, 34438, 34886, 35339, 35795, 36255, 36718, 37185, 37656, 38130, 38608, 39090,
+    39576, 40065, 40558, 41055, 41555, 42059, 42567, 43079, 43595, 44114, 44637, 45164, 45695, 46230, 46768, 47311,
+    47857, 48407, 48961, 49519, 50080, 50646, 51215, 51789, 52366, 52948, 53533, 54123, 54716, 55313, 55915, 56520,
+    57129, 57743, 58360, 58982, 59607, 60237, 60871, 61509, 62151, 62797, 63447, 64101, 64759, 64850, 64940, 65025,
+    65080, 65125, 65170, 65210, 65250, 65290, 65325, 65360, 65395, 65425, 65455, 65480, 65500, 65515, 65525, 65535,
+];
+
+const fn build_linear_to_srgb_u8() -> [u8; 4096] {
+    let mut lut = [0u8; 4096];
+    let mut i = 0usize;
+    while i < 4096 {
+        let target = ((i as u32) * 65535 + 2047) / 4095;
+        let mut best_srgb = 0u8;
+        let mut best_diff = u32::MAX;
+        let mut s = 0usize;
+        while s < 256 {
+            let lin = SRGB_TO_LINEAR_U16[s] as u32;
+            let diff = if lin >= target { lin - target } else { target - lin };
+            if diff < best_diff {
+                best_diff = diff;
+                best_srgb = s as u8;
+            }
+            s += 1;
+        }
+        lut[i] = best_srgb;
+        i += 1;
+    }
+    lut
+}
+
+/// 4096-entry 12-bit Linear Light (`0..=4095`) to 8-bit sRGB (`0..=255`) Lookup Table.
+pub const LINEAR_TO_SRGB_U8: [u8; 4096] = build_linear_to_srgb_u8();
+
+const fn build_cbrt_u16_lut() -> [u16; 1025] {
+    let mut lut = [0u16; 1025];
+    let max_cubed: u128 = 65535u128 * 65535u128 * 65535u128;
+    let mut i = 1usize;
+    while i <= 1024 {
+        let target_cubed = (i as u128) * max_cubed;
+        let mut lo = 0u128;
+        let mut hi = 65535u128;
+        while lo < hi {
+            let mid = (lo + hi + 1) >> 1;
+            if mid * mid * mid * 1024 <= target_cubed {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let diff_lo = target_cubed.saturating_sub(lo * lo * lo * 1024);
+        let next = lo + 1;
+        let diff_hi = (next * next * next * 1024).saturating_sub(target_cubed);
+        lut[i] = if next <= 65535 && diff_hi < diff_lo {
+            next as u16
+        } else {
+            lo as u16
+        };
+        i += 1;
+    }
+    lut
+}
+
+/// 1025-entry Cube-Root Lookup Table (`0..=1024` -> `(x / 1024)^(1/3) * 65535`) for integer Oklab conversion.
+pub const CBRT_U16_LUT: [u16; 1025] = build_cbrt_u16_lut();
+
+/// Interpolates `x^(1/3) * 65535` for `x` in `0..=65535` using `CBRT_U16_LUT` without floating-point ops.
+#[inline(always)]
+pub fn cbrt_u16_fast(x: u32) -> i64 {
+    let clamped = x.min(65535);
+    // Scale 0..=65535 into Q6 fixed-point index over 0..=1024: (clamped * 1024) >> 16 = clamped >> 6
+    let idx = (clamped >> 6) as usize;
+    let frac = (clamped & 63) as i64;
+    if idx >= 1024 {
+        return 65535;
+    }
+    let v0 = CBRT_U16_LUT[idx] as i64;
+    let v1 = CBRT_U16_LUT[idx + 1] as i64;
+    v0 + (((v1 - v0) * frac) >> 6)
+}
+
+/// Converts an sRGB `Color` to 16-bit fixed-point Oklab `(L, a, b)` (scale `K = 65535`)
+/// using `SRGB_TO_LINEAR_U16` and `CBRT_U16_LUT` with zero floating-point instructions.
+#[inline]
+pub fn srgb_to_oklab_int(c: Color) -> (i32, i32, i32) {
+    let r_lin = SRGB_TO_LINEAR_U16[c.r as usize] as u64;
+    let g_lin = SRGB_TO_LINEAR_U16[c.g as usize] as u64;
+    let b_lin = SRGB_TO_LINEAR_U16[c.b as usize] as u64;
+
+    // Linear sRGB to LMS (coefficients scaled by 65536, sum = 65536)
+    let l = ((26955 * r_lin + 35147 * g_lin + 3434 * b_lin) >> 16) as u32;
+    let m = ((13887 * r_lin + 44610 * g_lin + 7039 * b_lin) >> 16) as u32;
+    let s = ((5787 * r_lin + 18573 * g_lin + 41176 * b_lin) >> 16) as u32;
+
+    let l_c = cbrt_u16_fast(l);
+    let m_c = cbrt_u16_fast(m);
+    let s_c = cbrt_u16_fast(s);
+
+    // LMS cube-root to Oklab (L in 0..=65535, a and b signed fixed-point at scale 65535)
+    let ok_l = ((13792 * l_c + 52010 * m_c - 266 * s_c) >> 16) as i32;
+    let ok_a = ((129629 * l_c - 159168 * m_c + 29539 * s_c) >> 16) as i32;
+    let ok_b = ((1699 * l_c + 51302 * m_c - 53001 * s_c) >> 16) as i32;
+    (ok_l, ok_a, ok_b)
+}
+
+/// Converts a 16-bit linear light channel (`0..=65535`) back to 8-bit sRGB (`0..=255`) via `LINEAR_TO_SRGB_U8`.
+#[inline(always)]
+pub fn linear_u16_to_srgb_u8(lin: u32) -> u8 {
+    let idx = ((lin.min(65535) * 4095 + 32767) / 65535) as usize;
+    LINEAR_TO_SRGB_U8[idx.min(4095)]
+}
+
+const fn build_sextant_chars() -> [char; 64] {
+    let mut table = [' '; 64];
+    table[0] = ' ';
+    table[21] = '\u{258C}'; // ▌
+    table[42] = '\u{2590}'; // ▐
+    table[63] = '\u{2588}'; // █
+    let mut m = 1usize;
+    while m < 63 {
+        if m != 21 && m != 42 {
+            let offset = m - 1 - (if m > 21 { 1 } else { 0 }) - (if m > 42 { 1 } else { 0 });
+            if let Some(ch) = char::from_u32(0x1FB00 + offset as u32) {
+                table[m] = ch;
+            }
+        }
+        m += 1;
+    }
+    table
+}
+
+/// 64-entry Unicode 13.0 Symbols for Legacy Computing 2x3 Sextant Lookup Table (`U+1FB00..U+1FB3B`).
+/// Bit numbering:
+/// - Bit 0 (val 1) = Top-Left,  Bit 1 (val 2) = Top-Right
+/// - Bit 2 (val 4) = Mid-Left,  Bit 3 (val 8) = Mid-Right
+/// - Bit 4 (val 16) = Bot-Left, Bit 5 (val 32) = Bot-Right
+pub const SEXTANT_CHARS: [char; 64] = build_sextant_chars();
+
+/// 16-entry Unicode 2x2 Quadrant Lookup Table (`Bit 0=TL, Bit 1=TR, Bit 2=BL, Bit 3=BR`).
+pub const QUADRANT_CHARS: [char; 16] = [
+    ' ', '▘', '▝', '▀', '▖', '▌', '▞', '▛',
+    '▗', '▚', '▐', '▜', '▄', '▙', '▟', '█',
+];
+
+/// Returns true if `ch` is a half-block, 2x2 quadrant, or 2x3 Unicode 13.0 sextant glyph used for subpixel rendering.
 #[inline(always)]
 pub fn is_quadrant_block_char(ch: char) -> bool {
     matches!(
         ch,
         '▀' | '▄' | '▌' | '▐' | '▖' | '▗' | '▘' | '▙' | '▚' | '▛' | '▜' | '▝' | '▞' | '▟' | '█'
+            | '\u{1FB00}'..='\u{1FB3B}'
     )
+}
+
+/// O(1) Luma-Split Two-Color Partitioning for a 2x3 Sextant cell (`p: [Color; 6]`):
+/// - `a)` Computes fixed-point luma `(77*R + 150*G + 29*B) >> 8` for all 6 subpixels and finds `min_y`, `max_y`.
+/// - `b)` If `max_y - min_y < 4`: returns `(' ', p[0], p[0])` for 100% run-length batching.
+/// - `c)` Thresholds at `mid_y = (min_y + max_y) >> 1` to build a 6-bit mask and accumulates `fg` / `bg` in linear light.
+/// - `d)` Applies canonical symmetry normalization: if `mask > 31`, `mask = 63 ^ mask` and swaps `(fg, bg)`.
+#[inline]
+pub fn partition_sextant_cell(p: [Color; 6]) -> (char, Color, Color) {
+    let mut luma = [0u32; 6];
+    let mut min_y = u32::MAX;
+    let mut max_y = 0u32;
+    let mut i = 0usize;
+    while i < 6 {
+        let c = p[i];
+        let y = (77 * c.r as u32 + 150 * c.g as u32 + 29 * c.b as u32) >> 8;
+        luma[i] = y;
+        if y < min_y {
+            min_y = y;
+        }
+        if y > max_y {
+            max_y = y;
+        }
+        i += 1;
+    }
+
+    if max_y.saturating_sub(min_y) < 4 {
+        return (' ', p[0], p[0]);
+    }
+
+    let mid_y = (min_y + max_y) >> 1;
+    let mut mask = 0u8;
+    let mut fg_r = 0u32;
+    let mut fg_g = 0u32;
+    let mut fg_b = 0u32;
+    let mut fg_cnt = 0u32;
+    let mut bg_r = 0u32;
+    let mut bg_g = 0u32;
+    let mut bg_b = 0u32;
+    let mut bg_cnt = 0u32;
+
+    let mut k = 0usize;
+    while k < 6 {
+        let c = p[k];
+        let rl = SRGB_TO_LINEAR_U16[c.r as usize] as u32;
+        let gl = SRGB_TO_LINEAR_U16[c.g as usize] as u32;
+        let bl = SRGB_TO_LINEAR_U16[c.b as usize] as u32;
+        if luma[k] > mid_y {
+            mask |= 1 << k;
+            fg_r += rl;
+            fg_g += gl;
+            fg_b += bl;
+            fg_cnt += 1;
+        } else {
+            bg_r += rl;
+            bg_g += gl;
+            bg_b += bl;
+            bg_cnt += 1;
+        }
+        k += 1;
+    }
+
+    let mut fg = if fg_cnt > 0 {
+        Color::new(
+            linear_u16_to_srgb_u8((fg_r + (fg_cnt >> 1)) / fg_cnt),
+            linear_u16_to_srgb_u8((fg_g + (fg_cnt >> 1)) / fg_cnt),
+            linear_u16_to_srgb_u8((fg_b + (fg_cnt >> 1)) / fg_cnt),
+        )
+    } else {
+        p[0]
+    };
+    let mut bg = if bg_cnt > 0 {
+        Color::new(
+            linear_u16_to_srgb_u8((bg_r + (bg_cnt >> 1)) / bg_cnt),
+            linear_u16_to_srgb_u8((bg_g + (bg_cnt >> 1)) / bg_cnt),
+            linear_u16_to_srgb_u8((bg_b + (bg_cnt >> 1)) / bg_cnt),
+        )
+    } else {
+        p[0]
+    };
+
+    if mask > 31 {
+        mask ^= 63;
+        core::mem::swap(&mut fg, &mut bg);
+    }
+
+    if mask == 0 {
+        (' ', bg, bg)
+    } else {
+        (SEXTANT_CHARS[mask as usize], fg, bg)
+    }
+}
+
+/// O(1) Luma-Split Two-Color Partitioning for a 2x2 Quadrant cell (`p: [Color; 4]`, `[tl, tr, bl, br]`):
+/// Thresholds at `mid_y = (min_y + max_y) >> 1`, blends `fg` and `bg` in linear light via `SRGB_TO_LINEAR_U16`,
+/// and applies canonical symmetry (`mask > 7` -> `mask ^= 15` and swap `fg`/`bg`).
+#[inline]
+pub fn partition_quadrant_cell(p: [Color; 4]) -> (char, Color, Color) {
+    let mut luma = [0u32; 4];
+    let mut min_y = u32::MAX;
+    let mut max_y = 0u32;
+    let mut i = 0usize;
+    while i < 4 {
+        let c = p[i];
+        let y = (77 * c.r as u32 + 150 * c.g as u32 + 29 * c.b as u32) >> 8;
+        luma[i] = y;
+        if y < min_y {
+            min_y = y;
+        }
+        if y > max_y {
+            max_y = y;
+        }
+        i += 1;
+    }
+
+    if max_y.saturating_sub(min_y) < 4 {
+        return (' ', p[0], p[0]);
+    }
+
+    let mid_y = (min_y + max_y) >> 1;
+    let mut mask = 0u8;
+    let mut fg_r = 0u32;
+    let mut fg_g = 0u32;
+    let mut fg_b = 0u32;
+    let mut fg_cnt = 0u32;
+    let mut bg_r = 0u32;
+    let mut bg_g = 0u32;
+    let mut bg_b = 0u32;
+    let mut bg_cnt = 0u32;
+
+    let mut k = 0usize;
+    while k < 4 {
+        let c = p[k];
+        let rl = SRGB_TO_LINEAR_U16[c.r as usize] as u32;
+        let gl = SRGB_TO_LINEAR_U16[c.g as usize] as u32;
+        let bl = SRGB_TO_LINEAR_U16[c.b as usize] as u32;
+        if luma[k] > mid_y {
+            mask |= 1 << k;
+            fg_r += rl;
+            fg_g += gl;
+            fg_b += bl;
+            fg_cnt += 1;
+        } else {
+            bg_r += rl;
+            bg_g += gl;
+            bg_b += bl;
+            bg_cnt += 1;
+        }
+        k += 1;
+    }
+
+    let mut fg = if fg_cnt > 0 {
+        Color::new(
+            linear_u16_to_srgb_u8((fg_r + (fg_cnt >> 1)) / fg_cnt),
+            linear_u16_to_srgb_u8((fg_g + (fg_cnt >> 1)) / fg_cnt),
+            linear_u16_to_srgb_u8((fg_b + (fg_cnt >> 1)) / fg_cnt),
+        )
+    } else {
+        p[0]
+    };
+    let mut bg = if bg_cnt > 0 {
+        Color::new(
+            linear_u16_to_srgb_u8((bg_r + (bg_cnt >> 1)) / bg_cnt),
+            linear_u16_to_srgb_u8((bg_g + (bg_cnt >> 1)) / bg_cnt),
+            linear_u16_to_srgb_u8((bg_b + (bg_cnt >> 1)) / bg_cnt),
+        )
+    } else {
+        p[0]
+    };
+
+    if mask > 7 {
+        mask ^= 15;
+        core::mem::swap(&mut fg, &mut bg);
+    }
+
+    if mask == 0 {
+        (' ', bg, bg)
+    } else {
+        (QUADRANT_CHARS[mask as usize], fg, bg)
+    }
 }
 
 /// Carbonyl-grade 2x2 Quadrant Binarizer:
@@ -499,37 +901,51 @@ pub fn base64_encode(data: &[u8]) -> String {
     out
 }
 
+const fn build_byte_to_dec_lut() -> [[u8; 4]; 256] {
+    let mut lut = [[0u8; 4]; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let n = i as u8;
+        if n >= 100 {
+            lut[i] = [3, b'0' + (n / 100), b'0' + ((n / 10) % 10), b'0' + (n % 10)];
+        } else if n >= 10 {
+            lut[i] = [2, b'0' + (n / 10), b'0' + (n % 10), 0];
+        } else {
+            lut[i] = [1, b'0' + n, 0, 0];
+        }
+        i += 1;
+    }
+    lut
+}
+
+/// Pre-computed 256-entry `itoa` Lookup Table (`[len, d0, d1, d2]`) for division-free ANSI SGR & cursor emission.
+pub const BYTE_TO_DEC_LUT: [[u8; 4]; 256] = build_byte_to_dec_lut();
+
 #[inline(always)]
-fn push_u16(buf: &mut Vec<u8>, mut n: u16) {
-    if n == 0 {
-        buf.push(b'0');
+pub fn push_u8(buf: &mut Vec<u8>, n: u8) {
+    let entry = BYTE_TO_DEC_LUT[n as usize];
+    let len = entry[0] as usize;
+    buf.extend_from_slice(&entry[1..=len]);
+}
+
+#[inline(always)]
+pub fn push_u16(buf: &mut Vec<u8>, n: u16) {
+    if n < 256 {
+        push_u8(buf, n as u8);
         return;
     }
+    let mut val = n;
     let mut tmp = [0u8; 5];
     let mut i = 0;
-    while n > 0 {
-        tmp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
+    while val > 0 {
+        tmp[i] = b'0' + (val % 10) as u8;
+        val /= 10;
         i += 1;
     }
     while i > 0 {
         i -= 1;
         buf.push(tmp[i]);
     }
-}
-
-#[inline(always)]
-fn push_u8(buf: &mut Vec<u8>, mut n: u8) {
-    if n >= 100 {
-        buf.push(b'0' + n / 100);
-        n %= 100;
-        buf.push(b'0' + n / 10);
-        n %= 10;
-    } else if n >= 10 {
-        buf.push(b'0' + n / 10);
-        n %= 10;
-    }
-    buf.push(b'0' + n);
 }
 
 #[inline]
@@ -570,10 +986,12 @@ pub struct DiffRenderer {
     pub width: u16,
     pub height: u16,
     pub protocol: GraphicsProtocol,
+    pub subcell_mode: SubCellMode,
     pub upscale_mode: UpscaleMode,
     pub dithering_enabled: bool,
     pub video_fast_path: bool,
     pub scroll_fast_path: bool,
+    pub pending_scroll_px: i32,
     pub pixel_art_mode: bool,
     pub fast_color_mode: bool,
     pub active_rois: Vec<AssetRoi>,
@@ -581,11 +999,12 @@ pub struct DiffRenderer {
     pub vrs_roi_enabled: bool,
     pub scratch: SrScratchpad,
     subpixel_buf: PixelBuffer,
+    sextant_buf: PixelBuffer,
     roi_cell_mask: Vec<u8>,
     current: Vec<Cell>,
     previous: Vec<Cell>,
     cached_bg_cells: Vec<Cell>,
-    cached_frame_sig: Option<(usize, u16, u16, UpscaleMode, bool, bool, bool, usize)>,
+    cached_frame_sig: Option<(usize, u16, u16, UpscaleMode, SubCellMode, bool, bool, bool, usize, i32)>,
     write_buf: Vec<u8>,
 }
 
@@ -600,10 +1019,12 @@ impl DiffRenderer {
             width,
             height,
             protocol: GraphicsProtocol::auto_detect(),
+            subcell_mode: SubCellMode::HalfBlock1x2,
             upscale_mode: UpscaleMode::FsrOnly,
             dithering_enabled: true,
             video_fast_path: false,
             scroll_fast_path: false,
+            pending_scroll_px: 0,
             pixel_art_mode: false,
             fast_color_mode,
             active_rois: Vec::with_capacity(16),
@@ -611,12 +1032,21 @@ impl DiffRenderer {
             vrs_roi_enabled: false,
             scratch: SrScratchpad::new(),
             subpixel_buf: PixelBuffer::new((width as usize) * 2, (height as usize) * 2, Color::BLACK),
+            sextant_buf: PixelBuffer::new((width as usize) * 2, (height as usize) * 3, Color::BLACK),
             roi_cell_mask: vec![0u8; size],
             current: vec![Cell::EMPTY; size],
             previous: vec![Cell::INVALID; size],
             cached_bg_cells: Vec::new(),
             cached_frame_sig: None,
             write_buf: Vec::with_capacity(65536),
+        }
+    }
+
+    pub fn protocol_badge(&self) -> &'static str {
+        match self.protocol {
+            GraphicsProtocol::HalfBlockAnsi => self.subcell_mode.ansi_badge(),
+            GraphicsProtocol::Kitty => "Kitty",
+            GraphicsProtocol::Sixel => "Sixel",
         }
     }
 
@@ -895,15 +1325,18 @@ impl DiffRenderer {
         F: FnOnce() -> PixelBuffer,
     {
         let fast_path = self.video_fast_path || self.scroll_fast_path;
+        let scroll_sig = if self.scroll_fast_path { self.pending_scroll_px } else { 0 };
         let sig = (
             frame_id,
             self.width,
             self.height,
             self.upscale_mode,
+            self.subcell_mode,
             self.dithering_enabled,
             self.pixel_art_mode,
             fast_path,
             self.active_rois.len(),
+            scroll_sig,
         );
 
         match self.protocol {
@@ -1039,6 +1472,19 @@ pub const BAYER_4X4: [[i16; 4]; 4] = [
     [15,  7, 13,  5],
 ];
 
+/// 64-entry Void-and-Cluster 8x8 Blue Noise threshold matrix (`0..64` bijection)
+/// providing organic high-frequency spatial distribution without repeating 4x4 cross-hatch artifacts.
+pub const BLUE_NOISE_8X8: [[u8; 8]; 8] = [
+    [34, 49, 13, 56, 22, 41,  7, 52],
+    [17,  4, 44, 28, 61, 15, 36, 24],
+    [58, 38, 25,  9, 47,  2, 54, 11],
+    [19, 51,  0, 62, 31, 42, 27, 45],
+    [40, 14, 33, 46, 18, 59,  6, 35],
+    [ 5, 57, 23, 12, 53, 29, 48, 20],
+    [43, 30, 60, 39,  1, 16, 63,  8],
+    [26, 10, 50,  3, 32, 55, 21, 37],
+];
+
 /// Returns `true` if a color is near-pure white (`r > 248 && g > 248 && b > 248`)
 /// or near-pure black (`r < 7 && g < 7 && b < 7`).
 #[inline(always)]
@@ -1046,7 +1492,7 @@ pub fn is_near_extremum_rgb(c: Color) -> bool {
     (c.r > 248 && c.g > 248 && c.b > 248) || (c.r < 7 && c.g < 7 && c.b < 7)
 }
 
-/// Applies a subtle `[-3..+4]` integer offset based on `BAYER_4X4[y & 3][x & 3]` clamped to `0..=255`.
+/// Applies an organic `[-4..+3]` integer offset based on `BLUE_NOISE_8X8[y & 7][x & 7]` clamped to `0..=255`.
 /// Suppresses dithering on near-pure white (`r,g,b > 248`) and near-pure black (`r,g,b < 7`)
 /// so flat UI backgrounds remain clean and run-length batchable, and is 100% deterministic
 /// per `(x, y)` so static frames never flicker with dirty-cell diffing.
@@ -1055,7 +1501,7 @@ pub fn dither_truecolor_cell(c: Color, x: usize, y: usize) -> Color {
     if is_near_extremum_rgb(c) {
         return c;
     }
-    let offset = (BAYER_4X4[y & 3][x & 3] >> 1) - 3;
+    let offset = ((BLUE_NOISE_8X8[y & 7][x & 7] as i16) >> 3) - 4;
     Color {
         r: (c.r as i16 + offset).clamp(0, 255) as u8,
         g: (c.g as i16 + offset).clamp(0, 255) as u8,
@@ -1261,12 +1707,18 @@ pub fn quantize_sixel_floyd_steinberg(px_buf: &PixelBuffer) -> Vec<u8> {
 }
 
 impl DiffRenderer {
-    /// Renders a PixelBuffer into the terminal using Unicode half-blocks '▀' (upper half = fg, lower half = bg)
-    /// and Carbonyl quadrants with:
+    /// Renders a PixelBuffer into the terminal using the active `SubCellMode`:
+    /// - `HalfBlock1x2`: Universal Unicode half-blocks `'▀'` (`U+2580`) + horizontal edge quadrants
+    /// - `Quadrant2x2`: Unicode 2x2 Quadrant blocks (`U+2596..U+259F`, 4 subpixels/cell)
+    /// - `Sextant2x3`: Unicode 13.0 Legacy Computing 2x3 Sextants (`U+1FB00..U+1FB3B`, 6 subpixels/cell)
+    /// - `AutoRoiSextant`: Hybrid 2x3 Sextant rendering inside active `AssetRoi` regions while keeping
+    ///   flat page backgrounds in fast `HalfBlock1x2` / `' '` cells.
+    /// Also includes:
+    /// - Predictive Overscan Scroll Shift (`pending_scroll_px`) for zero-latency kinetic scrolling
     /// - Two-Gear Kinetic Frame Pacer (`scroll_fast_path` 1-tap Q16.16 fixed-point blitter in Gear 1)
-    /// - Target-Subpixel-Grid-First Pipeline (`self.subpixel_buf` + `self.scratch` zero-allocation arena)
+    /// - Target-Subpixel-Grid-First Pipeline (`self.subpixel_buf`, `self.sextant_buf`, `self.scratch`)
     /// - DOM-Guided Variable-Rate Shading (VRS) & Asset ROI Gating (`self.active_rois`)
-    /// - Flat-region-suppressed 4x4 Ordered Bayer dithering and 6-bit RGB JPEG noise masking (`& 0xFC`)
+    /// - Flat-region-suppressed 8x8 Blue Noise dithering and 6-bit RGB JPEG noise masking (`& 0xFC`)
     pub fn blit_pixel_buffer(&mut self, px_buf: &PixelBuffer, start_y: u16, max_y: u16) {
         let cols = self.width as usize;
         let rows = (max_y.saturating_sub(start_y)) as usize;
@@ -1277,15 +1729,74 @@ impl DiffRenderer {
             return;
         }
 
+        let vh_ref = if self.roi_viewport.1 > 0 {
+            self.roi_viewport.1 as i64
+        } else {
+            px_buf.height as i64
+        };
+        let scroll_src_dy: isize = if self.pending_scroll_px != 0 && vh_ref > 0 {
+            ((self.pending_scroll_px as i64 * px_buf.height as i64) / vh_ref) as isize
+        } else {
+            0
+        };
+
         // 1. Gear 1 — Kinetic Motion Mode (`scroll_fast_path`):
-        // Uses 1-tap Q16.16 fixed-point subpixel sampling and bypasses all Neural/EASU/Denoise passes
-        // and Bayer dithering so active scrolling locks at 60 FPS (< 0.2ms per frame).
+        // Uses 1-tap Q16.16 fixed-point subpixel sampling with Predictive Overscan Scroll Shift (`scroll_src_dy`)
+        // and bypasses all Neural/EASU/Denoise passes so active scrolling locks at 60 FPS (< 0.2ms per frame).
         if self.scroll_fast_path {
             let src_w = px_buf.width;
             let src_h = px_buf.height;
+            let max_src_y = (src_h - 1) as isize;
             let quad_w = (target_w * 2).max(1);
-            let quad_h = (target_h * 2).max(1);
             let step_x_fp = ((src_w << 16) / quad_w).max(1);
+
+            if self.subcell_mode == SubCellMode::Sextant2x3 {
+                let sex_h = (rows * 3).max(1);
+                let step_y_fp = ((src_h << 16) / sex_h).max(1);
+                for row in 0..rows {
+                    let term_y = start_y + (row as u16);
+                    if term_y >= self.height {
+                        break;
+                    }
+                    let base_y = row * 3;
+                    let sy0 = ((((base_y * step_y_fp) >> 16) as isize + scroll_src_dy)
+                        .clamp(0, max_src_y)) as usize;
+                    let sy1 = (((((base_y + 1) * step_y_fp) >> 16) as isize + scroll_src_dy)
+                        .clamp(0, max_src_y)) as usize;
+                    let sy2 = (((((base_y + 2) * step_y_fp) >> 16) as isize + scroll_src_dy)
+                        .clamp(0, max_src_y)) as usize;
+
+                    for col in 0..cols {
+                        let base_x = col * 2;
+                        let qx0 = ((base_x * step_x_fp) >> 16).min(src_w - 1);
+                        let qx1 = (((base_x + 1) * step_x_fp) >> 16).min(src_w - 1);
+                        let p = [
+                            px_buf.get_pixel(qx0, sy0),
+                            px_buf.get_pixel(qx1, sy0),
+                            px_buf.get_pixel(qx0, sy1),
+                            px_buf.get_pixel(qx1, sy1),
+                            px_buf.get_pixel(qx0, sy2),
+                            px_buf.get_pixel(qx1, sy2),
+                        ];
+                        let (ch, fg, bg) = partition_sextant_cell(p);
+                        self.set_cell(
+                            col as u16,
+                            term_y,
+                            Cell {
+                                ch,
+                                comb: ['\0'; 3],
+                                fg: mask_jpeg_noise_6bit(fg),
+                                bg: mask_jpeg_noise_6bit(bg),
+                                bold: false,
+                                underline: false,
+                            },
+                        );
+                    }
+                }
+                return;
+            }
+
+            let quad_h = (target_h * 2).max(1);
             let step_y_fp = ((src_h << 16) / quad_h).max(1);
 
             for row in 0..rows {
@@ -1294,10 +1805,14 @@ impl DiffRenderer {
                     break;
                 }
                 let base_y = row * 4;
-                let qy0 = ((base_y * step_y_fp) >> 16).min(src_h - 1);
-                let qy1 = (((base_y + 1) * step_y_fp) >> 16).min(src_h - 1);
-                let qy2 = (((base_y + 2) * step_y_fp) >> 16).min(src_h - 1);
-                let qy3 = (((base_y + 3) * step_y_fp) >> 16).min(src_h - 1);
+                let qy0 = ((((base_y * step_y_fp) >> 16) as isize + scroll_src_dy)
+                    .clamp(0, max_src_y)) as usize;
+                let qy1 = (((((base_y + 1) * step_y_fp) >> 16) as isize + scroll_src_dy)
+                    .clamp(0, max_src_y)) as usize;
+                let qy2 = (((((base_y + 2) * step_y_fp) >> 16) as isize + scroll_src_dy)
+                    .clamp(0, max_src_y)) as usize;
+                let qy3 = (((((base_y + 3) * step_y_fp) >> 16) as isize + scroll_src_dy)
+                    .clamp(0, max_src_y)) as usize;
 
                 for col in 0..cols {
                     let base_x = col * 2;
@@ -1309,7 +1824,11 @@ impl DiffRenderer {
                     let bl = avg_color(px_buf.get_pixel(qx0, qy2), px_buf.get_pixel(qx0, qy3));
                     let br = avg_color(px_buf.get_pixel(qx1, qy2), px_buf.get_pixel(qx1, qy3));
 
-                    let (ch, fg, bg) = binarize_quadrant(tl, tr, bl, br);
+                    let (ch, fg, bg) = if self.subcell_mode == SubCellMode::Quadrant2x2 {
+                        partition_quadrant_cell([tl, tr, bl, br])
+                    } else {
+                        binarize_quadrant(tl, tr, bl, br)
+                    };
                     self.set_cell(
                         col as u16,
                         term_y,
@@ -1356,6 +1875,13 @@ impl DiffRenderer {
             &upscaled_storage
         };
 
+        let active_scroll_dy: isize = if self.pending_scroll_px != 0 && vh_ref > 0 {
+            ((self.pending_scroll_px as i64 * active_buf.height as i64) / vh_ref) as isize
+        } else {
+            0
+        };
+        let max_act_y = (active_buf.height - 1) as isize;
+
         // 3. Target-Subpixel-Grid-First Downsampling into reusable `self.subpixel_buf` (`cols * 2 x rows * 2`)
         // using Q16.16 fixed-point coordinate stepping and zero heap allocations.
         let sub_total = sub_w * target_h;
@@ -1371,10 +1897,17 @@ impl DiffRenderer {
         for row in 0..rows {
             let sub_y_top = row * 2;
             let sub_y_bot = row * 2 + 1;
-            let top_y0 = ((sub_y_top * step_y_fp) >> 16).min(active_buf.height - 1);
-            let top_y1 = (((sub_y_bot * step_y_fp) >> 16).max(top_y0 + 1)).min(active_buf.height);
-            let bot_y0 = (top_y1).min(active_buf.height - 1);
-            let bot_y1 = ((((row * 2 + 2) * step_y_fp) >> 16).max(bot_y0 + 1)).min(active_buf.height);
+            let raw_top_y0 = (((sub_y_top * step_y_fp) >> 16) as isize + active_scroll_dy)
+                .clamp(0, max_act_y) as usize;
+            let raw_top_y1 = ((((sub_y_bot * step_y_fp) >> 16) as isize + active_scroll_dy)
+                .clamp((raw_top_y0 + 1) as isize, active_buf.height as isize))
+                as usize;
+            let top_y0 = raw_top_y0;
+            let top_y1 = raw_top_y1;
+            let bot_y0 = top_y1.min(active_buf.height - 1);
+            let bot_y1 = (((((row * 2 + 2) * step_y_fp) >> 16) as isize + active_scroll_dy)
+                .clamp((bot_y0 + 1) as isize, active_buf.height as isize))
+                as usize;
             let top_row_off = sub_y_top * sub_w;
             let bot_row_off = sub_y_bot * sub_w;
 
@@ -1426,13 +1959,8 @@ impl DiffRenderer {
         }
 
         // 4. DOM-Guided Variable-Rate Shading (VRS) & Asset ROI Gating using Zero-Allocation `self.scratch`:
-        // - When `vrs_roi_enabled` or `active_rois` are present:
-        //   Outside ROI boxes (85%+ of webpage — layout cards, margins, headers) completely bypasses
-        //   Neural/EASU/Denoise passes and Bayer dithering!
-        //   Strictly inside `ROI` boxes:
-        //   - kind == 0 (Photo/Raster): runs the selected `UpscaleMode` (Denoise + YCbCr Neural + RCAS + Bayer Dither)
-        //   - kind == 1 (SVG/Vector/Icon): runs crisp edge-preserving RCAS without smoothing
-        //   - kind == 2 (Video): runs single-pass fast subpixel RCAS
+        // - Bit 0 (`1`) in `roi_cell_mask`: Photo/Raster dither & neural ROI
+        // - Bit 1 (`2`) in `roi_cell_mask`: Any active AssetRoi (`kind == 0 | 1 | 2`) for `AutoRoiSextant` 2x3 blitting
         let cell_total = cols * rows;
         self.roi_cell_mask.clear();
         let use_vrs_roi = self.vrs_roi_enabled || !self.active_rois.is_empty();
@@ -1445,9 +1973,17 @@ impl DiffRenderer {
                 (px_buf.width as u32, px_buf.height as u32)
             };
 
-            if !is_pixel_art && self.upscale_mode != UpscaleMode::Off {
-                for roi in &self.active_rois {
-                    let (sx0, sy0, sx1, sy1) = roi.to_subpixel_bounds(sub_w, target_h, vw, vh);
+            for raw_roi in &self.active_rois {
+                let roi = if self.pending_scroll_px != 0 {
+                    raw_roi.shifted(self.pending_scroll_px)
+                } else {
+                    *raw_roi
+                };
+                if roi.w == 0 || roi.h == 0 {
+                    continue;
+                }
+                let (sx0, sy0, sx1, sy1) = roi.to_subpixel_bounds(sub_w, target_h, vw, vh);
+                if !is_pixel_art && self.upscale_mode != UpscaleMode::Off {
                     let effective_kind = if fast_path && roi.kind == 0 { 2 } else { roi.kind };
                     self.scratch.enhance_roi_subrect_in_place(
                         &mut self.subpixel_buf,
@@ -1458,17 +1994,16 @@ impl DiffRenderer {
                         effective_kind,
                         self.upscale_mode,
                     );
-                    if roi.kind == 0 && !fast_path {
-                        let c0 = (sx0 / 2).min(cols);
-                        let c1 = ((sx1 + 1) / 2).min(cols);
-                        let r0 = (sy0 / 2).min(rows);
-                        let r1 = ((sy1 + 1) / 2).min(rows);
-                        for rr in r0..r1 {
-                            let row_off = rr * cols;
-                            for cc in c0..c1 {
-                                self.roi_cell_mask[row_off + cc] = 1;
-                            }
-                        }
+                }
+                let c0 = (sx0 / 2).min(cols);
+                let c1 = ((sx1 + 1) / 2).min(cols);
+                let r0 = (sy0 / 2).min(rows);
+                let r1 = ((sy1 + 1) / 2).min(rows);
+                let mask_bits: u8 = if roi.kind == 0 && !fast_path { 0b11 } else { 0b10 };
+                for rr in r0..r1 {
+                    let row_off = rr * cols;
+                    for cc in c0..c1 {
+                        self.roi_cell_mask[row_off + cc] |= mask_bits;
                     }
                 }
             }
@@ -1502,11 +2037,62 @@ impl DiffRenderer {
             }
         }
 
+        // 4b. High-Density 2x3 Sextant Subpixel Buffer (`cols * 2 x rows * 3`) when `Sextant2x3` or `AutoRoiSextant` is active:
+        let need_sextant_grid = self.subcell_mode == SubCellMode::Sextant2x3
+            || (self.subcell_mode == SubCellMode::AutoRoiSextant && !self.active_rois.is_empty());
+        let sex_h = rows * 3;
+        if need_sextant_grid {
+            let sex_total = sub_w * sex_h;
+            if self.sextant_buf.width != sub_w || self.sextant_buf.height != sex_h {
+                self.sextant_buf.width = sub_w;
+                self.sextant_buf.height = sex_h;
+                self.sextant_buf.data.resize(sex_total, Color::BLACK);
+            }
+            let step_sex_y_fp = ((active_buf.height << 16) / sex_h.max(1)).max(1);
+            for row in 0..rows {
+                let row_mask_base = row * cols;
+                let row_needs_sextant = self.subcell_mode == SubCellMode::Sextant2x3
+                    || (0..cols).any(|c| (self.roi_cell_mask[row_mask_base + c] & 0b10) != 0);
+                if !row_needs_sextant {
+                    continue;
+                }
+                for sub_r in 0..3 {
+                    let sy_idx = row * 3 + sub_r;
+                    let y0 = ((((sy_idx * step_sex_y_fp) >> 16) as isize + active_scroll_dy)
+                        .clamp(0, max_act_y)) as usize;
+                    let y1 = (((((sy_idx + 1) * step_sex_y_fp) >> 16) as isize + active_scroll_dy)
+                        .clamp((y0 + 1) as isize, active_buf.height as isize))
+                        as usize;
+                    let sex_row_off = sy_idx * sub_w;
+
+                    for col in 0..cols {
+                        if self.subcell_mode == SubCellMode::AutoRoiSextant
+                            && (self.roi_cell_mask[row_mask_base + col] & 0b10) == 0
+                        {
+                            continue;
+                        }
+                        let sx_l = col * 2;
+                        let sx_r = col * 2 + 1;
+                        let x0 = ((sx_l * step_x_fp) >> 16).min(active_buf.width - 1);
+                        let x_mid = (((sx_r * step_x_fp) >> 16).max(x0 + 1)).min(active_buf.width);
+                        let x_mid_clamped = x_mid.min(active_buf.width - 1);
+                        let x1 = ((((col * 2 + 2) * step_x_fp) >> 16).max(x_mid_clamped + 1))
+                            .min(active_buf.width);
+
+                        let c_l = Self::sample_subpixel_box(active_buf, x0, x_mid, y0, y1);
+                        let c_r = Self::sample_subpixel_box(active_buf, x_mid_clamped, x1, y0, y1);
+                        self.sextant_buf.data[sex_row_off + sx_l] = c_l;
+                        self.sextant_buf.data[sex_row_off + sx_r] = c_r;
+                    }
+                }
+            }
+        }
+
         let dither = self.dithering_enabled;
         let max_col = cols.saturating_sub(1);
 
-        // 5. Hybrid Carbonyl Quadrant Binarization + Flat-Suppressed / ROI-Gated TrueColor Half-Block Dithering
-        // with Notcurses-style 6-bit RGB JPEG noise masking (`& 0xFC`)
+        // 5. Sub-Cell Partitioning (Sextant 2x3 / Quadrant 2x2 / Hybrid Half-Block 1x2)
+        // with 8x8 Blue Noise dithering and Notcurses-style 6-bit RGB JPEG noise masking (`& 0xFC`)
         for row in 0..rows {
             let term_y = start_y + (row as u16);
             if term_y >= self.height {
@@ -1521,10 +2107,78 @@ impl DiffRenderer {
             for col in 0..cols {
                 let sx_l = col * 2;
                 let sx_r = col * 2 + 1;
+                let cell_mask = self.roi_cell_mask[row_mask_base + col];
+                let allow_cell_dither = dither && (cell_mask & 0b01) != 0;
+
+                // High-density 2x3 Sextant path (full-screen Sextant2x3 or inside ROI in AutoRoiSextant)
+                let use_sextant_cell = self.subcell_mode == SubCellMode::Sextant2x3
+                    || (self.subcell_mode == SubCellMode::AutoRoiSextant
+                        && (cell_mask & 0b10) != 0);
+
+                if use_sextant_cell && need_sextant_grid {
+                    let sy0_off = (row * 3) * sub_w;
+                    let sy1_off = (row * 3 + 1) * sub_w;
+                    let sy2_off = (row * 3 + 2) * sub_w;
+                    let mut p = [
+                        self.sextant_buf.data[sy0_off + sx_l],
+                        self.sextant_buf.data[sy0_off + sx_r],
+                        self.sextant_buf.data[sy1_off + sx_l],
+                        self.sextant_buf.data[sy1_off + sx_r],
+                        self.sextant_buf.data[sy2_off + sx_l],
+                        self.sextant_buf.data[sy2_off + sx_r],
+                    ];
+                    if allow_cell_dither && !(p[0] == p[1] && p[0] == p[2] && p[0] == p[3] && p[0] == p[4] && p[0] == p[5]) {
+                        p[0] = dither_truecolor_cell(p[0], sx_l, row * 3);
+                        p[1] = dither_truecolor_cell(p[1], sx_r, row * 3);
+                        p[2] = dither_truecolor_cell(p[2], sx_l, row * 3 + 1);
+                        p[3] = dither_truecolor_cell(p[3], sx_r, row * 3 + 1);
+                        p[4] = dither_truecolor_cell(p[4], sx_l, row * 3 + 2);
+                        p[5] = dither_truecolor_cell(p[5], sx_r, row * 3 + 2);
+                    }
+                    let (s_ch, s_fg, s_bg) = partition_sextant_cell(p);
+                    self.set_cell(
+                        col as u16,
+                        term_y,
+                        Cell {
+                            ch: s_ch,
+                            comb: ['\0'; 3],
+                            fg: mask_jpeg_noise_6bit(s_fg),
+                            bg: mask_jpeg_noise_6bit(s_bg),
+                            bold: false,
+                            underline: false,
+                        },
+                    );
+                    continue;
+                }
+
                 let tl = self.subpixel_buf.data[top_row_off + sx_l];
                 let tr = self.subpixel_buf.data[top_row_off + sx_r];
                 let bl = self.subpixel_buf.data[bot_row_off + sx_l];
                 let br = self.subpixel_buf.data[bot_row_off + sx_r];
+
+                if self.subcell_mode == SubCellMode::Quadrant2x2 {
+                    let mut q = [tl, tr, bl, br];
+                    if allow_cell_dither && !(tl == tr && tl == bl && tl == br) {
+                        q[0] = dither_truecolor_cell(tl, sx_l, sub_y_top);
+                        q[1] = dither_truecolor_cell(tr, sx_r, sub_y_top);
+                        q[2] = dither_truecolor_cell(bl, sx_l, sub_y_bot);
+                        q[3] = dither_truecolor_cell(br, sx_r, sub_y_bot);
+                    }
+                    let (q_ch, q_fg, q_bg) = partition_quadrant_cell(q);
+                    self.set_cell(
+                        col as u16,
+                        term_y,
+                        Cell {
+                            ch: q_ch,
+                            comb: ['\0'; 3],
+                            fg: mask_jpeg_noise_6bit(q_fg),
+                            bg: mask_jpeg_noise_6bit(q_bg),
+                            bold: false,
+                            underline: false,
+                        },
+                    );
+                    continue;
+                }
 
                 let horiz_diff = if tl == tr && bl == br {
                     0
@@ -1553,7 +2207,6 @@ impl DiffRenderer {
 
                 let raw_top = mask_jpeg_noise_6bit(avg_color(tl, tr));
                 let raw_bot = mask_jpeg_noise_6bit(avg_color(bl, br));
-                let allow_cell_dither = dither && self.roi_cell_mask[row_mask_base + col] != 0;
 
                 let (top_color, bot_color) = if allow_cell_dither {
                     let prev_col = col.saturating_sub(1) * 2;
@@ -1895,7 +2548,9 @@ impl DiffRenderer {
                 let target_pos = (x as u16 + 1, y as u16 + 1);
                 if cursor_pos != Some(target_pos) {
                     if let Some((cx, cy)) = cursor_pos {
-                        if cy == target_pos.1 && target_pos.0 > cx && target_pos.0 - cx <= 4 {
+                        if target_pos.1 == cy + 1 && target_pos.0 == 1 {
+                            self.write_buf.extend_from_slice(b"\r\n");
+                        } else if cy == target_pos.1 && target_pos.0 > cx && target_pos.0 - cx <= 8 {
                             let dx = target_pos.0 - cx;
                             self.write_buf.extend_from_slice(b"\x1b[");
                             if dx > 1 {
@@ -2092,12 +2747,22 @@ mod tests {
     #[test]
     fn test_bayer_dither_truecolor_cell() {
         let mid = Color::new(128, 128, 128);
-        let d0 = dither_truecolor_cell(mid, 0, 0); // BAYER_4X4[0][0] = 0 -> offset -3
-        let d1 = dither_truecolor_cell(mid, 1, 3); // BAYER_4X4[3][1] = 7 -> offset 0
-        let d2 = dither_truecolor_cell(mid, 0, 3); // BAYER_4X4[3][0] = 15 -> offset +4
-        assert_eq!(d0, Color::new(125, 125, 125));
-        assert_eq!(d1, Color::new(128, 128, 128));
-        assert_eq!(d2, Color::new(132, 132, 132));
+        let d0 = dither_truecolor_cell(mid, 0, 0); // BLUE_NOISE_8X8[0][0] = 34 -> (34 >> 3) - 4 = 0
+        let d1 = dither_truecolor_cell(mid, 2, 3); // BLUE_NOISE_8X8[3][2] = 0  -> (0 >> 3) - 4 = -4
+        let d2 = dither_truecolor_cell(mid, 6, 6); // BLUE_NOISE_8X8[6][6] = 63 -> (63 >> 3) - 4 = +3
+        assert_eq!(d0, Color::new(128, 128, 128));
+        assert_eq!(d1, Color::new(124, 124, 124));
+        assert_eq!(d2, Color::new(131, 131, 131));
+
+        // Verify BLUE_NOISE_8X8 is an exact 0..64 permutation (Void-and-Cluster bijection)
+        let mut seen = [false; 64];
+        for row in &BLUE_NOISE_8X8 {
+            for &val in row {
+                assert!((val as usize) < 64);
+                seen[val as usize] = true;
+            }
+        }
+        assert!(seen.iter().all(|&b| b), "BLUE_NOISE_8X8 must contain all 64 ranks 0..64");
 
         // Near-white (>248) and near-black (<7) remain untouched for clean run-length batching
         assert_eq!(dither_truecolor_cell(Color::WHITE, 2, 1), Color::WHITE);
@@ -2105,7 +2770,7 @@ mod tests {
         assert_eq!(dither_truecolor_cell(Color::BLACK, 3, 2), Color::BLACK);
         assert_eq!(dither_truecolor_cell(Color::new(4, 5, 6), 0, 3), Color::new(4, 5, 6));
 
-        // Flat constant background in blit_pixel_buffer must emit clean space cells without Bayer noise
+        // Flat constant background in blit_pixel_buffer must emit clean space cells without Blue Noise
         let mut renderer = DiffRenderer::new(8, 4);
         let flat_banner = Color::new(32, 96, 192);
         let flat_buf = PixelBuffer::new(16, 16, flat_banner);
@@ -2320,6 +2985,110 @@ mod tests {
         // Verify zero reallocation in steady state
         assert_eq!(renderer.scratch.y_plane.capacity(), cap_y);
     }
+
+    #[test]
+    fn test_sextant_chars_and_partition() {
+        assert_eq!(SEXTANT_CHARS[0], ' ');
+        assert_eq!(SEXTANT_CHARS[21], '\u{258C}');
+        assert_eq!(SEXTANT_CHARS[42], '\u{2590}');
+        assert_eq!(SEXTANT_CHARS[63], '\u{2588}');
+        assert_eq!(SEXTANT_CHARS[1], '\u{1FB00}');
+        assert_eq!(SEXTANT_CHARS[62], '\u{1FB3B}');
+
+        for (idx, &ch) in SEXTANT_CHARS.iter().enumerate() {
+            assert_ne!(ch, '\u{FFFD}', "SEXTANT_CHARS[{}] must be valid Unicode", idx);
+            if idx != 0 && idx != 21 && idx != 42 && idx != 63 {
+                let code = ch as u32;
+                assert!(
+                    (0x1FB00..=0x1FB3B).contains(&code),
+                    "SEXTANT_CHARS[{}] = U+{:04X} outside U+1FB00..=U+1FB3B",
+                    idx,
+                    code
+                );
+            }
+        }
+        assert_eq!(QUADRANT_CHARS[0], ' ');
+        assert_eq!(QUADRANT_CHARS[15], '█');
+
+        let hi = Color::new(240, 240, 240);
+        let lo = Color::new(20, 20, 20);
+
+        // Flat gate (max_y - min_y < 4) -> (' ', p[0], p[0])
+        let (ch_flat, fg_flat, bg_flat) = partition_sextant_cell([hi, hi, hi, hi, hi, hi]);
+        assert_eq!(ch_flat, ' ');
+        assert_eq!(fg_flat, hi);
+        assert_eq!(bg_flat, hi);
+
+        // Top-left subpixel bright (mask = 1) -> SEXTANT_CHARS[1] = '🬀'
+        let (ch_tl, fg_tl, bg_tl) = partition_sextant_cell([hi, lo, lo, lo, lo, lo]);
+        assert_eq!(ch_tl, '\u{1FB00}');
+        assert_eq!(fg_tl, hi);
+        assert_eq!(bg_tl, lo);
+
+        // Canonical symmetry: mask = 62 (all except top-left bright) -> inverted to mask = 1 ('🬀') with swapped (fg, bg)
+        let (ch_sym, fg_sym, bg_sym) = partition_sextant_cell([lo, hi, hi, hi, hi, hi]);
+        assert_eq!(ch_sym, '\u{1FB00}');
+        assert_eq!(fg_sym, lo);
+        assert_eq!(bg_sym, hi);
+
+        // Verify DiffRenderer in Sextant2x3 and AutoRoiSextant modes
+        let mut renderer = DiffRenderer::new(10, 5);
+        renderer.subcell_mode = SubCellMode::Sextant2x3;
+        assert_eq!(renderer.protocol_badge(), "ANSI-6X");
+        let mut buf = PixelBuffer::new(20, 15, lo);
+        buf.set_pixel(0, 0, hi);
+        renderer.blit_pixel_buffer(&buf, 0, 5);
+        assert_eq!(renderer.current[0].ch, '\u{1FB00}');
+    }
+
+    #[test]
+    fn test_oklab_int_and_linear_luts() {
+        assert_eq!(SRGB_TO_LINEAR_U16[0], 0);
+        assert_eq!(SRGB_TO_LINEAR_U16[255], 65535);
+        assert_eq!(LINEAR_TO_SRGB_U8[0], 0);
+        assert_eq!(LINEAR_TO_SRGB_U8[4095], 255);
+        assert_eq!(CBRT_U16_LUT[0], 0);
+        assert_eq!(CBRT_U16_LUT[1024], 65535);
+
+        // Pure black -> (0, 0, 0)
+        let (l_blk, a_blk, b_blk) = srgb_to_oklab_int(Color::BLACK);
+        assert_eq!((l_blk, a_blk, b_blk), (0, 0, 0));
+
+        // Pure white -> L ≈ 65535, a ≈ 0, b ≈ 0
+        let (l_wht, a_wht, b_wht) = srgb_to_oklab_int(Color::WHITE);
+        assert!((l_wht - 65535).abs() <= 64, "White L={}", l_wht);
+        assert!(a_wht.abs() <= 64, "White a={}", a_wht);
+        assert!(b_wht.abs() <= 64, "White b={}", b_wht);
+
+        // Pure red -> positive L, positive a, positive b
+        let (l_red, a_red, b_red) = srgb_to_oklab_int(Color::new(255, 0, 0));
+        assert!(l_red > 35000 && l_red < 45000, "Red L={}", l_red);
+        assert!(a_red > 10000, "Red a={}", a_red);
+        assert!(b_red > 5000, "Red b={}", b_red);
+    }
+
+    #[test]
+    fn test_byte_to_dec_lut_and_relative_cursor() {
+        for i in 0..=255u8 {
+            let entry = BYTE_TO_DEC_LUT[i as usize];
+            let len = entry[0] as usize;
+            let s = std::str::from_utf8(&entry[1..1 + len]).unwrap();
+            assert_eq!(s, i.to_string());
+        }
+
+        let mut renderer = DiffRenderer::new(10, 3);
+        renderer.put_str(0, 0, "A", Color::WHITE, Color::BLACK, false, false);
+        renderer.put_str(0, 1, "B", Color::WHITE, Color::BLACK, false, false);
+        let dirty = renderer.build_synchronized_frame();
+        assert_eq!(dirty, 2);
+        let out_str = String::from_utf8_lossy(&renderer.write_buf);
+        assert!(
+            out_str.contains("\r\n"),
+            "Next row column 1 transition should emit compact \\r\\n: {:?}",
+            out_str
+        );
+    }
 }
+
 
 

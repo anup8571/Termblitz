@@ -1623,45 +1623,67 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             }\
             return 0;\
         }\
-        var popSel='[role=listbox],[role=dialog],[role=alertdialog],[aria-modal=true],[role=menu],.modal,.dialog,#dialog,[id*=cookie],[id*=consent],[class*=consent],[class*=dialog],.G43f7e,.UUbT9,.aajZCb,.sbct';\
-        var popCand=document.querySelectorAll(popSel+',div,ul,section');\
-        var popBoxes=[];\
+        function getStackZ(el){\
+            var cur=el,maxZ=0;\
+            while(cur&&cur!==document.body&&cur!==document.documentElement){\
+                var cs=getComputedStyle(cur);\
+                var pos=cs.position;\
+                var zi=parseInt(cs.zIndex,10);\
+                if(!isNaN(zi)&&zi>maxZ)maxZ=zi;\
+                if((pos==='fixed'||pos==='sticky')&&maxZ<10)maxZ=10;\
+                cur=cur.parentElement;\
+            }\
+            return maxZ;\
+        }\
+        var popSel='dialog[open],[role=listbox],[role=dialog],[role=alertdialog],[aria-modal=true],[role=menu],.modal,.dialog,#dialog,[id*=cookie],[id*=consent],[class*=consent],[class*=dialog],.G43f7e,.UUbT9,.aajZCb,.sbct';\
+        var popCand=document.querySelectorAll(popSel+',header,nav,div,ul,section,aside');\
+        var popBoxes=[],occluderBoxes=[];\
         for(var pi=0;pi<popCand.length;pi++){\
             var pel=popCand[pi];\
             var ps=getComputedStyle(pel);\
             if(ps.display==='none'||ps.visibility==='hidden'||parseFloat(ps.opacity)<0.1)continue;\
             var isRolePop=pel.matches(popSel);\
-            var isPosPop=(ps.position==='fixed'||ps.position==='absolute')&&(parseInt(ps.zIndex,10)>2||isRolePop);\
+            var zVal=parseInt(ps.zIndex,10);\
+            if(isNaN(zVal))zVal=0;\
+            var isPosPop=(ps.position==='fixed'||ps.position==='absolute'||ps.position==='sticky')&&(zVal>=2||isRolePop||ps.position==='fixed');\
             if(!isRolePop&&!isPosPop)continue;\
-            if(isRolePop&&!pel.matches('.sbct')&&!pel.querySelector('[role=option],.sbct,li'))continue;\
             var prc=pel.getBoundingClientRect();\
-            if(!prc||prc.width<40||prc.height<20||prc.bottom<=4||prc.top>=vh-4||prc.right<=4||prc.left>=vw-4)continue;\
-            if(prc.width>=vw-4&&prc.height>=vh-16&&!isRolePop)continue;\
+            if(!prc||prc.width<32||prc.height<18||prc.bottom<=2||prc.top>=vh-2||prc.right<=2||prc.left>=vw-2)continue;\
             var pbg=getBg(pel);\
             if(!pbg&&isRolePop)pbg='rgb(255, 255, 255)';\
             if(!pbg)continue;\
-            var rgbm=pbg.match(/(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)/);\
-            if(!rgbm)continue;\
             var mx=Math.max(0,~~prc.left),my=Math.max(0,~~prc.top),mw=Math.min(vw-mx,~~prc.width),mh=Math.min(vh-my,~~prc.height);\
             if(mw<24||mh<16)continue;\
+            var effZ=Math.max(zVal,getStackZ(pel),isRolePop?100:10);\
+            if(occluderBoxes.length<16){\
+                occluderBoxes.push({el:pel,x:mx,y:my,w:mw,h:mh,z:effZ});\
+            }\
+            if(isRolePop&&!pel.matches('.sbct,dialog[open],[role=dialog],[role=alertdialog],[aria-modal=true]')&&!pel.querySelector('[role=option],.sbct,li,button,a'))continue;\
+            if(prc.width>=vw-4&&prc.height>=vh-16&&!isRolePop)continue;\
+            var rgbm=pbg.match(/(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)/);\
+            if(!rgbm)continue;\
             var dup=false;\
             for(var di=0;di<popBoxes.length;di++){\
                 var pb=popBoxes[di];\
                 if(Math.abs(pb.x-mx)<8&&Math.abs(pb.y-my)<8&&Math.abs(pb.w-mw)<12&&Math.abs(pb.h-mh)<12){dup=true;break;}\
             }\
             if(!dup){\
-                popBoxes.push({el:pel,x:mx,y:my,w:mw,h:mh,bg:pbg});\
+                popBoxes.push({el:pel,x:mx,y:my,w:mw,h:mh,bg:pbg,z:effZ});\
                 r.push('POPUP_MASK:'+mx+','+my+','+mw+','+mh+','+rgbm[1]+','+rgbm[2]+','+rgbm[3]);\
                 if(popBoxes.length>=8)break;\
             }\
         }\
         function isOccluded(el,cx,cy){\
             if(cx<1||cy<1||cx>=vw-1||cy>=vh-1)return false;\
-            var hit=document.elementFromPoint(cx,cy);\
-            if(!hit||hit===el||el.contains(hit)||hit.contains(el))return false;\
-            var ia=el.closest('a,button,label,[role=button],[role=option],[role=listbox],.sbct,.G43f7e,li');\
-            if(ia&&ia===hit.closest('a,button,label,[role=button],[role=option],[role=listbox],.sbct,.G43f7e,li'))return false;\
-            return true;\
+            var elZ=getStackZ(el);\
+            for(var oi=0;oi<occluderBoxes.length;oi++){\
+                var ob=occluderBoxes[oi];\
+                if(cx>=ob.x&&cx<=ob.x+ob.w&&cy>=ob.y&&cy<=ob.y+ob.h){\
+                    if(ob.el===el||ob.el.contains(el)||el.contains(ob.el))continue;\
+                    if(ob.z>elZ)return true;\
+                }\
+            }\
+            return false;\
         }\
         var skipTags={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,SVG:1,PATH:1,HEAD:1,META:1,TITLE:1,OBJECT:1};\
         var tw=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);\
@@ -3250,6 +3272,8 @@ impl CdpEngine {
     }
 
     pub fn scroll_at(&mut self, delta: i32, col: u16, row: u16) {
+        let step_px = (delta * 36).clamp(-180, 180);
+        self.pending_scroll_px.fetch_add(step_px, Ordering::Relaxed);
         if let Some(ref tx) = self.command_tx {
             let _ = tx.send(CdpWorkerCommand::Scroll { delta, col, row });
         }
