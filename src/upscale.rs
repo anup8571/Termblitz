@@ -3126,7 +3126,7 @@ mod tests {
         assert_eq!(mask, 0b0110_1101);
 
         let mut row_top = vec![c_a; 16];
-        let mut row_bot = vec![c_a; 16];
+        let row_bot = vec![c_a; 16];
         row_top[5] = c_b;
         let mut out_flat = vec![false; 16];
         detect_flat_tiles_4corner_row(&row_top, &row_bot, &mut out_flat);

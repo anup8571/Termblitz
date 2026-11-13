@@ -3649,6 +3649,10 @@ mod tests {
             is_fixed: false,
             is_popup: false,
         };
+        let fixed_item = OverlayItem {
+            is_fixed: true,
+            ..item.clone()
+        };
         let popup_item = OverlayItem {
             is_popup: true,
             ..item.clone()
@@ -3658,18 +3662,15 @@ mod tests {
             y: 200,
             w: 120,
             h: 80,
-            is_fixed: false,
-        };
-        let fixed_roi = AssetRoi {
-            is_fixed: true,
-            ..roi
+            kind: 0,
         };
 
         // Positive scroll_delta_px (scrolling down) shifts document overlays and ROIs up
         assert_eq!(item.effective_px_y(48), 152);
+        assert_eq!(fixed_item.effective_px_y(48), 200);
         assert_eq!(popup_item.effective_px_y(48), 200);
         assert_eq!(roi.shifted(48).y, 152);
-        assert_eq!(fixed_roi.shifted(48).y, 200);
+        assert_eq!(roi.shifted(-40).y, 240);
     }
 }
 
