@@ -80,6 +80,8 @@ impl TextOverlaySpan {
     }
 }
 
+pub type OverlayItem = TextOverlaySpan;
+
 /// Elevated popup or autocomplete dropdown box (`POPUP_MASK:x,y,w,h,r,g,b` or `RECT_MASK:x,y,w,h,r,g,b`)
 /// emitted by the DOM extractor before suggestion text items so the renderer can wipe stale underlying page text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1630,7 +1632,13 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
                 var pos=cs.position;\
                 var zi=parseInt(cs.zIndex,10);\
                 if(!isNaN(zi)&&zi>maxZ)maxZ=zi;\
+                var role=cur.getAttribute&&cur.getAttribute('role');\
+                var ariaModal=cur.getAttribute&&cur.getAttribute('aria-modal');\
+                if(ariaModal==='true'||role==='dialog'||role==='alertdialog'||role==='listbox'||role==='menu'){\
+                    if(maxZ<100)maxZ=100;\
+                }\
                 if((pos==='fixed'||pos==='sticky')&&maxZ<10)maxZ=10;\
+                else if(pos==='absolute'&&!isNaN(zi)&&zi>0&&maxZ<zi)maxZ=zi;\
                 cur=cur.parentElement;\
             }\
             return maxZ;\
@@ -1640,6 +1648,8 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
         var popBoxes=[],occluderBoxes=[];\
         for(var pi=0;pi<popCand.length;pi++){\
             var pel=popCand[pi];\
+            var prc=pel.getBoundingClientRect();\
+            if(!prc||prc.bottom<0||prc.top>vh||prc.right<0||prc.left>vw||prc.width<32||prc.height<18||prc.bottom<=2||prc.top>=vh-2||prc.right<=2||prc.left>=vw-2)continue;\
             var ps=getComputedStyle(pel);\
             if(ps.display==='none'||ps.visibility==='hidden'||parseFloat(ps.opacity)<0.1)continue;\
             var isRolePop=pel.matches(popSel);\
@@ -1647,8 +1657,6 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             if(isNaN(zVal))zVal=0;\
             var isPosPop=(ps.position==='fixed'||ps.position==='absolute'||ps.position==='sticky')&&(zVal>=2||isRolePop||ps.position==='fixed');\
             if(!isRolePop&&!isPosPop)continue;\
-            var prc=pel.getBoundingClientRect();\
-            if(!prc||prc.width<32||prc.height<18||prc.bottom<=2||prc.top>=vh-2||prc.right<=2||prc.left>=vw-2)continue;\
             var pbg=getBg(pel);\
             if(!pbg&&isRolePop)pbg='rgb(255, 255, 255)';\
             if(!pbg)continue;\
@@ -1686,7 +1694,21 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             return false;\
         }\
         var skipTags={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,SVG:1,PATH:1,HEAD:1,META:1,TITLE:1,OBJECT:1};\
-        var tw=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);\
+        var tw=document.createTreeWalker(document.body,NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT,{\
+            acceptNode:function(node){\
+                if(node.nodeType===1){\
+                    if(skipTags[node.tagName])return NodeFilter.FILTER_REJECT;\
+                    if(node.hasAttribute&&(node.hasAttribute('hidden')||node.getAttribute('aria-hidden')==='true'))return NodeFilter.FILTER_REJECT;\
+                    var rect=node.getBoundingClientRect();\
+                    if(rect&&(rect.bottom<0||rect.top>vh||rect.right<0||rect.left>vw)){\
+                        var cs=getComputedStyle(node);\
+                        if(cs.overflow!=='visible'||rect.bottom<-vh||rect.top>vh*2)return NodeFilter.FILTER_REJECT;\
+                    }\
+                    return NodeFilter.FILTER_SKIP;\
+                }\
+                return NodeFilter.FILTER_ACCEPT;\
+            }\
+        });\
         var n;\
         while(n=tw.nextNode()){\
             var t=n.textContent;\
@@ -1706,6 +1728,7 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             var minL=99999,minT=99999,maxR=-99999,maxB=-99999,cnt=0;\
             for(var i=0;i<rects.length;i++){\
                 var rc=rects[i];\
+                if(rc.bottom<0||rc.top>vh||rc.right<0||rc.left>vw)continue;\
                 if(rc.width>=1&&rc.height>=1){\
                     if(rc.left<minL)minL=rc.left;\
                     if(rc.top<minT)minT=rc.top;\
@@ -2634,6 +2657,7 @@ fn spawn_cdp_worker(
                                     *shared_rois.lock().unwrap() = parsed_rois;
                                     *shared_viewport.lock().unwrap() = (vw, vh);
                                     shared_scroll_pct.store(pct, Ordering::Relaxed);
+                                    shared_pending_scroll_px.store(0, Ordering::Relaxed);
                                     if !url_str.is_empty() && url_str != "about:blank" {
                                         *shared_live_url.lock().unwrap() = url_str.to_string();
                                     }
@@ -2726,6 +2750,7 @@ fn spawn_cdp_worker(
                 if let Ok(img) = image::load_from_memory(&jpeg_bytes) {
                     let new_buf = PixelBuffer::from_image(&img);
                     *shared_buf.lock().unwrap() = new_buf;
+                    shared_pending_scroll_px.store(0, Ordering::Relaxed);
                     let c = frame_counter.fetch_add(1, Ordering::Relaxed);
                     if c >= 1 {
                         is_loading.store(false, Ordering::Relaxed);
@@ -3605,6 +3630,46 @@ mod tests {
         let js = build_page_style_js(true, true, false);
         assert!(js.contains("forceEagerMedia"));
         assert!(js.contains("loading"));
+    }
+
+    #[test]
+    fn test_predictive_scroll_shift_overlay_and_asset_roi() {
+        let item = OverlayItem {
+            text: "Headline".to_string(),
+            px_x: 24,
+            px_y: 200,
+            px_w: 160,
+            px_h: 24,
+            fg: Color::BLACK,
+            bg: Some(Color::WHITE),
+            bold: true,
+            is_link: false,
+            is_input: false,
+            link_url: None,
+            is_fixed: false,
+            is_popup: false,
+        };
+        let popup_item = OverlayItem {
+            is_popup: true,
+            ..item.clone()
+        };
+        let roi = AssetRoi {
+            x: 24,
+            y: 200,
+            w: 120,
+            h: 80,
+            is_fixed: false,
+        };
+        let fixed_roi = AssetRoi {
+            is_fixed: true,
+            ..roi
+        };
+
+        // Positive scroll_delta_px (scrolling down) shifts document overlays and ROIs up
+        assert_eq!(item.effective_px_y(48), 152);
+        assert_eq!(popup_item.effective_px_y(48), 200);
+        assert_eq!(roi.shifted(48).y, 152);
+        assert_eq!(fixed_roi.shifted(48).y, 200);
     }
 }
 

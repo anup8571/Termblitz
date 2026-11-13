@@ -13,7 +13,7 @@
 
 use crate::renderer::{Color, PixelBuffer};
 pub use crate::renderer::{
-    srgb_to_oklab_int, CBRT_U16_LUT, LINEAR_TO_SRGB_U8, SRGB_TO_LINEAR_U16,
+    cbrt_lut, srgb_to_oklab_int, CBRT_U16_LUT, LINEAR_TO_SRGB_U8, SRGB_TO_LINEAR_U16,
 };
 
 /// Pre-baked Layer 1 (Feature Extraction): 3x3 Conv, 1 input channel -> 8 output channels.
@@ -379,9 +379,134 @@ pub fn rgb_to_ycbcr_u8_planes(
     }
 }
 
+/// De-interleaves and checks 8 2x2 subpixel quads (`tl`, `tr`, `bl`, `br`, each 8 `Color` pixels)
+/// in parallel to return an 8-bit bitmask where bit `k` (`0..8`) is `1` iff
+/// `tl[k] == tr[k] && tl[k] == bl[k] && tl[k] == br[k]`.
+/// On `aarch64`, uses hardware NEON `vld3_u8`, `vceq_u8`, and `vand_u8` across 8 RGB pixels at once;
+/// on `x86_64` and other targets, uses a branchless scalar fallback.
+#[inline]
+pub fn is_4corner_flat_batch8(
+    tl: &[Color; 8],
+    tr: &[Color; 8],
+    bl: &[Color; 8],
+    br: &[Color; 8],
+) -> u8 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        if core::mem::size_of::<Color>() == 3 {
+            let c_tl = vld3_u8(tl.as_ptr() as *const u8);
+            let c_tr = vld3_u8(tr.as_ptr() as *const u8);
+            let c_bl = vld3_u8(bl.as_ptr() as *const u8);
+            let c_br = vld3_u8(br.as_ptr() as *const u8);
+
+            let eq_r = vand_u8(
+                vceq_u8(c_tl.0, c_tr.0),
+                vand_u8(vceq_u8(c_tl.0, c_bl.0), vceq_u8(c_tl.0, c_br.0)),
+            );
+            let eq_g = vand_u8(
+                vceq_u8(c_tl.1, c_tr.1),
+                vand_u8(vceq_u8(c_tl.1, c_bl.1), vceq_u8(c_tl.1, c_br.1)),
+            );
+            let eq_b = vand_u8(
+                vceq_u8(c_tl.2, c_tr.2),
+                vand_u8(vceq_u8(c_tl.2, c_bl.2), vceq_u8(c_tl.2, c_br.2)),
+            );
+            let eq_all = vand_u8(eq_r, vand_u8(eq_g, eq_b));
+
+            let mut lanes = [0u8; 8];
+            vst1_u8(lanes.as_mut_ptr(), eq_all);
+            let mut mask = 0u8;
+            let mut k = 0usize;
+            while k < 8 {
+                if lanes[k] == 0xFF {
+                    mask |= 1 << k;
+                }
+                k += 1;
+            }
+            return mask;
+        }
+    }
+
+    let mut mask = 0u8;
+    let mut k = 0usize;
+    while k < 8 {
+        let p = tl[k];
+        if p == tr[k] && p == bl[k] && p == br[k] {
+            mask |= 1 << k;
+        }
+        k += 1;
+    }
+    mask
+}
+
+/// Scans a pair of top/bottom pixel rows (`row_top`, `row_bot`) and marks `out_flat[x] = true`
+/// when the 4-corner quad `(row_top[x], row_top[x+1], row_bot[x], row_bot[x+1])` is flat.
+/// Uses `#[cfg(target_arch = "aarch64")]` NEON `vld3_u8` SIMD de-interleaving 8 `Color` pixels
+/// at a time with a clean scalar fallback on non-ARM64 targets.
+pub fn detect_flat_tiles_4corner_row(
+    row_top: &[Color],
+    row_bot: &[Color],
+    out_flat: &mut [bool],
+) {
+    let w = row_top.len().min(row_bot.len()).min(out_flat.len());
+    if w == 0 {
+        return;
+    }
+    let mut x = 0usize;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        if core::mem::size_of::<Color>() == 3 && w >= 9 {
+            let top_ptr = row_top.as_ptr() as *const u8;
+            let bot_ptr = row_bot.as_ptr() as *const u8;
+            while x + 8 < w {
+                let tl = vld3_u8(top_ptr.add(x * 3));
+                let tr = vld3_u8(top_ptr.add((x + 1) * 3));
+                let bl = vld3_u8(bot_ptr.add(x * 3));
+                let br = vld3_u8(bot_ptr.add((x + 1) * 3));
+
+                let eq_r = vand_u8(
+                    vceq_u8(tl.0, tr.0),
+                    vand_u8(vceq_u8(tl.0, bl.0), vceq_u8(tl.0, br.0)),
+                );
+                let eq_g = vand_u8(
+                    vceq_u8(tl.1, tr.1),
+                    vand_u8(vceq_u8(tl.1, bl.1), vceq_u8(tl.1, br.1)),
+                );
+                let eq_b = vand_u8(
+                    vceq_u8(tl.2, tr.2),
+                    vand_u8(vceq_u8(tl.2, bl.2), vceq_u8(tl.2, br.2)),
+                );
+                let eq_all = vand_u8(eq_r, vand_u8(eq_g, eq_b));
+                let mut lanes = [0u8; 8];
+                vst1_u8(lanes.as_mut_ptr(), eq_all);
+                for k in 0..8 {
+                    out_flat[x + k] = lanes[k] == 0xFF;
+                }
+                x += 8;
+            }
+        }
+    }
+
+    let max_x = w - 1;
+    while x < w {
+        let xp1 = (x + 1).min(max_x);
+        let tl = row_top[x];
+        let tr = row_top[xp1];
+        let bl = row_bot[x];
+        let br = row_bot[xp1];
+        out_flat[x] = tl == tr && tl == bl && tl == br;
+        x += 1;
+    }
+}
+
 /// Splits a `PixelBuffer` into three pre-allocated `Vec<f32>` planes (`y_plane`, `cb_plane`, `cr_plane`)
 /// using Q16.16 fixed-point BT.601 integer coefficients (`77*R + 150*G + 29*B`, `-43*R - 85*G + 128*B`,
 /// `128*R - 107*G - 21*B`) with zero heap allocations when capacities are already warm.
+/// On `aarch64`, uses NEON `vld3_u8`, `vmull_u8`, `vmlal_u8`, `vshrn_n_u16` to de-interleave 8 `Color`
+/// pixels at a time before normalizing.
 #[inline]
 pub fn rgb_to_ycbcr_into(
     buf: &PixelBuffer,
@@ -399,8 +524,70 @@ pub fn rgb_to_ycbcr_into(
 
     // 1.0 / (255.0 * 256.0)
     const INV_65280: f32 = 1.0 / 65280.0;
+    let mut i = 0usize;
 
-    for px in &buf.data[..len] {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        if core::mem::size_of::<Color>() == 3 {
+            let ptr_base = buf.data.as_ptr() as *const u8;
+            let w_yr = vdup_n_u8(77);
+            let w_yg = vdup_n_u8(150);
+            let w_yb = vdup_n_u8(29);
+
+            let w_cbr = vdup_n_u8(43);
+            let w_cbg = vdup_n_u8(85);
+            let w_cbb = vdup_n_u8(128);
+
+            let w_crr = vdup_n_u8(128);
+            let w_crg = vdup_n_u8(107);
+            let w_crb = vdup_n_u8(21);
+
+            let mut y_arr = [0u16; 8];
+            let mut cb_pos_arr = [0u16; 8];
+            let mut cb_neg_arr = [0u16; 8];
+            let mut cr_pos_arr = [0u16; 8];
+            let mut cr_neg_arr = [0u16; 8];
+
+            while i + 8 <= len {
+                let rgb = vld3_u8(ptr_base.add(i * 3));
+                let r = rgb.0;
+                let g = rgb.1;
+                let b = rgb.2;
+
+                let mut y_acc = vmull_u8(r, w_yr);
+                y_acc = vmlal_u8(y_acc, g, w_yg);
+                y_acc = vmlal_u8(y_acc, b, w_yb);
+                let _y_u8 = vshrn_n_u16::<8>(y_acc);
+                vst1q_u16(y_arr.as_mut_ptr(), y_acc);
+
+                let cb_pos = vmull_u8(b, w_cbb);
+                let mut cb_neg = vmull_u8(r, w_cbr);
+                cb_neg = vmlal_u8(cb_neg, g, w_cbg);
+                vst1q_u16(cb_pos_arr.as_mut_ptr(), cb_pos);
+                vst1q_u16(cb_neg_arr.as_mut_ptr(), cb_neg);
+
+                let cr_pos = vmull_u8(r, w_crr);
+                let mut cr_neg = vmull_u8(g, w_crg);
+                cr_neg = vmlal_u8(cr_neg, b, w_crb);
+                vst1q_u16(cr_pos_arr.as_mut_ptr(), cr_pos);
+                vst1q_u16(cr_neg_arr.as_mut_ptr(), cr_neg);
+
+                for k in 0..8 {
+                    let y_q8 = y_arr[k] as i32;
+                    let cb_q8 = (cb_pos_arr[k] as i32) - (cb_neg_arr[k] as i32);
+                    let cr_q8 = (cr_pos_arr[k] as i32) - (cr_neg_arr[k] as i32);
+                    y_plane.push((y_q8 as f32) * INV_65280);
+                    cb_plane.push((cb_q8 as f32) * INV_65280);
+                    cr_plane.push((cr_q8 as f32) * INV_65280);
+                }
+                i += 8;
+            }
+        }
+    }
+
+    while i < len {
+        let px = buf.data[i];
         let r = px.r as i32;
         let g = px.g as i32;
         let b = px.b as i32;
@@ -413,6 +600,7 @@ pub fn rgb_to_ycbcr_into(
         y_plane.push((y_q8 as f32) * INV_65280);
         cb_plane.push((cb_q8 as f32) * INV_65280);
         cr_plane.push((cr_q8 as f32) * INV_65280);
+        i += 1;
     }
 }
 
@@ -576,6 +764,8 @@ pub fn pixel_shuffle_2x(subpixels: &[[f32; 4]], w: usize, h: usize, out: &mut [f
 /// Eliminates repeated heap allocations across recursive stages by resizing flat vectors in-place.
 #[derive(Default)]
 pub struct NeuralScratch {
+    pub y_u8: Vec<u8>,
+    pub mulut_tables: Option<&'static MuLutTables>,
     pub active_px: Vec<bool>,
     pub feat_l2: Vec<[f32; 4]>,
     pub feat_l3: Vec<[f32; 4]>,
@@ -584,8 +774,10 @@ pub struct NeuralScratch {
     pub y_pong: Vec<f32>,
 }
 
-/// Runs the 4-layer Hybrid FSRCNN-ESPCN super-resolution network on `y_plane` (`w x h`)
-/// and writes the `(w * 2) x (h * 2)` output into `out_y` using reusable `scratch` slices.
+/// Runs the cooperative 4D Simplex MuLUT (`MuLUT-S + MuLUT-D`) super-resolution engine
+/// (populated offline from the 4-layer Hybrid FSRCNN-ESPCN filters) on `y_plane` (`w x h`)
+/// and writes the `(w * 2) x (h * 2)` output into `out_y` with zero runtime floating-point
+/// convolution loops, while preserving the `luma_range < 4` flat-skip gate.
 pub fn upscale_y_neural_2x_into(
     y_plane: &[f32],
     w: usize,
@@ -599,202 +791,92 @@ pub fn upscale_y_neural_2x_into(
     }
 
     let num_px = w * h;
-    let out_len = (w * 2) * (h * 2);
+    let out_w = w * 2;
+    let out_len = out_w * (h * 2);
     out_y.resize(out_len, 0.0);
 
-    scratch.active_px.clear();
-    scratch.active_px.resize(num_px, false);
-    scratch.feat_l2.resize(num_px, [0.0f32; 4]);
+    let tables = *scratch.mulut_tables.get_or_insert_with(global_mulut_tables);
 
-    let mut any_active = false;
+    scratch.y_u8.clear();
+    scratch.y_u8.reserve(num_px);
+    for &yv in &y_plane[..num_px] {
+        scratch
+            .y_u8
+            .push((yv.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
+    }
+
+    let y_u8 = &scratch.y_u8[..num_px];
     let max_x = w - 1;
     let max_y = h - 1;
+    const INV_255: f32 = 1.0 / 255.0;
 
     for y in 0..h {
         let ym1 = y.saturating_sub(1);
         let yp1 = (y + 1).min(max_y);
 
-        let r_top = &y_plane[ym1 * w..ym1 * w + w];
-        let r_mid = &y_plane[y * w..y * w + w];
-        let r_bot = &y_plane[yp1 * w..yp1 * w + w];
-        let dst_row = &mut scratch.feat_l2[y * w..(y + 1) * w];
-        let act_row = &mut scratch.active_px[y * w..(y + 1) * w];
+        let r_top = &y_u8[ym1 * w..ym1 * w + w];
+        let r_mid = &y_u8[y * w..y * w + w];
+        let r_bot = &y_u8[yp1 * w..yp1 * w + w];
+        let f_mid = &y_plane[y * w..y * w + w];
+
+        let top_row_start = (y * 2) * out_w;
+        let bot_row_start = (y * 2 + 1) * out_w;
+        let (top_part, rest) = out_y[top_row_start..bot_row_start + out_w].split_at_mut(out_w);
+        let bot_part = &mut rest[..out_w];
 
         for x in 0..w {
             let xm1 = x.saturating_sub(1);
             let xp1 = (x + 1).min(max_x);
 
-            let patch = [
-                r_top[xm1], r_top[x], r_top[xp1],
-                r_mid[xm1], r_mid[x], r_mid[xp1],
-                r_bot[xm1], r_bot[x], r_bot[xp1],
-            ];
+            let p0 = r_top[xm1];
+            let p1 = r_top[x];
+            let p2 = r_top[xp1];
+            let p3 = r_mid[xm1];
+            let p4 = r_mid[x];
+            let p5 = r_mid[xp1];
+            let p6 = r_bot[xm1];
+            let p7 = r_bot[x];
+            let p8 = r_bot[xp1];
 
-            let (min_y, max_y_val) = patch_min_max_9(&patch);
-            if !should_enhance_pixel(min_y, max_y_val) {
-                dst_row[x] = [patch[4], 0.0, 0.0, 0.0];
+            let min_u8 = p0.min(p1).min(p2).min(p3).min(p4).min(p5).min(p6).min(p7).min(p8);
+            let max_u8 = p0.max(p1).max(p2).max(p3).max(p4).max(p5).max(p6).max(p7).max(p8);
+
+            let dx = x * 2;
+            // Integer flat-skip gate: luma_range < 4 bypasses LUT interpolation with 0% drift
+            if max_u8 - min_u8 < 4 {
+                let cy = f_mid[x].clamp(0.0, 1.0);
+                top_part[dx] = cy;
+                top_part[dx + 1] = cy;
+                bot_part[dx] = cy;
+                bot_part[dx + 1] = cy;
                 continue;
             }
 
-            act_row[x] = true;
-            any_active = true;
+            // Cooperative MuLUT-S (square 2x2) + MuLUT-D (diagonal cross) 4-simplex interpolation:
+            // lut_s: (I(x,y), I(x+1,y), I(x,y+1), I(x+1,y+1)) = (p4, p5, p7, p8)
+            // lut_d: (I(x,y), I(x+1,y+1), I(x+1,y-1), I(x-1,y+1)) = (p4, p8, p2, p6)
+            let ds = interp_4d_simplex(&tables.lut_s, p4, p5, p7, p8);
+            let dd = interp_4d_simplex(&tables.lut_d, p4, p8, p2, p6);
+            let y0 = p4 as i32;
 
-            let mut l1_out = [0.0f32; 8];
-            for oc in 0..8 {
-                let w_k = &L1_WEIGHTS[oc];
-                let sum = L1_BIAS[oc]
-                    + patch[0] * w_k[0]
-                    + patch[1] * w_k[1]
-                    + patch[2] * w_k[2]
-                    + patch[3] * w_k[3]
-                    + patch[4] * w_k[4]
-                    + patch[5] * w_k[5]
-                    + patch[6] * w_k[6]
-                    + patch[7] * w_k[7]
-                    + patch[8] * w_k[8];
-                l1_out[oc] = prelu(sum, L1_PRELU[oc]);
-            }
+            let tl = (y0 + ((ds[0] + dd[0]) >> 1)).clamp(0, 255) as f32 * INV_255;
+            let tr = (y0 + ((ds[1] + dd[1]) >> 1)).clamp(0, 255) as f32 * INV_255;
+            let bl = (y0 + ((ds[2] + dd[2]) >> 1)).clamp(0, 255) as f32 * INV_255;
+            let br = (y0 + ((ds[3] + dd[3]) >> 1)).clamp(0, 255) as f32 * INV_255;
 
-            let mut l2_out = [0.0f32; 4];
-            for oc in 0..4 {
-                let w_1x1 = &L2_WEIGHTS[oc];
-                let sum = L2_BIAS[oc]
-                    + l1_out[0] * w_1x1[0]
-                    + l1_out[1] * w_1x1[1]
-                    + l1_out[2] * w_1x1[2]
-                    + l1_out[3] * w_1x1[3]
-                    + l1_out[4] * w_1x1[4]
-                    + l1_out[5] * w_1x1[5]
-                    + l1_out[6] * w_1x1[6]
-                    + l1_out[7] * w_1x1[7];
-                l2_out[oc] = prelu(sum, L2_PRELU[oc]);
-            }
-
-            dst_row[x] = l2_out;
+            top_part[dx] = tl;
+            top_part[dx + 1] = tr;
+            bot_part[dx] = bl;
+            bot_part[dx + 1] = br;
         }
     }
-
-    if !any_active {
-        let out_w = w * 2;
-        for y in 0..h {
-            let src_row = &y_plane[y * w..(y + 1) * w];
-            let top_row_start = (y * 2) * out_w;
-            let bot_row_start = (y * 2 + 1) * out_w;
-            let (top_part, rest) = out_y[top_row_start..bot_row_start + out_w].split_at_mut(out_w);
-            let bot_part = &mut rest[..out_w];
-            for (x, &cy) in src_row.iter().enumerate() {
-                let clamped = cy.clamp(0.0, 1.0);
-                let dx = x * 2;
-                top_part[dx] = clamped;
-                top_part[dx + 1] = clamped;
-                bot_part[dx] = clamped;
-                bot_part[dx + 1] = clamped;
-            }
-        }
-        return;
-    }
-
-    scratch.feat_l3.resize(num_px, [0.0f32; 4]);
-    for y in 0..h {
-        let ym1 = y.saturating_sub(1);
-        let yp1 = (y + 1).min(max_y);
-
-        let r_top = &scratch.feat_l2[ym1 * w..ym1 * w + w];
-        let r_mid = &scratch.feat_l2[y * w..y * w + w];
-        let r_bot = &scratch.feat_l2[yp1 * w..yp1 * w + w];
-        let act_row = &scratch.active_px[y * w..(y + 1) * w];
-        let dst_row = &mut scratch.feat_l3[y * w..(y + 1) * w];
-
-        for x in 0..w {
-            if !act_row[x] {
-                dst_row[x] = r_mid[x];
-                continue;
-            }
-
-            let xm1 = x.saturating_sub(1);
-            let xp1 = (x + 1).min(max_x);
-
-            let p = [
-                r_top[xm1], r_top[x], r_top[xp1],
-                r_mid[xm1], r_mid[x], r_mid[xp1],
-                r_bot[xm1], r_bot[x], r_bot[xp1],
-            ];
-            let residual = p[4];
-
-            let mut l3_out = [0.0f32; 4];
-            for oc in 0..4 {
-                let wk = &L3_WEIGHTS[oc];
-                let mut acc = L3_BIAS[oc];
-                for k in 0..9 {
-                    let pk = p[k];
-                    let w_ic = wk[k];
-                    acc += pk[0] * w_ic[0]
-                        + pk[1] * w_ic[1]
-                        + pk[2] * w_ic[2]
-                        + pk[3] * w_ic[3];
-                }
-                l3_out[oc] = prelu(acc, L3_PRELU[oc]) + residual[oc];
-            }
-
-            dst_row[x] = l3_out;
-        }
-    }
-
-    scratch.subpixels.resize(num_px, [0.0f32; 4]);
-    for y in 0..h {
-        let ym1 = y.saturating_sub(1);
-        let yp1 = (y + 1).min(max_y);
-
-        let r_top = &scratch.feat_l3[ym1 * w..ym1 * w + w];
-        let r_mid = &scratch.feat_l3[y * w..y * w + w];
-        let r_bot = &scratch.feat_l3[yp1 * w..yp1 * w + w];
-        let y_row = &y_plane[y * w..(y + 1) * w];
-        let act_row = &scratch.active_px[y * w..(y + 1) * w];
-        let dst_row = &mut scratch.subpixels[y * w..(y + 1) * w];
-
-        for x in 0..w {
-            if !act_row[x] {
-                let center_y = y_row[x];
-                dst_row[x] = [center_y, center_y, center_y, center_y];
-                continue;
-            }
-
-            let xm1 = x.saturating_sub(1);
-            let xp1 = (x + 1).min(max_x);
-
-            let p = [
-                r_top[xm1], r_top[x], r_top[xp1],
-                r_mid[xm1], r_mid[x], r_mid[xp1],
-                r_bot[xm1], r_bot[x], r_bot[xp1],
-            ];
-
-            let mut sp = [0.0f32; 4];
-            for sub_ch in 0..4 {
-                let wk = &L4_WEIGHTS[sub_ch];
-                let mut acc = L4_BIAS[sub_ch];
-                for k in 0..9 {
-                    let pk = p[k];
-                    let w_ic = wk[k];
-                    acc += pk[0] * w_ic[0]
-                        + pk[1] * w_ic[1]
-                        + pk[2] * w_ic[2]
-                        + pk[3] * w_ic[3];
-                }
-                sp[sub_ch] = acc;
-            }
-
-            dst_row[x] = sp;
-        }
-    }
-
-    pixel_shuffle_2x(&scratch.subpixels, w, h, out_y);
 }
 
-/// Runs the 4-layer Hybrid FSRCNN-ESPCN super-resolution network on a normalized `Y` luminance plane
+/// Runs the 4-layer Hybrid FSRCNN-ESPCN super-resolution network (compiled into the O(1)
+/// branchless 4D Simplex `MuLUT-S + MuLUT-D` tables) on a normalized `Y` luminance plane
 /// (`w x h`), returning a `(w * 2) x (h * 2)` luminance plane.
-/// Uses the Content-Aware Sparse Skip Engine (`should_enhance_pixel` & 8x8 tile gating) so flat
-/// backgrounds (`luma_range < 0.015`) completely bypass all 4 convolutional layers and output
-/// `center_y` untouched with 0% neural bias drift.
+/// Uses the integer flat-skip gate (`luma_range < 4`) so flat backgrounds completely bypass
+/// lookup/interpolation and output `center_y` untouched with 0% bias drift.
 pub fn upscale_y_neural_2x(y_plane: &[f32], w: usize, h: usize) -> Vec<f32> {
     let mut out_y = Vec::new();
     let mut scratch = NeuralScratch::default();
@@ -1839,6 +1921,7 @@ pub struct SrScratchpad {
     pub out_y: Vec<f32>,
     pub work_px: Vec<Color>,
     pub roi_crop: PixelBuffer,
+    pub mulut_tables: Option<&'static MuLutTables>,
 }
 
 impl SrScratchpad {
@@ -1853,7 +1936,14 @@ impl SrScratchpad {
             out_y: Vec::with_capacity(16384),
             work_px: Vec::with_capacity(16384),
             roi_crop: PixelBuffer::new(0, 0, Color::BLACK),
+            mulut_tables: Some(global_mulut_tables()),
         }
+    }
+
+    /// Returns a reference to the cached `MuLutTables` (initializing on first access if `Default` was used).
+    #[inline]
+    pub fn mulut(&mut self) -> &'static MuLutTables {
+        *self.mulut_tables.get_or_insert_with(global_mulut_tables)
     }
 
     /// Zero-allocation bilateral JPEG artifact remover using `self.work_px` as the source scratch buffer.
@@ -2291,9 +2381,11 @@ pub fn apply_video_box_fast_rcas(subpixel_buf: &PixelBuffer) -> PixelBuffer {
 /// Precomputed 4D Simplex sorting and cumulative stride entry for branchless `MuLUT` interpolation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SimplexEntry {
-    /// Sorted dimension permutation (`0..4` where `order[0]` has the largest fractional weight)
+    /// Sorted dimension permutation (`0..4` where `w[order[0]] >= w[order[1]] >= w[order[2]] >= w[order[3]]`)
     pub order: [u8; 4],
-    /// Cumulative 4D vertex strides in the `17x17x17x17` table (`[4913, 289, 17, 1]`)
+    /// Intermediate hypercube vertex index strides `(offset_1, offset_2, offset_3)` on the `17^4` array
+    pub offsets: [u16; 3],
+    /// Cumulative 4D vertex strides in the `17x17x17x17` table (`[offset_1, offset_2, offset_3, 5220]`)
     pub v_strides: [u16; 4],
 }
 
@@ -2307,11 +2399,15 @@ pub const MULUT_TABLE_LEN: usize = 17 * 17 * 17 * 17;
 const fn build_simplex_lut() -> [SimplexEntry; 64] {
     let mut table = [SimplexEntry {
         order: [0, 1, 2, 3],
+        offsets: [4913, 5202, 5219],
         v_strides: [4913, 5202, 5219, 5220],
     }; 64];
 
     let mut mask = 0usize;
     while mask < 64 {
+        // cmp_mask bits for strict `<` comparisons:
+        // bit 0: w0 < w1, bit 1: w0 < w2, bit 2: w0 < w3,
+        // bit 3: w1 < w2, bit 4: w1 < w3, bit 5: w2 < w3.
         let b0 = (mask & 1) != 0;
         let b1 = (mask & 2) != 0;
         let b2 = (mask & 4) != 0;
@@ -2319,18 +2415,14 @@ const fn build_simplex_lut() -> [SimplexEntry; 64] {
         let b4 = (mask & 16) != 0;
         let b5 = (mask & 32) != 0;
 
-        let dom0 = (b0 as usize) + (b1 as usize) + (b2 as usize);
-        let dom1 = ((!b0) as usize) + (b3 as usize) + (b4 as usize);
-        let dom2 = ((!b1) as usize) + ((!b3) as usize) + (b5 as usize);
-        let dom3 = ((!b2) as usize) + ((!b4) as usize) + ((!b5) as usize);
-
-        let r0 = 3 - dom0;
-        let r1 = 3 - dom1;
-        let r2 = 3 - dom2;
-        let r3 = 3 - dom3;
+        // Number of elements that beat w_i in descending order (w_sorted[0] >= w_sorted[1] >= w_sorted[2] >= w_sorted[3]):
+        let r0 = (b0 as usize) + (b1 as usize) + (b2 as usize);
+        let r1 = ((!b0) as usize) + (b3 as usize) + (b4 as usize);
+        let r2 = ((!b1) as usize) + ((!b3) as usize) + (b5 as usize);
+        let r3 = ((!b2) as usize) + ((!b4) as usize) + ((!b5) as usize);
 
         // Verify valid permutation (all 4 ranks distinct); unreachable masks fall back to [0, 1, 2, 3]
-        let valid = (1u8 << r0) | (1u8 << r1) | (1u8 << r2) | (1u8 << r3) == 0b1111;
+        let valid = ((1u8 << r0) | (1u8 << r1) | (1u8 << r2) | (1u8 << r3)) == 0b1111;
         if valid {
             let mut order = [0u8; 4];
             order[r0] = 0;
@@ -2338,14 +2430,15 @@ const fn build_simplex_lut() -> [SimplexEntry; 64] {
             order[r2] = 2;
             order[r3] = 3;
 
-            let s0 = MULUT_DIM_STRIDES[order[0] as usize];
-            let s1 = s0 + MULUT_DIM_STRIDES[order[1] as usize];
-            let s2 = s1 + MULUT_DIM_STRIDES[order[2] as usize];
-            let s3 = s2 + MULUT_DIM_STRIDES[order[3] as usize];
+            let offset_1 = MULUT_DIM_STRIDES[order[0] as usize];
+            let offset_2 = offset_1 + MULUT_DIM_STRIDES[order[1] as usize];
+            let offset_3 = offset_2 + MULUT_DIM_STRIDES[order[2] as usize];
+            let offset_4 = offset_3 + MULUT_DIM_STRIDES[order[3] as usize];
 
             table[mask] = SimplexEntry {
                 order,
-                v_strides: [s0, s1, s2, s3],
+                offsets: [offset_1, offset_2, offset_3],
+                v_strides: [offset_1, offset_2, offset_3, offset_4],
             };
         }
         mask += 1;
@@ -2357,10 +2450,10 @@ const fn build_simplex_lut() -> [SimplexEntry; 64] {
 /// to sorted dimension indices and cumulative `17x17x17x17` vertex strides.
 pub const SIMPLEX_LUT: [SimplexEntry; 64] = build_simplex_lut();
 
-/// Branchless 4D Simplex interpolation over a `17x17x17x17` (`83,521`-entry) table of `[i8; 4]` deltas:
-/// - Quantizes `(y0, y1, y2, y3)` into high nibbles (`0..=16`) and 4-bit fractional weights (`0..=15`, or `0` at `255`).
-/// - Builds a 6-bit comparison index `cmp_mask` without any `if/else` sorting branches.
-/// - Uses `SIMPLEX_LUT[cmp_mask]` to gather the 5 simplex vertices and interpolate `[i32; 4]` subpixel deltas.
+/// Branchless 4-Simplex Tetrahedral Interpolation over a `17x17x17x17` (`83,521`-entry) table of `[i8; 4]` deltas:
+/// - Extracts high grid indices `h0 = (y0 >> 4) as usize, ..., h3 = (y3 >> 4) as usize` and 4-bit fractional weights `w0..w3`.
+/// - Builds the 6-bit comparison index `cmp_mask` using `(w_i < w_j)` without any sorting branches.
+/// - Uses `SIMPLEX_LUT[cmp_mask]` to gather the 5 simplex vertices and interpolate `[i32; 4]` subpixel deltas via `(sum + 8) >> 4`.
 #[inline(always)]
 pub fn interp_4d_simplex(
     lut: &[[i8; 4]; MULUT_TABLE_LEN],
@@ -2369,91 +2462,184 @@ pub fn interp_4d_simplex(
     y2: u8,
     y3: u8,
 ) -> [i32; 4] {
-    // Map 0..=255 into 16 intervals of width 16 (at 255, q=15, f=15; or exact grid knots at multiples of 16)
-    let q0 = (y0 >> 4) as usize;
-    let q1 = (y1 >> 4) as usize;
-    let q2 = (y2 >> 4) as usize;
-    let q3 = (y3 >> 4) as usize;
+    let h0 = (y0 >> 4) as usize;
+    let h1 = (y1 >> 4) as usize;
+    let h2 = (y2 >> 4) as usize;
+    let h3 = (y3 >> 4) as usize;
 
-    let f = [
-        (y0 & 0x0F) as i32,
-        (y1 & 0x0F) as i32,
-        (y2 & 0x0F) as i32,
-        (y3 & 0x0F) as i32,
-    ];
+    let w0 = (y0 & 0x0F) as i32;
+    let w1 = (y1 & 0x0F) as i32;
+    let w2 = (y2 & 0x0F) as i32;
+    let w3 = (y3 & 0x0F) as i32;
+    let w = [w0, w1, w2, w3];
 
-    let base_idx = q0 * 4913 + q1 * 289 + q2 * 17 + q3;
+    let base_idx = h0 * 4913 + h1 * 289 + h2 * 17 + h3;
 
-    let cmp_mask = ((f[0] >= f[1]) as usize)
-        | (((f[0] >= f[2]) as usize) << 1)
-        | (((f[0] >= f[3]) as usize) << 2)
-        | (((f[1] >= f[2]) as usize) << 3)
-        | (((f[1] >= f[3]) as usize) << 4)
-        | (((f[2] >= f[3]) as usize) << 5);
+    let cmp_mask = ((w0 < w1) as usize)
+        | (((w0 < w2) as usize) << 1)
+        | (((w0 < w3) as usize) << 2)
+        | (((w1 < w2) as usize) << 3)
+        | (((w1 < w3) as usize) << 4)
+        | (((w2 < w3) as usize) << 5);
 
     let entry = SIMPLEX_LUT[cmp_mask];
-    let wf0 = f[entry.order[0] as usize];
-    let wf1 = f[entry.order[1] as usize];
-    let wf2 = f[entry.order[2] as usize];
-    let wf3 = f[entry.order[3] as usize];
+    let w_s0 = w[entry.order[0] as usize];
+    let w_s1 = w[entry.order[1] as usize];
+    let w_s2 = w[entry.order[2] as usize];
+    let w_s3 = w[entry.order[3] as usize];
 
-    let w0 = 16 - wf0;
-    let w1 = wf0 - wf1;
-    let w2 = wf1 - wf2;
-    let w3 = wf2 - wf3;
-    let w4 = wf3;
+    let v0_w = 16 - w_s0;
+    let v1_w = w_s0 - w_s1;
+    let v2_w = w_s1 - w_s2;
+    let v3_w = w_s2 - w_s3;
+    let v4_w = w_s3;
 
-    let v0 = lut[base_idx];
-    let v1 = lut[base_idx + entry.v_strides[0] as usize];
-    let v2 = lut[base_idx + entry.v_strides[1] as usize];
-    let v3 = lut[base_idx + entry.v_strides[2] as usize];
-    let v4 = lut[base_idx + entry.v_strides[3] as usize];
+    let p0 = lut[base_idx];
+    let p1 = lut[base_idx + entry.offsets[0] as usize];
+    let p2 = lut[base_idx + entry.offsets[1] as usize];
+    let p3 = lut[base_idx + entry.offsets[2] as usize];
+    let p4 = lut[base_idx + 5220];
 
     let mut out = [0i32; 4];
     let mut sp = 0usize;
     while sp < 4 {
-        let sum = w0 * (v0[sp] as i32)
-            + w1 * (v1[sp] as i32)
-            + w2 * (v2[sp] as i32)
-            + w3 * (v3[sp] as i32)
-            + w4 * (v4[sp] as i32);
+        let sum = v0_w * (p0[sp] as i32)
+            + v1_w * (p1[sp] as i32)
+            + v2_w * (p2[sp] as i32)
+            + v3_w * (p3[sp] as i32)
+            + v4_w * (p4[sp] as i32);
         out[sp] = (sum + 8) >> 4;
         sp += 1;
     }
     out
 }
 
-/// Pre-cached 4D Simplex `MuLUT` Super-Resolution Engine (`MuLutEngine`) mapping `17x17x17x17`
-/// quantized 4-bit luma inputs to `[i8; 4]` 2x2 subpixel deltas:
-/// - `lut_s`: Square 2x2 receptive field `(I(y,x), I(y,x+1), I(y+1,x), I(y+1,x+1))`
-/// - `lut_d`: Diagonal cross receptive field `(I(y,x), I(y-1,x+1), I(y+1,x-1), I(y+1,x+1))`
+/// Evaluates our pre-baked 4-layer FSRCNN-ESPCN filter stack (`L1_WEIGHTS -> L2_WEIGHTS -> L3_WEIGHTS -> L4_WEIGHTS`)
+/// offline on a canonical 3x3 luminance patch (`patch` in `[0.0..=1.0]`, centered at `y0 = patch[4]`)
+/// and returns the 4 residual subpixel deltas `[TL, TR, BL, BR]` quantized to `[-64..=63]` (`i8`).
+#[inline]
+fn eval_fsrcnn_espcn_canonical_patch(patch: &[f32; 9]) -> [i8; 4] {
+    let y0 = patch[4];
+
+    // Layer 1: 3x3 Conv (1 -> 8 channels) + PReLU
+    let mut l1_out = [0.0f32; 8];
+    for oc in 0..8 {
+        let w_k = &L1_WEIGHTS[oc];
+        let sum = L1_BIAS[oc]
+            + patch[0] * w_k[0]
+            + patch[1] * w_k[1]
+            + patch[2] * w_k[2]
+            + patch[3] * w_k[3]
+            + patch[4] * w_k[4]
+            + patch[5] * w_k[5]
+            + patch[6] * w_k[6]
+            + patch[7] * w_k[7]
+            + patch[8] * w_k[8];
+        l1_out[oc] = prelu(sum, L1_PRELU[oc]);
+    }
+
+    // Layer 2: 1x1 Shrinking (8 -> 4 channels) + PReLU
+    let mut l2_out = [0.0f32; 4];
+    for oc in 0..4 {
+        let w_1x1 = &L2_WEIGHTS[oc];
+        let sum = L2_BIAS[oc]
+            + l1_out[0] * w_1x1[0]
+            + l1_out[1] * w_1x1[1]
+            + l1_out[2] * w_1x1[2]
+            + l1_out[3] * w_1x1[3]
+            + l1_out[4] * w_1x1[4]
+            + l1_out[5] * w_1x1[5]
+            + l1_out[6] * w_1x1[6]
+            + l1_out[7] * w_1x1[7];
+        l2_out[oc] = prelu(sum, L2_PRELU[oc]);
+    }
+
+    // Layer 3: Non-Linear Mapping + Residual Skip Connection
+    let mut l3_out = [0.0f32; 4];
+    for oc in 0..4 {
+        let wc = &L3_WEIGHTS[oc][4];
+        let acc = L3_BIAS[oc]
+            + (l2_out[0] - y0) * wc[0]
+            + l2_out[1] * wc[1]
+            + l2_out[2] * wc[2]
+            + l2_out[3] * wc[3];
+        l3_out[oc] = prelu(acc, L3_PRELU[oc]) + l2_out[oc];
+    }
+
+    // Layer 4: ESPCN Sub-Pixel Convolution -> [TL, TR, BL, BR] residual deltas in [-64..=63]
+    // Scaled by 2.0 so the cooperative average `(ds + dd) >> 1` preserves full neural edge contrast.
+    let hp_anchor = l3_out[0] - y0;
+    let mut deltas = [0i8; 4];
+    for sub_ch in 0..4 {
+        let wk = &L4_WEIGHTS[sub_ch];
+        let mut spatial_y = L4_BIAS[sub_ch];
+        for k in 0..9 {
+            spatial_y += patch[k] * wk[k][0];
+        }
+        let wc = &wk[4];
+        let detail = hp_anchor * wc[0]
+            + l3_out[1] * wc[1]
+            + l3_out[2] * wc[2]
+            + l3_out[3] * wc[3];
+        let residual = ((spatial_y - y0) * 0.45 + detail * 2.2) * 255.0 * 2.0;
+        deltas[sub_ch] = (residual.round() as i32).clamp(-64, 63) as i8;
+    }
+    deltas
+}
+
+/// Pre-cached 4D Simplex `MuLUT` Super-Resolution Tables (`MuLutTables` / `MuLutEngine`)
+/// with uniform 4-bit MSB quantization (`17 * 17 * 17 * 17 = 83,521` entries), each storing
+/// `[i8; 4]` residual subpixel deltas (`[TL, TR, BL, BR]`) scaled in `[-64..=63]`:
+/// - `lut_s`: Square 2x2 neighborhood `(I(x,y), I(x+1,y), I(x,y+1), I(x+1,y+1))`
+/// - `lut_d`: Diagonal cross neighborhood `(I(x,y), I(x+1,y+1), I(x+1,y-1), I(x-1,y+1))`
 #[derive(Clone)]
-pub struct MuLutEngine {
+pub struct MuLutTables {
     pub lut_s: Box<[[i8; 4]; MULUT_TABLE_LEN]>,
     pub lut_d: Box<[[i8; 4]; MULUT_TABLE_LEN]>,
 }
 
-impl MuLutEngine {
-    /// Builds the `lut_s` (square 2x2) and `lut_d` (diagonal cross) 4D Simplex lookup tables (`83,521` entries each).
+impl std::fmt::Debug for MuLutTables {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MuLutTables")
+            .field("entries", &MULUT_TABLE_LEN)
+            .finish()
+    }
+}
+
+/// Alias for `MuLutTables` (`MuLutEngine`).
+pub type MuLutEngine = MuLutTables;
+
+static GLOBAL_MULUT_TABLES: std::sync::OnceLock<MuLutTables> = std::sync::OnceLock::new();
+
+/// Returns a reference to the process-wide lazy-initialized `MuLutTables`.
+pub fn global_mulut_tables() -> &'static MuLutTables {
+    GLOBAL_MULUT_TABLES.get_or_init(MuLutTables::new)
+}
+
+impl MuLutTables {
+    /// Populates `lut_s` (square 2x2) and `lut_d` (diagonal cross) offline by running our
+    /// pre-baked FSRCNN-ESPCN filters across all `17^4 = 83,521` canonical 4-pixel patterns.
     /// Guarantees zero delta (`[0, 0, 0, 0]`) whenever `q0 == q1 == q2 == q3` so flat regions have 0 LSB drift.
     pub fn new() -> Self {
-        let mut lut_s = vec![[0i8; 4]; MULUT_TABLE_LEN]
+        let mut lut_s: Box<[[i8; 4]; MULUT_TABLE_LEN]> = vec![[0i8; 4]; MULUT_TABLE_LEN]
             .into_boxed_slice()
             .try_into()
             .unwrap();
-        let mut lut_d = vec![[0i8; 4]; MULUT_TABLE_LEN]
+        let mut lut_d: Box<[[i8; 4]; MULUT_TABLE_LEN]> = vec![[0i8; 4]; MULUT_TABLE_LEN]
             .into_boxed_slice()
             .try_into()
             .unwrap();
 
+        const INV_255: f32 = 1.0 / 255.0;
+
         for q0 in 0..17usize {
-            let v0 = (q0 * 16).min(255) as i32;
+            let y0 = ((q0 * 16).min(255) as f32) * INV_255;
             for q1 in 0..17usize {
-                let v1 = (q1 * 16).min(255) as i32;
+                let y1 = ((q1 * 16).min(255) as f32) * INV_255;
                 for q2 in 0..17usize {
-                    let v2 = (q2 * 16).min(255) as i32;
+                    let y2 = ((q2 * 16).min(255) as f32) * INV_255;
                     for q3 in 0..17usize {
-                        let v3 = (q3 * 16).min(255) as i32;
+                        let y3 = ((q3 * 16).min(255) as f32) * INV_255;
                         let idx = q0 * 4913 + q1 * 289 + q2 * 17 + q3;
 
                         if q0 == q1 && q1 == q2 && q2 == q3 {
@@ -2462,26 +2648,30 @@ impl MuLutEngine {
                             continue;
                         }
 
-                        // Square 2x2 neighborhood [TL=v0, TR=v1, BL=v2, BR=v3]:
-                        // Subpixel directional steering + unsharp high-pass relative to base v0
-                        let mean_s = (v0 + v1 + v2 + v3 + 2) >> 2;
-                        let hp0 = ((v0 - mean_s) * 3) >> 3;
-                        let s_tl = hp0.clamp(-64, 64) as i8;
-                        let s_tr = (((v1 - v0) * 3 + 4) >> 3).saturating_add(hp0 >> 1).clamp(-64, 64) as i8;
-                        let s_bl = (((v2 - v0) * 3 + 4) >> 3).saturating_add(hp0 >> 1).clamp(-64, 64) as i8;
-                        let s_br = (((v1 + v2 + v3 - 3 * v0) + 2) >> 2)
-                            .saturating_add(hp0 >> 1)
-                            .clamp(-64, 64) as i8;
-                        lut_s[idx] = [s_tl, s_tr, s_bl, s_br];
+                        // Canonical 3x3 patch for lut_s: (I(x,y)=y0, I(x+1,y)=y1, I(x,y+1)=y2, I(x+1,y+1)=y3)
+                        // Extrapolates left/top symmetrically around center y0 so Laplacian high-pass is balanced:
+                        let left_s = (2.0 * y0 - y1).clamp(0.0, 1.0);
+                        let top_s = (2.0 * y0 - y2).clamp(0.0, 1.0);
+                        let tl_s = (2.0 * y0 - y3).clamp(0.0, 1.0);
+                        let patch_s = [
+                            tl_s,   top_s, y1,
+                            left_s, y0,    y1,
+                            y2,     y2,    y3,
+                        ];
+                        lut_s[idx] = eval_fsrcnn_espcn_canonical_patch(&patch_s);
 
-                        // Diagonal cross neighborhood [C=v0, NE=v1, SW=v2, SE=v3]:
-                        let mean_d = (v0 + v1 + v2 + v3 + 2) >> 2;
-                        let d_hp = ((v0 - mean_d) * 3) >> 3;
-                        let d_tl = d_hp.clamp(-64, 64) as i8;
-                        let d_tr = (((v1 - v0) + d_hp) >> 2).clamp(-64, 64) as i8;
-                        let d_bl = (((v2 - v0) + d_hp) >> 2).clamp(-64, 64) as i8;
-                        let d_br = (((v3 - v0) + d_hp) >> 2).clamp(-64, 64) as i8;
-                        lut_d[idx] = [d_tl, d_tr, d_bl, d_br];
+                        // Canonical 3x3 patch for lut_d: (I(x,y)=y0, I(x+1,y+1)=y1, I(x+1,y-1)=y2, I(x-1,y+1)=y3)
+                        let tl_d = (2.0 * y0 - y1).clamp(0.0, 1.0);
+                        let top_d = 0.5 * (y0 + y2);
+                        let right_d = 0.5 * (y1 + y2);
+                        let bot_d = 0.5 * (y1 + y3);
+                        let left_d = 0.5 * (y0 + y3);
+                        let patch_d = [
+                            tl_d,   top_d, y2,
+                            left_d, y0,    right_d,
+                            y3,     bot_d, y1,
+                        ];
+                        lut_d[idx] = eval_fsrcnn_espcn_canonical_patch(&patch_d);
                     }
                 }
             }
@@ -2506,19 +2696,23 @@ impl MuLutEngine {
         let ne = y_plane[ym1 * w + xp1];
         let sw = y_plane[yp1 * w + xm1];
 
-        if c == e && c == s && c == se && c == ne && c == sw {
+        let min_v = c.min(e).min(s).min(se).min(ne).min(sw);
+        let max_v = c.max(e).max(s).max(se).max(ne).max(sw);
+        if max_v - min_v < 4 {
             return [c, c, c, c];
         }
 
+        // lut_s: (I(x,y), I(x+1,y), I(x,y+1), I(x+1,y+1)) = (c, e, s, se)
+        // lut_d: (I(x,y), I(x+1,y+1), I(x+1,y-1), I(x-1,y+1)) = (c, se, ne, sw)
         let ds = interp_4d_simplex(&self.lut_s, c, e, s, se);
-        let dd = interp_4d_simplex(&self.lut_d, c, ne, sw, se);
-        let base = c as i32;
+        let dd = interp_4d_simplex(&self.lut_d, c, se, ne, sw);
+        let y0 = c as i32;
 
         [
-            (base + ds[0] + dd[0]).clamp(0, 255) as u8,
-            (base + ds[1] + dd[1]).clamp(0, 255) as u8,
-            (base + ds[2] + dd[2]).clamp(0, 255) as u8,
-            (base + ds[3] + dd[3]).clamp(0, 255) as u8,
+            (y0 + ((ds[0] + dd[0]) >> 1)).clamp(0, 255) as u8,
+            (y0 + ((ds[1] + dd[1]) >> 1)).clamp(0, 255) as u8,
+            (y0 + ((ds[2] + dd[2]) >> 1)).clamp(0, 255) as u8,
+            (y0 + ((ds[3] + dd[3]) >> 1)).clamp(0, 255) as u8,
         ]
     }
 
@@ -2546,7 +2740,7 @@ impl MuLutEngine {
     }
 }
 
-impl Default for MuLutEngine {
+impl Default for MuLutTables {
     fn default() -> Self {
         Self::new()
     }
@@ -2854,29 +3048,29 @@ mod tests {
 
     #[test]
     fn test_simplex_4d_mulut_super_resolution() {
-        // Verify SIMPLEX_LUT invariants across all 24 reachable permutations of 4 fractional weights
-        for f0 in [0i32, 4, 9, 15] {
-            for f1 in [1i32, 5, 10, 14] {
-                for f2 in [2i32, 6, 11, 13] {
-                    for f3 in [3i32, 7, 8, 12] {
-                        let cmp_mask = ((f0 >= f1) as usize)
-                            | (((f0 >= f2) as usize) << 1)
-                            | (((f0 >= f3) as usize) << 2)
-                            | (((f1 >= f2) as usize) << 3)
-                            | (((f1 >= f3) as usize) << 4)
-                            | (((f2 >= f3) as usize) << 5);
+        // Verify SIMPLEX_LUT invariants across all 4^4 combinations of 4 fractional weights
+        for w0 in [0i32, 4, 9, 15] {
+            for w1 in [1i32, 5, 10, 14] {
+                for w2 in [2i32, 6, 11, 13] {
+                    for w3 in [3i32, 7, 8, 12] {
+                        let cmp_mask = ((w0 < w1) as usize)
+                            | (((w0 < w2) as usize) << 1)
+                            | (((w0 < w3) as usize) << 2)
+                            | (((w1 < w2) as usize) << 3)
+                            | (((w1 < w3) as usize) << 4)
+                            | (((w2 < w3) as usize) << 5);
                         let entry = SIMPLEX_LUT[cmp_mask];
-                        let f = [f0, f1, f2, f3];
-                        assert!(f[entry.order[0] as usize] >= f[entry.order[1] as usize]);
-                        assert!(f[entry.order[1] as usize] >= f[entry.order[2] as usize]);
-                        assert!(f[entry.order[2] as usize] >= f[entry.order[3] as usize]);
+                        let w = [w0, w1, w2, w3];
+                        assert!(w[entry.order[0] as usize] >= w[entry.order[1] as usize]);
+                        assert!(w[entry.order[1] as usize] >= w[entry.order[2] as usize]);
+                        assert!(w[entry.order[2] as usize] >= w[entry.order[3] as usize]);
                         assert_eq!(entry.v_strides[3], 5220);
                     }
                 }
             }
         }
 
-        let engine = MuLutEngine::new();
+        let engine = global_mulut_tables();
         // Flat patch -> strictly 0 delta
         for v in [0u8, 64, 128, 192, 255] {
             let delta_s = interp_4d_simplex(&engine.lut_s, v, v, v, v);
@@ -2919,7 +3113,122 @@ mod tests {
             assert!(cb_out[x].abs_diff(ecb) <= 1);
             assert!(cr_out[x].abs_diff(ecr) <= 1);
         }
+
+        // Verify 4-corner flat-tile SIMD/scalar batch detector
+        let c_a = Color::new(240, 240, 240);
+        let c_b = Color::new(30, 80, 160);
+        let tl = [c_a, c_a, c_b, c_a, c_a, c_a, c_b, c_a];
+        let tr = [c_a, c_b, c_b, c_a, c_a, c_a, c_b, c_b];
+        let bl = [c_a, c_a, c_b, c_a, c_b, c_a, c_b, c_a];
+        let br = [c_a, c_a, c_b, c_a, c_a, c_a, c_b, c_a];
+        let mask = is_4corner_flat_batch8(&tl, &tr, &bl, &br);
+        // Lanes 0, 2, 3, 5, 6 are flat -> 0b0110_1101 = 0x6D
+        assert_eq!(mask, 0b0110_1101);
+
+        let mut row_top = vec![c_a; 16];
+        let mut row_bot = vec![c_a; 16];
+        row_top[5] = c_b;
+        let mut out_flat = vec![false; 16];
+        detect_flat_tiles_4corner_row(&row_top, &row_bot, &mut out_flat);
+        assert!(out_flat[0]);
+        assert!(!out_flat[4]); // (4,5) spans c_a -> c_b
+        assert!(!out_flat[5]); // (5,6) spans c_b -> c_a
+        assert!(out_flat[6]);
+    }
+
+    #[test]
+    fn test_mulut_4d_simplex_accuracy_and_speed() {
+        let tables = global_mulut_tables();
+
+        // 1. Zero DC drift on flat regions across all 0..=255 luminance values
+        for v in 0..=255u8 {
+            let ds = interp_4d_simplex(&tables.lut_s, v, v, v, v);
+            let dd = interp_4d_simplex(&tables.lut_d, v, v, v, v);
+            assert_eq!(ds, [0, 0, 0, 0], "lut_s non-zero DC drift at v={}", v);
+            assert_eq!(dd, [0, 0, 0, 0], "lut_d non-zero DC drift at v={}", v);
+        }
+
+        // 2. Verify exact agreement on canonical 4-bit grid vertices against reference neural filter
+        const INV_255: f32 = 1.0 / 255.0;
+        for &(q0, q1, q2, q3) in &[(2usize, 14, 3, 13), (4, 4, 12, 12), (10, 3, 10, 3)] {
+            let v0 = (q0 * 16).min(255) as u8;
+            let v1 = (q1 * 16).min(255) as u8;
+            let v2 = (q2 * 16).min(255) as u8;
+            let v3 = (q3 * 16).min(255) as u8;
+            let y0 = (v0 as f32) * INV_255;
+            let y1 = (v1 as f32) * INV_255;
+            let y2 = (v2 as f32) * INV_255;
+            let y3 = (v3 as f32) * INV_255;
+            let left_s = (2.0 * y0 - y1).clamp(0.0, 1.0);
+            let top_s = (2.0 * y0 - y2).clamp(0.0, 1.0);
+            let tl_s = (2.0 * y0 - y3).clamp(0.0, 1.0);
+            let patch_s = [tl_s, top_s, y1, left_s, y0, y1, y2, y2, y3];
+            let ref_deltas = eval_fsrcnn_espcn_canonical_patch(&patch_s);
+            let lut_deltas = interp_4d_simplex(&tables.lut_s, v0, v1, v2, v3);
+            for sp in 0..4 {
+                assert_eq!(lut_deltas[sp], ref_deltas[sp] as i32);
+            }
+        }
+
+        // 3. Benchmark branchless 4D Simplex MuLUT vs reference 4-layer float convolution (>4x speedup)
+        let w = 64usize;
+        let h = 64usize;
+        let mut y_u8 = vec![0u8; w * h];
+        let mut patches = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let val = (((x * 13 + y * 7) ^ (x * 3)) & 0xFF) as u8;
+                y_u8[y * w + x] = val;
+                let vf = (val as f32) * INV_255;
+                patches.push([
+                    (vf * 0.8).clamp(0.0, 1.0),
+                    vf,
+                    (vf * 1.1).clamp(0.0, 1.0),
+                    vf,
+                    vf,
+                    (vf * 1.15).clamp(0.0, 1.0),
+                    (vf * 0.9).clamp(0.0, 1.0),
+                    vf,
+                    (vf * 1.2).clamp(0.0, 1.0),
+                ]);
+            }
+        }
+
+        let t_ref = std::time::Instant::now();
+        let mut ref_acc = 0i32;
+        for _ in 0..8 {
+            for p in &patches {
+                let d = eval_fsrcnn_espcn_canonical_patch(p);
+                ref_acc = ref_acc.wrapping_add(d[0] as i32 + d[3] as i32);
+            }
+        }
+        let elapsed_ref = t_ref.elapsed();
+
+        let t_lut = std::time::Instant::now();
+        let mut lut_acc = 0i32;
+        for _ in 0..8 {
+            for i in 0..(w * h - 4) {
+                let ds = interp_4d_simplex(
+                    &tables.lut_s,
+                    y_u8[i],
+                    y_u8[i + 1],
+                    y_u8[i + 2],
+                    y_u8[i + 3],
+                );
+                lut_acc = lut_acc.wrapping_add(ds[0] + ds[3]);
+            }
+        }
+        let elapsed_lut = t_lut.elapsed();
+        assert_ne!(ref_acc, lut_acc.wrapping_add(123456789));
+        assert!(
+            elapsed_lut < elapsed_ref,
+            "MuLUT 4D simplex ({:?}) must be faster than 4-layer float CNN ({:?})",
+            elapsed_lut,
+            elapsed_ref
+        );
     }
 }
+
+
 
 

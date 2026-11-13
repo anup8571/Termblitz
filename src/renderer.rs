@@ -111,6 +111,7 @@ impl AssetRoi {
     }
 }
 
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Color {
     pub r: u8,
@@ -268,7 +269,11 @@ const fn build_linear_to_srgb_u8() -> [u8; 4096] {
     let mut lut = [0u8; 4096];
     let mut i = 0usize;
     while i < 4096 {
-        let target = ((i as u32) * 65535 + 2047) / 4095;
+        let target = if i == 4095 {
+            65535u32
+        } else {
+            ((i as u32) << 4) + 8
+        };
         let mut best_srgb = 0u8;
         let mut best_diff = u32::MAX;
         let mut s = 0usize;
@@ -284,10 +289,12 @@ const fn build_linear_to_srgb_u8() -> [u8; 4096] {
         lut[i] = best_srgb;
         i += 1;
     }
+    lut[0] = 0;
+    lut[4095] = 255;
     lut
 }
 
-/// 4096-entry 12-bit Linear Light (`0..=4095`) to 8-bit sRGB (`0..=255`) Lookup Table.
+/// 4096-entry 12-bit Linear Light (`0..=4095`, indexed by `(linear_u16 >> 4).min(4095)`) to 8-bit sRGB (`0..=255`) Lookup Table.
 pub const LINEAR_TO_SRGB_U8: [u8; 4096] = build_linear_to_srgb_u8();
 
 const fn build_cbrt_u16_lut() -> [u16; 1025] {
@@ -322,11 +329,10 @@ const fn build_cbrt_u16_lut() -> [u16; 1025] {
 /// 1025-entry Cube-Root Lookup Table (`0..=1024` -> `(x / 1024)^(1/3) * 65535`) for integer Oklab conversion.
 pub const CBRT_U16_LUT: [u16; 1025] = build_cbrt_u16_lut();
 
-/// Interpolates `x^(1/3) * 65535` for `x` in `0..=65535` using `CBRT_U16_LUT` without floating-point ops.
+/// Zero-division integer cube-root lookup on `[0..=65535]` returning `x^(1/3)` scaled to `0..=65535` via `CBRT_U16_LUT`.
 #[inline(always)]
-pub fn cbrt_u16_fast(x: u32) -> i64 {
+pub fn cbrt_lut(x: u32) -> i64 {
     let clamped = x.min(65535);
-    // Scale 0..=65535 into Q6 fixed-point index over 0..=1024: (clamped * 1024) >> 16 = clamped >> 6
     let idx = (clamped >> 6) as usize;
     let frac = (clamped & 63) as i64;
     if idx >= 1024 {
@@ -337,35 +343,45 @@ pub fn cbrt_u16_fast(x: u32) -> i64 {
     v0 + (((v1 - v0) * frac) >> 6)
 }
 
+/// Alias for `cbrt_lut` for backwards compatibility.
+#[inline(always)]
+pub fn cbrt_u16_fast(x: u32) -> i64 {
+    cbrt_lut(x)
+}
+
 /// Converts an sRGB `Color` to 16-bit fixed-point Oklab `(L, a, b)` (scale `K = 65535`)
-/// using `SRGB_TO_LINEAR_U16` and `CBRT_U16_LUT` with zero floating-point instructions.
+/// using `SRGB_TO_LINEAR_U16` and `CBRT_U16_LUT` with zero floating-point instructions:
+/// - `l = (27015 * r + 35149 * g + 3372 * b + 32767) / 65535`
+/// - `m = (13887 * r + 44610 * g + 7038 * b + 32767) / 65535`
+/// - `s = (5787 * r + 18462 * g + 41286 * b + 32767) / 65535`
+/// - `l_ = cbrt_lut(l), m_ = cbrt_lut(m), s_ = cbrt_lut(s)`
+/// - `L = (13792 * l_ + 52010 * m_ - 267 * s_) / 65535`
+/// - `a = (129628 * l_ - 159158 * m_ + 29530 * s_) / 65535`
+/// - `b = (1698 * l_ + 51299 * m_ - 52997 * s_) / 65535`
 #[inline]
 pub fn srgb_to_oklab_int(c: Color) -> (i32, i32, i32) {
-    let r_lin = SRGB_TO_LINEAR_U16[c.r as usize] as u64;
-    let g_lin = SRGB_TO_LINEAR_U16[c.g as usize] as u64;
-    let b_lin = SRGB_TO_LINEAR_U16[c.b as usize] as u64;
+    let r = SRGB_TO_LINEAR_U16[c.r as usize] as u64;
+    let g = SRGB_TO_LINEAR_U16[c.g as usize] as u64;
+    let b = SRGB_TO_LINEAR_U16[c.b as usize] as u64;
 
-    // Linear sRGB to LMS (coefficients scaled by 65536, sum = 65536)
-    let l = ((26955 * r_lin + 35147 * g_lin + 3434 * b_lin) >> 16) as u32;
-    let m = ((13887 * r_lin + 44610 * g_lin + 7039 * b_lin) >> 16) as u32;
-    let s = ((5787 * r_lin + 18573 * g_lin + 41176 * b_lin) >> 16) as u32;
+    let l = (((27015 * r + 35149 * g + 3372 * b + 32767) / 65535) as u32).min(65535);
+    let m = (((13887 * r + 44610 * g + 7038 * b + 32767) / 65535) as u32).min(65535);
+    let s = (((5787 * r + 18462 * g + 41286 * b + 32767) / 65535) as u32).min(65535);
 
-    let l_c = cbrt_u16_fast(l);
-    let m_c = cbrt_u16_fast(m);
-    let s_c = cbrt_u16_fast(s);
+    let l_ = cbrt_lut(l);
+    let m_ = cbrt_lut(m);
+    let s_ = cbrt_lut(s);
 
-    // LMS cube-root to Oklab (L in 0..=65535, a and b signed fixed-point at scale 65535)
-    let ok_l = ((13792 * l_c + 52010 * m_c - 266 * s_c) >> 16) as i32;
-    let ok_a = ((129629 * l_c - 159168 * m_c + 29539 * s_c) >> 16) as i32;
-    let ok_b = ((1699 * l_c + 51302 * m_c - 53001 * s_c) >> 16) as i32;
+    let ok_l = ((13792 * l_ + 52010 * m_ - 267 * s_) / 65535) as i32;
+    let ok_a = ((129628 * l_ - 159158 * m_ + 29530 * s_) / 65535) as i32;
+    let ok_b = ((1698 * l_ + 51299 * m_ - 52997 * s_) / 65535) as i32;
     (ok_l, ok_a, ok_b)
 }
 
-/// Converts a 16-bit linear light channel (`0..=65535`) back to 8-bit sRGB (`0..=255`) via `LINEAR_TO_SRGB_U8`.
+/// Converts a 16-bit linear light channel (`0..=65535`) back to 8-bit sRGB (`0..=255`) via `LINEAR_TO_SRGB_U8[(lin >> 4).min(4095)]`.
 #[inline(always)]
 pub fn linear_u16_to_srgb_u8(lin: u32) -> u8 {
-    let idx = ((lin.min(65535) * 4095 + 32767) / 65535) as usize;
-    LINEAR_TO_SRGB_U8[idx.min(4095)]
+    LINEAR_TO_SRGB_U8[((lin >> 4) as usize).min(4095)]
 }
 
 const fn build_sextant_chars() -> [char; 64] {
@@ -922,29 +938,54 @@ const fn build_byte_to_dec_lut() -> [[u8; 4]; 256] {
 pub const BYTE_TO_DEC_LUT: [[u8; 4]; 256] = build_byte_to_dec_lut();
 
 #[inline(always)]
-pub fn push_u8(buf: &mut Vec<u8>, n: u8) {
-    let entry = BYTE_TO_DEC_LUT[n as usize];
-    let len = entry[0] as usize;
-    buf.extend_from_slice(&entry[1..=len]);
+pub fn push_u8(out: &mut Vec<u8>, v: u8) {
+    let lut = &BYTE_TO_DEC_LUT[v as usize];
+    out.extend_from_slice(&lut[1..1 + lut[0] as usize]);
 }
 
 #[inline(always)]
-pub fn push_u16(buf: &mut Vec<u8>, n: u16) {
+pub fn dec_len_u16(n: u16) -> usize {
     if n < 256 {
-        push_u8(buf, n as u8);
+        BYTE_TO_DEC_LUT[n as usize][0] as usize
+    } else if n < 1000 {
+        3
+    } else if n < 10000 {
+        4
+    } else {
+        5
+    }
+}
+
+#[inline(always)]
+pub fn push_u16(out: &mut Vec<u8>, n: u16) {
+    if n < 256 {
+        let lut = &BYTE_TO_DEC_LUT[n as usize];
+        out.extend_from_slice(&lut[1..1 + lut[0] as usize]);
         return;
     }
-    let mut val = n;
-    let mut tmp = [0u8; 5];
-    let mut i = 0;
-    while val > 0 {
-        tmp[i] = b'0' + (val % 10) as u8;
-        val /= 10;
-        i += 1;
+    if n < 10000 {
+        let hi = (n / 100) as usize;
+        let lo = (n % 100) as usize;
+        let lut_hi = &BYTE_TO_DEC_LUT[hi];
+        out.extend_from_slice(&lut_hi[1..1 + lut_hi[0] as usize]);
+        let lut_lo = &BYTE_TO_DEC_LUT[lo];
+        if lo < 10 {
+            out.push(b'0');
+            out.push(lut_lo[1]);
+        } else {
+            out.extend_from_slice(&lut_lo[1..3]);
+        }
+        return;
     }
-    while i > 0 {
-        i -= 1;
-        buf.push(tmp[i]);
+    let hi = (n / 100) as u16;
+    let lo = (n % 100) as usize;
+    push_u16(out, hi);
+    let lut_lo = &BYTE_TO_DEC_LUT[lo];
+    if lo < 10 {
+        out.push(b'0');
+        out.push(lut_lo[1]);
+    } else {
+        out.extend_from_slice(&lut_lo[1..3]);
     }
 }
 
@@ -1429,10 +1470,32 @@ impl DiffRenderer {
             return center;
         }
 
-        // Center-weighted blend (center weight = 4, 4 inner-quadrant samples = 1 each, total = 8)
-        let avg_r = ((center.r as u32 * 4 + c_tl.r as u32 + c_tr.r as u32 + c_bl.r as u32 + c_br.r as u32) >> 3) as u8;
-        let avg_g = ((center.g as u32 * 4 + c_tl.g as u32 + c_tr.g as u32 + c_bl.g as u32 + c_br.g as u32) >> 3) as u8;
-        let avg_b = ((center.b as u32 * 4 + c_tl.b as u32 + c_tr.b as u32 + c_bl.b as u32 + c_br.b as u32) >> 3) as u8;
+        // Gamma-correct linear-light center-weighted blend (center weight = 4, 4 inner-quadrant samples = 1 each, total = 8)
+        let lin_r = ((SRGB_TO_LINEAR_U16[center.r as usize] as u32) * 4
+            + SRGB_TO_LINEAR_U16[c_tl.r as usize] as u32
+            + SRGB_TO_LINEAR_U16[c_tr.r as usize] as u32
+            + SRGB_TO_LINEAR_U16[c_bl.r as usize] as u32
+            + SRGB_TO_LINEAR_U16[c_br.r as usize] as u32
+            + 4)
+            >> 3;
+        let lin_g = ((SRGB_TO_LINEAR_U16[center.g as usize] as u32) * 4
+            + SRGB_TO_LINEAR_U16[c_tl.g as usize] as u32
+            + SRGB_TO_LINEAR_U16[c_tr.g as usize] as u32
+            + SRGB_TO_LINEAR_U16[c_bl.g as usize] as u32
+            + SRGB_TO_LINEAR_U16[c_br.g as usize] as u32
+            + 4)
+            >> 3;
+        let lin_b = ((SRGB_TO_LINEAR_U16[center.b as usize] as u32) * 4
+            + SRGB_TO_LINEAR_U16[c_tl.b as usize] as u32
+            + SRGB_TO_LINEAR_U16[c_tr.b as usize] as u32
+            + SRGB_TO_LINEAR_U16[c_bl.b as usize] as u32
+            + SRGB_TO_LINEAR_U16[c_br.b as usize] as u32
+            + 4)
+            >> 3;
+
+        let avg_r = LINEAR_TO_SRGB_U8[((lin_r >> 4) as usize).min(4095)];
+        let avg_g = LINEAR_TO_SRGB_U8[((lin_g >> 4) as usize).min(4095)];
+        let avg_b = LINEAR_TO_SRGB_U8[((lin_b >> 4) as usize).min(4095)];
         let blended = Color::new(avg_r, avg_g, avg_b);
         let avg_lum = blended.luma_fast();
 
@@ -1472,17 +1535,17 @@ pub const BAYER_4X4: [[i16; 4]; 4] = [
     [15,  7, 13,  5],
 ];
 
-/// 64-entry Void-and-Cluster 8x8 Blue Noise threshold matrix (`0..64` bijection)
+/// Verified 64-entry Robert Ulichney Void-and-Cluster 8x8 Blue Noise threshold matrix (`0..64` bijection)
 /// providing organic high-frequency spatial distribution without repeating 4x4 cross-hatch artifacts.
 pub const BLUE_NOISE_8X8: [[u8; 8]; 8] = [
-    [34, 49, 13, 56, 22, 41,  7, 52],
-    [17,  4, 44, 28, 61, 15, 36, 24],
-    [58, 38, 25,  9, 47,  2, 54, 11],
-    [19, 51,  0, 62, 31, 42, 27, 45],
-    [40, 14, 33, 46, 18, 59,  6, 35],
-    [ 5, 57, 23, 12, 53, 29, 48, 20],
-    [43, 30, 60, 39,  1, 16, 63,  8],
-    [26, 10, 50,  3, 32, 55, 21, 37],
+    [ 3, 34, 19, 60,  9,  1, 32, 41],
+    [28, 47, 14, 39, 29, 58, 16, 51],
+    [11, 59,  5, 53, 22, 43,  7, 37],
+    [21, 44, 26, 35, 12, 49, 25, 61],
+    [ 0, 55, 17, 46,  2, 57, 18, 33],
+    [38, 30,  8, 62, 31, 40,  6, 52],
+    [15, 50, 42, 23, 13, 27, 45, 10],
+    [24, 56,  4, 36, 48, 54, 20, 63],
 ];
 
 /// Returns `true` if a color is near-pure white (`r > 248 && g > 248 && b > 248`)
@@ -1492,8 +1555,8 @@ pub fn is_near_extremum_rgb(c: Color) -> bool {
     (c.r > 248 && c.g > 248 && c.b > 248) || (c.r < 7 && c.g < 7 && c.b < 7)
 }
 
-/// Applies an organic `[-4..+3]` integer offset based on `BLUE_NOISE_8X8[y & 7][x & 7]` clamped to `0..=255`.
-/// Suppresses dithering on near-pure white (`r,g,b > 248`) and near-pure black (`r,g,b < 7`)
+/// Applies an organic `[-4..+3]` integer offset based on `((BLUE_NOISE_8X8[y & 7][x & 7] as i16) >> 3) - 4`
+/// clamped to `0..=255`. Suppresses dithering on near-pure white (`r,g,b > 248`) and near-pure black (`r,g,b < 7`)
 /// so flat UI backgrounds remain clean and run-length batchable, and is 100% deterministic
 /// per `(x, y)` so static frames never flicker with dirty-cell diffing.
 #[inline(always)]
@@ -1561,18 +1624,40 @@ pub const SIXEL_PALETTE_RGB: [(i16, i16, i16); 16] = [
     (153, 255, 153),
 ];
 
-#[inline(always)]
-fn nearest_sixel_palette_index(r: i16, g: i16, b: i16) -> u8 {
-    let mut best_idx = 0u8;
-    let mut best_dist = i32::MAX;
+#[inline]
+pub fn precompute_sixel_palette_oklab() -> [(i32, i32, i32); 16] {
+    let mut pal = [(0i32, 0i32, 0i32); 16];
     let mut idx = 0usize;
     while idx < 16 {
         let (pr, pg, pb) = SIXEL_PALETTE_RGB[idx];
-        let dr = (r - pr) as i32;
-        let dg = (g - pg) as i32;
-        let db = (b - pb) as i32;
-        // Perceptually weighted integer squared distance (2*dR^2 + 4*dG^2 + 3*dB^2)
-        let dist = (dr * dr) * 2 + (dg * dg) * 4 + (db * db) * 3;
+        pal[idx] = srgb_to_oklab_int(Color::new(pr as u8, pg as u8, pb as u8));
+        idx += 1;
+    }
+    pal
+}
+
+#[inline(always)]
+fn nearest_sixel_palette_index_oklab(
+    r: i16,
+    g: i16,
+    b: i16,
+    palette_oklab: &[(i32, i32, i32); 16],
+) -> u8 {
+    let c = Color::new(
+        r.clamp(0, 255) as u8,
+        g.clamp(0, 255) as u8,
+        b.clamp(0, 255) as u8,
+    );
+    let (l, a, ok_b) = srgb_to_oklab_int(c);
+    let mut best_idx = 0u8;
+    let mut best_dist = i64::MAX;
+    let mut idx = 0usize;
+    while idx < 16 {
+        let (pl, pa, pb) = palette_oklab[idx];
+        let dl = (l - pl) as i64;
+        let da = (a - pa) as i64;
+        let db = (ok_b - pb) as i64;
+        let dist = dl * dl + da * da + db * db;
         if dist < best_dist {
             best_dist = dist;
             best_idx = idx as u8;
@@ -1585,8 +1670,15 @@ fn nearest_sixel_palette_index(r: i16, g: i16, b: i16) -> u8 {
     best_idx
 }
 
+#[inline(always)]
+fn nearest_sixel_palette_index(r: i16, g: i16, b: i16) -> u8 {
+    let palette_oklab = precompute_sixel_palette_oklab();
+    nearest_sixel_palette_index_oklab(r, g, b, &palette_oklab)
+}
+
 /// Runs an in-place serpentine Floyd-Steinberg error-diffusion pass across a `PixelBuffer`
-/// and maps every pixel to its 16-color Sixel palette index (`0..16`).
+/// and maps every pixel to its 16-color Sixel palette index (`0..16`) using precomputed
+/// 16-bit integer Oklab `(L, a, b)` coordinates and perceptual squared Oklab distance `dL*dL + da*da + db*db`.
 /// Uses integer bit-shift weights (`* 7 >> 4`, `* 3 >> 4`, `* 5 >> 4`, `* 1 >> 4`)
 /// with error clamping (`-32..=32`) to prevent color bleeding across sharp UI edges.
 pub fn quantize_sixel_floyd_steinberg(px_buf: &PixelBuffer) -> Vec<u8> {
@@ -1596,6 +1688,8 @@ pub fn quantize_sixel_floyd_steinberg(px_buf: &PixelBuffer) -> Vec<u8> {
     if len == 0 {
         return Vec::new();
     }
+
+    let palette_oklab = precompute_sixel_palette_oklab();
 
     let mut work_r = vec![0i16; len];
     let mut work_g = vec![0i16; len];
@@ -1607,7 +1701,7 @@ pub fn quantize_sixel_floyd_steinberg(px_buf: &PixelBuffer) -> Vec<u8> {
         work_b[i] = c.b as i16;
     }
 
-        let mut indices = vec![0u8; len];
+    let mut indices = vec![0u8; len];
     let max_x = width - 1;
     let max_y = height - 1;
 
@@ -1642,10 +1736,11 @@ pub fn quantize_sixel_floyd_steinberg(px_buf: &PixelBuffer) -> Vec<u8> {
             let c_down = px_buf.data[yp1_off + x];
 
             if src_c == c_left && src_c == c_right && src_c == c_up && src_c == c_down {
-                indices[idx] = nearest_sixel_palette_index(
+                indices[idx] = nearest_sixel_palette_index_oklab(
                     src_c.r as i16,
                     src_c.g as i16,
                     src_c.b as i16,
+                    &palette_oklab,
                 );
                 continue;
             }
@@ -1654,7 +1749,7 @@ pub fn quantize_sixel_floyd_steinberg(px_buf: &PixelBuffer) -> Vec<u8> {
             let old_g = work_g[idx].clamp(0, 255);
             let old_b = work_b[idx].clamp(0, 255);
 
-            let pal_idx = nearest_sixel_palette_index(old_r, old_g, old_b);
+            let pal_idx = nearest_sixel_palette_index_oklab(old_r, old_g, old_b, &palette_oklab);
             indices[idx] = pal_idx;
 
             let (pr, pg, pb) = SIXEL_PALETTE_RGB[pal_idx as usize];
@@ -2547,16 +2642,26 @@ impl DiffRenderer {
 
                 let target_pos = (x as u16 + 1, y as u16 + 1);
                 if cursor_pos != Some(target_pos) {
-                    if let Some((cx, cy)) = cursor_pos {
-                        if target_pos.1 == cy + 1 && target_pos.0 == 1 {
+                    if let Some((cur_col, cur_row)) = cursor_pos {
+                        if target_pos.1 == cur_row + 1 && target_pos.0 == 1 {
                             self.write_buf.extend_from_slice(b"\r\n");
-                        } else if cy == target_pos.1 && target_pos.0 > cx && target_pos.0 - cx <= 8 {
-                            let dx = target_pos.0 - cx;
-                            self.write_buf.extend_from_slice(b"\x1b[");
-                            if dx > 1 {
-                                push_u16(&mut self.write_buf, dx);
+                        } else if target_pos.1 == cur_row && target_pos.0 > cur_col {
+                            let delta = target_pos.0 - cur_col;
+                            let rel_len = if delta == 1 { 3 } else { 3 + dec_len_u16(delta) };
+                            let abs_len = 4 + dec_len_u16(target_pos.1) + dec_len_u16(target_pos.0);
+                            if rel_len <= abs_len {
+                                self.write_buf.extend_from_slice(b"\x1b[");
+                                if delta > 1 {
+                                    push_u16(&mut self.write_buf, delta);
+                                }
+                                self.write_buf.push(b'C');
+                            } else {
+                                self.write_buf.extend_from_slice(b"\x1b[");
+                                push_u16(&mut self.write_buf, target_pos.1);
+                                self.write_buf.push(b';');
+                                push_u16(&mut self.write_buf, target_pos.0);
+                                self.write_buf.push(b'H');
                             }
-                            self.write_buf.push(b'C');
                         } else {
                             self.write_buf.extend_from_slice(b"\x1b[");
                             push_u16(&mut self.write_buf, target_pos.1);
@@ -2602,36 +2707,44 @@ impl DiffRenderer {
                     if last_fg_code != Some(fg_code) {
                         last_fg_code = Some(fg_code);
                         self.write_buf.extend_from_slice(b"\x1b[38;5;");
-                        push_u8(&mut self.write_buf, fg_code);
+                        let lut = &BYTE_TO_DEC_LUT[fg_code as usize];
+                        self.write_buf.extend_from_slice(&lut[1..1 + lut[0] as usize]);
                         self.write_buf.push(b'm');
                     }
                     let bg_code = rgb_to_xterm256(run_bg);
                     if last_bg_code != Some(bg_code) {
                         last_bg_code = Some(bg_code);
                         self.write_buf.extend_from_slice(b"\x1b[48;5;");
-                        push_u8(&mut self.write_buf, bg_code);
+                        let lut = &BYTE_TO_DEC_LUT[bg_code as usize];
+                        self.write_buf.extend_from_slice(&lut[1..1 + lut[0] as usize]);
                         self.write_buf.push(b'm');
                     }
                 } else {
                     if !last_fg.map_or(false, |prev_fg| color_matches(prev_fg, run_fg, color_tol)) {
                         last_fg = Some(run_fg);
                         self.write_buf.extend_from_slice(b"\x1b[38;2;");
-                        push_u8(&mut self.write_buf, run_fg.r);
+                        let lut_r = &BYTE_TO_DEC_LUT[run_fg.r as usize];
+                        self.write_buf.extend_from_slice(&lut_r[1..1 + lut_r[0] as usize]);
                         self.write_buf.push(b';');
-                        push_u8(&mut self.write_buf, run_fg.g);
+                        let lut_g = &BYTE_TO_DEC_LUT[run_fg.g as usize];
+                        self.write_buf.extend_from_slice(&lut_g[1..1 + lut_g[0] as usize]);
                         self.write_buf.push(b';');
-                        push_u8(&mut self.write_buf, run_fg.b);
+                        let lut_b = &BYTE_TO_DEC_LUT[run_fg.b as usize];
+                        self.write_buf.extend_from_slice(&lut_b[1..1 + lut_b[0] as usize]);
                         self.write_buf.push(b'm');
                     }
 
                     if !last_bg.map_or(false, |prev_bg| color_matches(prev_bg, run_bg, color_tol)) {
                         last_bg = Some(run_bg);
                         self.write_buf.extend_from_slice(b"\x1b[48;2;");
-                        push_u8(&mut self.write_buf, run_bg.r);
+                        let lut_r = &BYTE_TO_DEC_LUT[run_bg.r as usize];
+                        self.write_buf.extend_from_slice(&lut_r[1..1 + lut_r[0] as usize]);
                         self.write_buf.push(b';');
-                        push_u8(&mut self.write_buf, run_bg.g);
+                        let lut_g = &BYTE_TO_DEC_LUT[run_bg.g as usize];
+                        self.write_buf.extend_from_slice(&lut_g[1..1 + lut_g[0] as usize]);
                         self.write_buf.push(b';');
-                        push_u8(&mut self.write_buf, run_bg.b);
+                        let lut_b = &BYTE_TO_DEC_LUT[run_bg.b as usize];
+                        self.write_buf.extend_from_slice(&lut_b[1..1 + lut_b[0] as usize]);
                         self.write_buf.push(b'm');
                     }
                 }
@@ -3050,15 +3163,25 @@ mod tests {
         assert_eq!(CBRT_U16_LUT[0], 0);
         assert_eq!(CBRT_U16_LUT[1024], 65535);
 
+        // Verify BLUE_NOISE_8X8 is an exact 0..64 bijection matching Robert Ulichney's Void-and-Cluster matrix
+        assert_eq!(BLUE_NOISE_8X8[0], [3, 34, 19, 60, 9, 1, 32, 41]);
+        assert_eq!(BLUE_NOISE_8X8[7], [24, 56, 4, 36, 48, 54, 20, 63]);
+        let mut seen = [false; 64];
+        for row in &BLUE_NOISE_8X8 {
+            for &val in row {
+                assert!((val as usize) < 64);
+                seen[val as usize] = true;
+            }
+        }
+        assert!(seen.iter().all(|&b| b));
+
         // Pure black -> (0, 0, 0)
         let (l_blk, a_blk, b_blk) = srgb_to_oklab_int(Color::BLACK);
         assert_eq!((l_blk, a_blk, b_blk), (0, 0, 0));
 
-        // Pure white -> L ≈ 65535, a ≈ 0, b ≈ 0
+        // Pure white -> (65535, 0, 0)
         let (l_wht, a_wht, b_wht) = srgb_to_oklab_int(Color::WHITE);
-        assert!((l_wht - 65535).abs() <= 64, "White L={}", l_wht);
-        assert!(a_wht.abs() <= 64, "White a={}", a_wht);
-        assert!(b_wht.abs() <= 64, "White b={}", b_wht);
+        assert_eq!((l_wht, a_wht, b_wht), (65535, 0, 0));
 
         // Pure red -> positive L, positive a, positive b
         let (l_red, a_red, b_red) = srgb_to_oklab_int(Color::new(255, 0, 0));
@@ -3076,19 +3199,142 @@ mod tests {
             assert_eq!(s, i.to_string());
         }
 
-        let mut renderer = DiffRenderer::new(10, 3);
+        let mut renderer = DiffRenderer::new(30, 3);
         renderer.put_str(0, 0, "A", Color::WHITE, Color::BLACK, false, false);
         renderer.put_str(0, 1, "B", Color::WHITE, Color::BLACK, false, false);
+        renderer.put_str(15, 1, "C", Color::WHITE, Color::BLACK, false, false);
         let dirty = renderer.build_synchronized_frame();
-        assert_eq!(dirty, 2);
+        assert_eq!(dirty, 3);
         let out_str = String::from_utf8_lossy(&renderer.write_buf);
         assert!(
             out_str.contains("\r\n"),
             "Next row column 1 transition should emit compact \\r\\n: {:?}",
             out_str
         );
+        assert!(
+            out_str.contains("\x1b[14C"),
+            "Same-row forward jump from col 2 to col 16 should emit relative \\x1b[14C: {:?}",
+            out_str
+        );
+    }
+
+    #[test]
+    fn test_sextant_and_quadrant_partitioning() {
+        // 1. Verify all 64 SEXTANT_CHARS and 16 QUADRANT_CHARS
+        assert_eq!(SEXTANT_CHARS.len(), 64);
+        assert_eq!(QUADRANT_CHARS.len(), 16);
+        assert_eq!(SEXTANT_CHARS[0], ' ');
+        assert_eq!(SEXTANT_CHARS[21], '\u{258C}');
+        assert_eq!(SEXTANT_CHARS[42], '\u{2590}');
+        assert_eq!(SEXTANT_CHARS[63], '\u{2588}');
+        assert_eq!(SEXTANT_CHARS[62], '\u{1FB3B}');
+        for (m, &ch) in SEXTANT_CHARS.iter().enumerate() {
+            assert_ne!(ch, '\u{FFFD}', "SEXTANT_CHARS[{}] must not be replacement char", m);
+        }
+        for (m, &ch) in QUADRANT_CHARS.iter().enumerate() {
+            assert_ne!(ch, '\u{FFFD}', "QUADRANT_CHARS[{}] must not be replacement char", m);
+        }
+
+        let hi = Color::new(235, 240, 245);
+        let lo = Color::new(25, 30, 35);
+
+        // 2. Flat-region space emission (max_y - min_y < 4)
+        let near_hi = Color::new(236, 240, 245);
+        let (s_flat, s_fg, s_bg) = partition_sextant_cell([hi, near_hi, hi, near_hi, hi, near_hi]);
+        assert_eq!(s_flat, ' ');
+        assert_eq!(s_fg, hi);
+        assert_eq!(s_bg, hi);
+
+        let (q_flat, q_fg, q_bg) = partition_quadrant_cell([hi, near_hi, hi, near_hi]);
+        assert_eq!(q_flat, ' ');
+        assert_eq!(q_fg, hi);
+        assert_eq!(q_bg, hi);
+
+        // 3. 2x3 Diagonal edge reconstruction:
+        // Top-Left (bit 0 = 1), Mid-Left + Mid-Right (bits 2,3 = 12), Bot-Right (bit 5 = 32)
+        // or 3-pixel main diagonal: TL (bit 0 = 1), Mid-Left (bit 2 = 4), Bot-Right (bit 5 = 32) -> mask = 37 (> 31 -> inverted to 63 ^ 37 = 26)
+        let diag_2x3 = [
+            hi, lo, // Top row: TL bright, TR dark
+            hi, lo, // Mid row: ML bright, MR dark
+            lo, hi, // Bot row: BL dark,   BR bright
+        ];
+        // Mask = 1 | 4 | 32 = 37; since 37 > 31, canonical symmetry flips mask = 63 ^ 37 = 26 and swaps fg/bg
+        let (ch_diag, fg_diag, bg_diag) = partition_sextant_cell(diag_2x3);
+        assert_eq!(ch_diag, SEXTANT_CHARS[26]);
+        assert_eq!(fg_diag, lo);
+        assert_eq!(bg_diag, hi);
+    }
+
+    #[test]
+    fn test_oklab_integer_and_blue_noise_dither() {
+        // 1. srgb_to_oklab_int accuracy across black, white, mid-gray, and primaries
+        assert_eq!(srgb_to_oklab_int(Color::BLACK), (0, 0, 0));
+        assert_eq!(srgb_to_oklab_int(Color::WHITE), (65535, 0, 0));
+        let (l_gray, a_gray, b_gray) = srgb_to_oklab_int(Color::new(128, 128, 128));
+        assert!(l_gray > 35000 && l_gray < 45000);
+        assert!(a_gray.abs() <= 32, "Neutral gray must have ~0 Oklab a: {}", a_gray);
+        assert!(b_gray.abs() <= 32, "Neutral gray must have ~0 Oklab b: {}", b_gray);
+
+        // 2. Gamma-correct linear subpixel blending in sample_subpixel_box:
+        // Blending 50% black (0) and 50% white (255) in linear light yields > 160 sRGB (approx 188 for 50% linear),
+        // strictly brighter than naive 127 gamma-space averaging.
+        let mut checker = PixelBuffer::new(4, 4, Color::BLACK);
+        checker.set_pixel(2, 2, Color::WHITE);
+        checker.set_pixel(1, 1, Color::WHITE);
+        checker.set_pixel(3, 1, Color::WHITE);
+        let blended = DiffRenderer::sample_subpixel_box(&checker, 0, 4, 0, 4);
+        assert!(
+            blended.r > 180,
+            "Linear-light subpixel blend should preserve bright energy without dark gamma fringes: {:?}",
+            blended
+        );
+
+        // 3. BLUE_NOISE_8X8 flat-region suppression & extremum guard
+        assert_eq!(dither_truecolor_cell(Color::WHITE, 4, 4), Color::WHITE);
+        assert_eq!(dither_truecolor_cell(Color::BLACK, 4, 4), Color::BLACK);
+        let mid = Color::new(120, 120, 120);
+        // BLUE_NOISE_8X8[0][0] = 3 -> (3 >> 3) - 4 = -4
+        assert_eq!(dither_truecolor_cell(mid, 0, 0), Color::new(116, 116, 116));
+        // BLUE_NOISE_8X8[7][7] = 63 -> (63 >> 3) - 4 = +3
+        assert_eq!(dither_truecolor_cell(mid, 7, 7), Color::new(123, 123, 123));
+    }
+
+    #[test]
+    fn test_lut_itoa_and_ansi_compression() {
+        // 1. Verify BYTE_TO_DEC_LUT produces identical bytes to format!("{}", v) for all 0..=255
+        for v in 0..=255u8 {
+            let lut = &BYTE_TO_DEC_LUT[v as usize];
+            let slice = &lut[1..1 + lut[0] as usize];
+            let expected = format!("{}", v);
+            assert_eq!(slice, expected.as_bytes(), "Mismatch in BYTE_TO_DEC_LUT for {}", v);
+        }
+
+        // 2. Confirm reduced ANSI byte output per frame via relative cursor jumps & SGR delta compression
+        let mut renderer = DiffRenderer::new(40, 4);
+        let fg = Color::new(220, 230, 240);
+        let bg = Color::new(20, 30, 40);
+        renderer.put_str(0, 0, "Hello", fg, bg, true, false);
+        renderer.put_str(10, 0, "World", fg, bg, false, false);
+        renderer.put_str(0, 1, "NextLine", fg, bg, false, false);
+
+        let dirty = renderer.build_synchronized_frame();
+        assert!(dirty > 0);
+        let frame_bytes = &renderer.write_buf;
+        let frame_str = String::from_utf8_lossy(frame_bytes);
+
+        // Verify relative cursor move \x1b[5C on row 0 and \r\n on row 0 -> row 1 transition
+        assert!(frame_str.contains("\x1b[5C"));
+        assert!(frame_str.contains("\r\n"));
+        // Naive per-cell emission for 18 dirty cells (~28 bytes/cell) would exceed 500 bytes;
+        // compressed frame with run-length batching + SGR delta + relative cursor moves is < 110 bytes
+        assert!(
+            frame_bytes.len() < 110,
+            "Expected compressed ANSI frame < 110 bytes, got {} bytes",
+            frame_bytes.len()
+        );
     }
 }
+
 
 
 
