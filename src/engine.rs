@@ -124,11 +124,11 @@ impl RectMask {
     }
 
     /// Maps this CSS viewport popup rectangle to terminal cell bounds `(col_start, row_start, col_end, row_end)`
-    /// where `row` is in full terminal coordinates (`1..rows`, excluding row 0 status bar).
+    /// where `row` is in full terminal coordinates (`2..rows`, below row 0 header and row 1 https bar).
     pub fn to_terminal_bounds(&self, cols: u16, rows: u16, vw: u32, vh: u32) -> (u16, u16, u16, u16) {
         let pw = vw.max(1) as f32;
         let ph = vh.max(1) as f32;
-        let view_start_y = 1u16;
+        let view_start_y = 2u16;
         let view_rows = (rows.saturating_sub(view_start_y)).max(1) as f32;
 
         let c0 = ((self.x.max(0) as f32 * cols as f32) / pw).floor().max(0.0) as u16;
@@ -180,11 +180,11 @@ impl VideoRect {
     }
 
     /// Converts this CSS viewport video rectangle into terminal cell bounds `(col_start, row_start, col_end, row_end)`
-    /// where `row` is in full terminal coordinates (`1..rows`, excluding row 0 status bar).
+    /// where `row` is in full terminal coordinates (`2..rows`, below row 0 header and row 1 https bar).
     pub fn to_terminal_bounds(&self, cols: u16, rows: u16, vw: u32, vh: u32) -> (u16, u16, u16, u16) {
         let pw = vw.max(1) as f32;
         let ph = vh.max(1) as f32;
-        let view_start_y = 1u16;
+        let view_start_y = 2u16;
         let view_rows = (rows.saturating_sub(view_start_y)).max(1) as f32;
 
         let c0 = ((self.x.max(0) as f32 * cols as f32) / pw).floor().max(0.0) as u16;
@@ -1477,6 +1477,7 @@ fn build_page_style_js(hide_text: bool, adblock: bool, muted: bool) -> String {
                 s.textContent='\
                     html,body{{max-width:100vw!important;overflow-x:hidden!important;box-sizing:border-box!important;word-break:break-word!important;-webkit-text-size-adjust:100%!important;}}\
                     img,video,canvas,svg{{max-width:100%!important;height:auto!important;}}\
+                    .collapsible-block,.mf-collapsible-content,[class*=collapsible-block]{{display:block!important;}}\
                     html:not([data-termblitz-raw=yes]) *,html:not([data-termblitz-raw=yes]) *::before,html:not([data-termblitz-raw=yes]) *::after{{-webkit-text-fill-color:transparent!important;text-shadow:none!important;-webkit-text-stroke:0!important;}}\
                     html[data-termblitz-adblock=yes] ins.adsbygoogle,html[data-termblitz-adblock=yes] [id^=google_ads],html[data-termblitz-adblock=yes] [id^=div-gpt-ad],html[data-termblitz-adblock=yes] [data-text-ad],html[data-termblitz-adblock=yes] [aria-label=Ads],html[data-termblitz-adblock=yes] iframe[src*=doubleclick],html[data-termblitz-adblock=yes] iframe[id*=google_ads],html[data-termblitz-adblock=yes] ytd-ad-slot-renderer,html[data-termblitz-adblock=yes] ytd-in-feed-ad-layout-renderer,html[data-termblitz-adblock=yes] ytm-promoted-sparkles-web-renderer,html[data-termblitz-adblock=yes] ytm-companion-ad-renderer,html[data-termblitz-adblock=yes] .ytp-ad-overlay-container,html[data-termblitz-adblock=yes] .ytp-ad-message-container{{display:none!important;}}\
                 ';\
@@ -1616,6 +1617,16 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             }\
             return '';\
         }\
+        function getOwnBg(el){\
+            if(!el||el===document.body||el===document.documentElement)return '';\
+            var bc=getComputedStyle(el).backgroundColor;\
+            if(!bc||bc==='rgba(0, 0, 0, 0)'||bc==='transparent')return '';\
+            if(bc.indexOf('rgba(')===0){\
+                var parts=bc.split(',');\
+                if(parts.length>=4&&parseFloat(parts[3])<0.85)return '';\
+            }\
+            return bc;\
+        }\
         function isFixed(el){\
             var cur=el;\
             while(cur&&cur!==document.body&&cur!==document.documentElement){\
@@ -1644,7 +1655,7 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             return maxZ;\
         }\
         var popSel='dialog[open],[role=listbox],[role=dialog],[role=alertdialog],[aria-modal=true],[role=menu],.modal,.dialog,#dialog,[id*=cookie],[id*=consent],[class*=consent],[class*=dialog],.G43f7e,.UUbT9,.aajZCb,.sbct';\
-        var popCand=document.querySelectorAll(popSel+',header,nav,div,ul,section,aside');\
+        var popCand=document.querySelectorAll(popSel+',header,nav');\
         var popBoxes=[],occluderBoxes=[];\
         for(var pi=0;pi<popCand.length;pi++){\
             var pel=popCand[pi];\
@@ -1655,19 +1666,19 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             var isRolePop=pel.matches(popSel);\
             var zVal=parseInt(ps.zIndex,10);\
             if(isNaN(zVal))zVal=0;\
-            var isPosPop=(ps.position==='fixed'||ps.position==='absolute'||ps.position==='sticky')&&(zVal>=2||isRolePop||ps.position==='fixed');\
-            if(!isRolePop&&!isPosPop)continue;\
-            var pbg=getBg(pel);\
-            if(!pbg&&isRolePop)pbg='rgb(255, 255, 255)';\
+            var isStickyNav=(!isRolePop&&(ps.position==='fixed'||ps.position==='sticky')&&prc.height<=88);\
+            if(!isRolePop&&!isStickyNav)continue;\
+            var pbg=getOwnBg(pel);\
+            if(!pbg&&isRolePop)pbg=getOwnBg(pel.parentElement)||'rgb(255, 255, 255)';\
             if(!pbg)continue;\
             var mx=Math.max(0,~~prc.left),my=Math.max(0,~~prc.top),mw=Math.min(vw-mx,~~prc.width),mh=Math.min(vh-my,~~prc.height);\
-            if(mw<24||mh<16)continue;\
+            if(mw<24||mh<16||mh>=vh-24)continue;\
             var effZ=Math.max(zVal,getStackZ(pel),isRolePop?100:10);\
             if(occluderBoxes.length<16){\
                 occluderBoxes.push({el:pel,x:mx,y:my,w:mw,h:mh,z:effZ});\
             }\
-            if(isRolePop&&!pel.matches('.sbct,dialog[open],[role=dialog],[role=alertdialog],[aria-modal=true]')&&!pel.querySelector('[role=option],.sbct,li,button,a'))continue;\
-            if(prc.width>=vw-4&&prc.height>=vh-16&&!isRolePop)continue;\
+            if(!isRolePop)continue;\
+            if(!pel.matches('.sbct,dialog[open],[role=dialog],[role=alertdialog],[aria-modal=true]')&&!pel.querySelector('[role=option],.sbct,li,button,a'))continue;\
             var rgbm=pbg.match(/(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)/);\
             if(!rgbm)continue;\
             var dup=false;\
@@ -2162,8 +2173,8 @@ fn spawn_cdp_worker(
                     CdpWorkerCommand::Click(col, row) => {
                         coalesced_scroll_delta = 0;
                         let px_x = (((col as f32 + 0.5) * width_px as f32) / curr_cols.max(1) as f32) as u32;
-                        let px_y = ((((row.saturating_sub(1) as f32) + 0.5) * height_px as f32)
-                            / (curr_rows.saturating_sub(1)).max(1) as f32) as u32;
+                        let px_y = ((((row.saturating_sub(2) as f32) + 0.5) * height_px as f32)
+                            / (curr_rows.saturating_sub(2)).max(1) as f32) as u32;
                         seq += 1;
                         let press = format!(
                             r#"{{"id":{},"method":"Input.dispatchMouseEvent","params":{{"type":"mousePressed","x":{},"y":{},"button":"left","clickCount":1}}}}"#,
@@ -2185,8 +2196,8 @@ fn spawn_cdp_worker(
                     CdpWorkerCommand::FocusInput(col, row) => {
                         coalesced_scroll_delta = 0;
                         let px_x = (((col as f32 + 0.5) * width_px as f32) / curr_cols.max(1) as f32) as u32;
-                        let px_y = ((((row.saturating_sub(1) as f32) + 0.5) * height_px as f32)
-                            / (curr_rows.saturating_sub(1)).max(1) as f32) as u32;
+                        let px_y = ((((row.saturating_sub(2) as f32) + 0.5) * height_px as f32)
+                            / (curr_rows.saturating_sub(2)).max(1) as f32) as u32;
                         seq += 1;
                         let press = format!(
                             r#"{{"id":{},"method":"Input.dispatchMouseEvent","params":{{"type":"mousePressed","x":{},"y":{},"button":"left","clickCount":1}}}}"#,
@@ -2476,8 +2487,8 @@ fn spawn_cdp_worker(
                     / curr_cols.max(1) as f32)
                     .round()
                     .clamp(1.0, (width_px.saturating_sub(2)).max(1) as f32) as i32;
-                let px_y = ((((sc_row.max(1).saturating_sub(1) as f32) + 0.5) * height_px as f32)
-                    / (curr_rows.saturating_sub(1)).max(1) as f32)
+                let px_y = ((((sc_row.max(2).saturating_sub(2) as f32) + 0.5) * height_px as f32)
+                    / (curr_rows.saturating_sub(2)).max(1) as f32)
                     .round()
                     .clamp(1.0, (height_px.saturating_sub(2)).max(1) as f32) as i32;
 
@@ -2895,7 +2906,7 @@ impl CdpEngine {
         let (vw, vh) = self.get_viewport_dims();
         let pw = vw.max(1) as f32;
         let ph = vh.max(1) as f32;
-        let view_start_y = 1u16;
+        let view_start_y = 2u16;
         let view_rows = (rows.saturating_sub(view_start_y)).max(1) as f32;
 
         for span in overlays.iter().rev() {

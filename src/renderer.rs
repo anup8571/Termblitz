@@ -1025,6 +1025,7 @@ fn write_stdout_bytes(buf: &[u8]) -> io::Result<()> {
 pub struct DiffRenderer {
     pub width: u16,
     pub height: u16,
+    pub layout_rows: u16,
     pub protocol: GraphicsProtocol,
     pub subcell_mode: SubCellMode,
     pub upscale_mode: UpscaleMode,
@@ -1058,6 +1059,7 @@ impl DiffRenderer {
         Self {
             width,
             height,
+            layout_rows: height,
             protocol: GraphicsProtocol::auto_detect(),
             subcell_mode: SubCellMode::HalfBlock1x2,
             upscale_mode: UpscaleMode::FsrOnly,
@@ -1091,6 +1093,9 @@ impl DiffRenderer {
     }
 
     pub fn resize(&mut self, width: u16, height: u16) {
+        if width != self.width || height >= self.layout_rows {
+            self.layout_rows = height;
+        }
         self.width = width;
         self.height = height;
         let size = (width as usize) * (height as usize);
@@ -1816,7 +1821,9 @@ impl DiffRenderer {
     pub fn blit_pixel_buffer(&mut self, px_buf: &PixelBuffer, start_y: u16, max_y: u16) {
         let cols = self.width as usize;
         let rows = (max_y.saturating_sub(start_y)) as usize;
+        let full_rows = (self.layout_rows.max(max_y).saturating_sub(start_y)).max(1) as usize;
         let target_h = rows * 2;
+        let full_target_h = full_rows * 2;
         let target_w = cols;
 
         if target_w == 0 || target_h == 0 || px_buf.width == 0 || px_buf.height == 0 {
@@ -1845,7 +1852,7 @@ impl DiffRenderer {
             let step_x_fp = ((src_w << 16) / quad_w).max(1);
 
             if self.subcell_mode == SubCellMode::Sextant2x3 {
-                let sex_h = (rows * 3).max(1);
+                let sex_h = (full_rows * 3).max(1);
                 let step_y_fp = ((src_h << 16) / sex_h).max(1);
                 for row in 0..rows {
                     let term_y = start_y + (row as u16);
@@ -1890,7 +1897,7 @@ impl DiffRenderer {
                 return;
             }
 
-            let quad_h = (target_h * 2).max(1);
+            let quad_h = (full_target_h * 2).max(1);
             let step_y_fp = ((src_h << 16) / quad_h).max(1);
 
             for row in 0..rows {
@@ -1995,7 +2002,7 @@ impl DiffRenderer {
         }
 
         let step_x_fp = ((active_buf.width << 16) / sub_w.max(1)).max(1);
-        let step_y_fp = ((active_buf.height << 16) / target_h.max(1)).max(1);
+        let step_y_fp = ((active_buf.height << 16) / full_target_h.max(1)).max(1);
 
         for row in 0..rows {
             let sub_y_top = row * 2;
@@ -2085,23 +2092,25 @@ impl DiffRenderer {
                 if roi.w == 0 || roi.h == 0 {
                     continue;
                 }
-                let (sx0, sy0, sx1, sy1) = roi.to_subpixel_bounds(sub_w, target_h, vw, vh);
-                if !is_pixel_art && self.upscale_mode != UpscaleMode::Off {
+                let (sx0, sy0, sx1, sy1) = roi.to_subpixel_bounds(sub_w, full_target_h, vw, vh);
+                let sy0_vis = sy0.min(target_h);
+                let sy1_vis = sy1.min(target_h);
+                if !is_pixel_art && self.upscale_mode != UpscaleMode::Off && sy0_vis < sy1_vis {
                     let effective_kind = if fast_path && roi.kind == 0 { 2 } else { roi.kind };
                     self.scratch.enhance_roi_subrect_in_place(
                         &mut self.subpixel_buf,
                         sx0,
-                        sy0,
+                        sy0_vis,
                         sx1,
-                        sy1,
+                        sy1_vis,
                         effective_kind,
                         self.upscale_mode,
                     );
                 }
                 let c0 = (sx0 / 2).min(cols);
                 let c1 = ((sx1 + 1) / 2).min(cols);
-                let r0 = (sy0 / 2).min(rows);
-                let r1 = ((sy1 + 1) / 2).min(rows);
+                let r0 = (sy0_vis / 2).min(rows);
+                let r1 = ((sy1_vis + 1) / 2).min(rows);
                 let mask_bits: u8 = if roi.kind == 0 && !fast_path { 0b11 } else { 0b10 };
                 for rr in r0..r1 {
                     let row_off = rr * cols;
@@ -2144,6 +2153,7 @@ impl DiffRenderer {
         let need_sextant_grid = self.subcell_mode == SubCellMode::Sextant2x3
             || (self.subcell_mode == SubCellMode::AutoRoiSextant && !self.active_rois.is_empty());
         let sex_h = rows * 3;
+        let full_sex_h = (full_rows * 3).max(1);
         if need_sextant_grid {
             let sex_total = sub_w * sex_h;
             if self.sextant_buf.width != sub_w || self.sextant_buf.height != sex_h {
@@ -2151,7 +2161,7 @@ impl DiffRenderer {
                 self.sextant_buf.height = sex_h;
                 self.sextant_buf.data.resize(sex_total, Color::BLACK);
             }
-            let step_sex_y_fp = ((active_buf.height << 16) / sex_h.max(1)).max(1);
+            let step_sex_y_fp = ((active_buf.height << 16) / full_sex_h).max(1);
             for row in 0..rows {
                 let row_mask_base = row * cols;
                 let row_needs_sextant = self.subcell_mode == SubCellMode::Sextant2x3
@@ -2758,6 +2768,7 @@ impl DiffRenderer {
                 }
 
                 let mut run_len = 0;
+                let mut has_complex_glyph = false;
                 while x < width {
                     let r_idx = row_offset + x;
                     let c = self.current[r_idx];
@@ -2768,6 +2779,10 @@ impl DiffRenderer {
                         || !color_matches(c.bg, run_bg, color_tol)
                     {
                         break;
+                    }
+
+                    if c.comb[0] != '\0' || ((c.ch as u32) > 0x7F && !is_quadrant_block_char(c.ch)) {
+                        has_complex_glyph = true;
                     }
 
                     let mut char_buf = [0u8; 4];
@@ -2786,7 +2801,14 @@ impl DiffRenderer {
                     run_len += 1;
                 }
 
-                cursor_pos = Some((target_pos.0 + run_len, target_pos.1));
+                // If the run contained complex Unicode/Indic glyphs or reached the right edge,
+                // force an exact absolute cursor jump (\x1b[row;colH) on the next span so spacing
+                // vowel signs or wide glyphs can never drift relative cursor positioning across rows.
+                if has_complex_glyph || target_pos.0 + run_len > self.width {
+                    cursor_pos = None;
+                } else {
+                    cursor_pos = Some((target_pos.0 + run_len, target_pos.1));
+                }
             }
         }
 

@@ -528,6 +528,11 @@ impl InputHandler {
                             self.is_entering_url = true;
                             self.url_input_buffer.clear();
                             return AppAction::FocusUrlBar;
+                        } else if mouse.row == 1 {
+                            self.is_typing_in_page = false;
+                            self.is_entering_url = true;
+                            self.url_input_buffer.clear();
+                            return AppAction::FocusUrlBar;
                         } else {
                             self.is_entering_url = false;
                             return AppAction::Click(mouse.column, mouse.row);

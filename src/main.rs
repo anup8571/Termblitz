@@ -501,18 +501,28 @@ fn main() -> io::Result<()> {
     let mut occupied_cells: Vec<bool> = Vec::with_capacity((cols as usize) * (rows as usize));
     let mut scroll_fast_until = Instant::now() - Duration::from_secs(1);
     let mut quality_settle_pending = false;
+    let mut full_rows = rows;
 
     loop {
         let frame_start = Instant::now();
 
         if let Ok((w, h)) = crossterm::terminal::size() {
             if w != cols || h != rows {
+                let width_changed = w != cols;
                 cols = w;
                 rows = h;
+                // Only update full_rows and resize Chromium when terminal width changes or height grows.
+                // When the Android soft keyboard opens (w == cols && h < full_rows), keep full_rows
+                // fixed so webpage content is never vertically squished!
+                if width_changed || h >= full_rows {
+                    full_rows = h;
+                    if mode.is_cdp() {
+                        cdp_engine.resize(cols, full_rows);
+                    }
+                }
                 renderer.resize(cols, rows);
-                native_engine.parse_and_layout(cols);
-                if mode.is_cdp() {
-                    cdp_engine.resize(cols, rows);
+                if width_changed {
+                    native_engine.parse_and_layout(cols);
                 }
             }
         }
@@ -546,7 +556,7 @@ fn main() -> io::Result<()> {
                         (RenderMode::Native, RenderMode::CdpHybrid) => {
                             renderer.clear(Color::new(246, 246, 239));
                             cdp_engine.set_hide_text(true);
-                            cdp_engine.navigate(&native_engine.current_url, cols, rows);
+                            cdp_engine.navigate(&native_engine.current_url, cols, full_rows);
                             status_banner = Some((
                                 "Hybrid Mode: Crisp DOM text + visual background".to_string(),
                                 Instant::now() + Duration::from_secs(2),
@@ -583,9 +593,9 @@ fn main() -> io::Result<()> {
                 cdp_engine.set_adblock(next_state);
                 status_banner = Some((
                     if next_state {
-                        "🛡️ Brave + YouTube Ad-Shield: ENABLED".to_string()
+                        "[SHIELD] Brave + YouTube Ad-Shield: ENABLED".to_string()
                     } else {
-                        "🛡️ Brave + YouTube Ad-Shield: DISABLED".to_string()
+                        "[SHIELD] Brave + YouTube Ad-Shield: DISABLED".to_string()
                     },
                     Instant::now() + Duration::from_secs(2),
                 ));
@@ -595,9 +605,9 @@ fn main() -> io::Result<()> {
                 renderer.force_redraw();
                 status_banner = Some((
                     if muted {
-                        "🔇 Browser Audio: MUTED [Alt+m / M]".to_string()
+                        "[MUTE] Browser Audio: MUTED [Alt+m / M]".to_string()
                     } else {
-                        "🔊 Browser Audio: UNMUTED [Alt+m / M]".to_string()
+                        "[SND] Browser Audio: UNMUTED [Alt+m / M]".to_string()
                     },
                     Instant::now() + Duration::from_secs(2),
                 ));
@@ -609,7 +619,7 @@ fn main() -> io::Result<()> {
                 cdp_engine.upscale_mode = next_sr;
                 renderer.force_redraw();
                 status_banner = Some((
-                    format!("✨ Super-Resolution [u]: {}", next_sr.name()),
+                    format!("Super-Resolution [u]: {}", next_sr.name()),
                     Instant::now() + Duration::from_secs(2),
                 ));
             }
@@ -621,7 +631,7 @@ fn main() -> io::Result<()> {
                 renderer.force_redraw();
                 status_banner = Some((
                     format!(
-                        "🎨 Dithering [d]: {}",
+                        "Dithering [d]: {}",
                         if next_dither {
                             "ON (8x8 Blue Noise + Serpentine Floyd-Steinberg)"
                         } else {
@@ -636,9 +646,9 @@ fn main() -> io::Result<()> {
                 renderer.force_redraw();
                 status_banner = Some((
                     if renderer.pixel_art_mode {
-                        "👾 Pixel-Art Scale2x Mode [p]: ON (Forced Scale2x)".to_string()
+                        "Pixel-Art Scale2x Mode [p]: ON (Forced Scale2x)".to_string()
                     } else {
-                        "👾 Pixel-Art Scale2x Mode [p]: AUTO (Content-Aware)".to_string()
+                        "Pixel-Art Scale2x Mode [p]: AUTO (Content-Aware)".to_string()
                     },
                     Instant::now() + Duration::from_secs(2),
                 ));
@@ -648,7 +658,7 @@ fn main() -> io::Result<()> {
                 renderer.force_redraw();
                 status_banner = Some((
                     format!(
-                        "🔲 Sub-Cell Blitter [s]: {} [{}]",
+                        "Sub-Cell Blitter [s]: {} [{}]",
                         renderer.subcell_mode.name(),
                         renderer.protocol_badge()
                     ),
@@ -719,7 +729,7 @@ fn main() -> io::Result<()> {
                     native_engine.load_url(&resolved, cols);
                 } else {
                     native_engine.current_url = resolved.clone();
-                    cdp_engine.navigate(&resolved, cols, rows);
+                    cdp_engine.navigate(&resolved, cols, full_rows);
                 }
             }
             AppAction::TypeInPage(text) => {
@@ -760,13 +770,14 @@ fn main() -> io::Result<()> {
                             mode = RenderMode::CdpHybrid;
                             cdp_engine.set_hide_text(true);
                             native_engine.current_url = resolved.clone();
-                            cdp_engine.navigate(&resolved, cols, rows);
+                            cdp_engine.navigate(&resolved, cols, full_rows);
                         } else {
                             native_engine.load_url(&resolved, cols);
                         }
                     }
                 } else {
-                    let (hit_link, hit_input) = cdp_engine.hit_test_overlay(click_x, click_y, cols, rows);
+                    let layout_max_y = full_rows.max(rows);
+                    let (hit_link, hit_input) = cdp_engine.hit_test_overlay(click_x, click_y, cols, layout_max_y);
                     if hit_input {
                         // Focus the DOM input element on the page and type directly into the webpage box
                         input_handler.is_entering_url = false;
@@ -776,7 +787,7 @@ fn main() -> io::Result<()> {
                         input_handler.is_typing_in_page = false;
                         if !url.starts_with("javascript:") && !url.is_empty() {
                             native_engine.current_url = url.clone();
-                            cdp_engine.navigate(&url, cols, rows);
+                            cdp_engine.navigate(&url, cols, full_rows);
                         } else {
                             cdp_engine.click(click_x, click_y);
                         }
@@ -826,7 +837,7 @@ fn main() -> io::Result<()> {
                         cdp_engine.stop();
                         cdp_engine.clear_error();
                     }
-                    cdp_engine.navigate(&curr, cols, rows);
+                    cdp_engine.navigate(&curr, cols, full_rows);
                 }
             }
             AppAction::ZoomIn => {
@@ -872,8 +883,12 @@ fn main() -> io::Result<()> {
         };
         renderer.clear(clear_bg);
 
-        let view_start_y = 1u16;
+        // Row 0: Top Status & Controls Header
+        // Row 1: Dedicated Separate https:// Address & Search Bar
+        // Row 2..rows: Webpage Viewport
+        let view_start_y = if rows > 4 { 2u16 } else { 1u16 };
         let view_max_y = rows;
+        let layout_max_y = full_rows.max(rows);
 
         match mode {
             RenderMode::Native => {
@@ -944,7 +959,7 @@ fn main() -> io::Result<()> {
                     renderer.pending_scroll_px = scroll_delta_px;
 
                     if count == 0 || (is_loading && count < 2) {
-                        let msg = " 🌐 Connecting & Loading Visual Web Page... ⏳ ";
+                        let msg = " [Loading Visual Web Page...] ";
                         let msg_x = cols.saturating_sub(msg.len() as u16) / 2;
                         let msg_y = rows / 2;
                         renderer.put_str(msg_x, msg_y, msg, Color::CYAN, Color::new(28, 32, 42), true, false);
@@ -981,10 +996,11 @@ fn main() -> io::Result<()> {
 
                             let pw = vw.max(1) as f32;
                             let ph = vh.max(1) as f32;
-                            let view_rows = (view_max_y.saturating_sub(view_start_y)).max(1) as f32;
+                            // Use layout_max_y (full_rows) so opening the Android soft keyboard never squishes text vertically!
+                            let view_rows = (layout_max_y.saturating_sub(view_start_y)).max(1) as f32;
                             let video_term_boxes: Vec<(u16, u16, u16, u16)> = video_rects
                                 .iter()
-                                .map(|vr| vr.to_terminal_bounds(cols, rows, vw, vh))
+                                .map(|vr| vr.to_terminal_bounds(cols, layout_max_y, vw, vh))
                                 .collect();
 
                             let cols_usize = cols as usize;
@@ -997,8 +1013,8 @@ fn main() -> io::Result<()> {
                                 if pass_popup {
                                     for mask in &rect_masks {
                                         let (mc0, mr0, mc1, mr1) =
-                                            mask.to_terminal_bounds(cols, rows, vw, vh);
-                                        renderer.fill_popup_mask(mc0, mr0, mc1, mr1, mask.color);
+                                            mask.to_terminal_bounds(cols, layout_max_y, vw, vh);
+                                        renderer.fill_popup_mask(mc0, mr0, mc1, mr1.min(view_max_y), mask.color);
                                         for ry in mr0.max(view_start_y)..mr1.min(view_max_y) {
                                             let r_base = (ry as usize) * cols_usize;
                                             let c0_u = (mc0 as usize).min(cols_usize);
@@ -1029,15 +1045,41 @@ fn main() -> io::Result<()> {
 
                                     if term_row >= view_start_y && term_row < view_max_y && start_col < cols {
                                         let available_cols = (cols - start_col) as usize;
-                                        let is_multiline = !span.is_input && !span.is_popup && box_rows >= 2 && span.px_h >= 30;
+                                        let is_multiline = !span.is_input && !span.is_popup && box_rows >= 2 && span.px_h >= 24;
                                         let text_disp_w = display_width(&span.text);
                                         let wrap_w = if is_multiline {
                                             span_cols.min(available_cols).max(8)
                                         } else {
                                             span_cols.max(text_disp_w).min(available_cols)
                                         };
-                                        let max_lines = if is_multiline { box_rows.min(2) } else { 1 };
-                                        let wrapped_lines = wrap_overlay_text(&span.text, wrap_w, max_lines);
+                                        // Allow up to 18 lines per paragraph so full Wikipedia/article sections render completely
+                                        let max_lines = if is_multiline { box_rows.min(18) } else { 1 };
+
+                                        // Check if an inline link (e.g. "India" at the start of "<p><a>India</a> is a country...</p>")
+                                        // already occupies the start of `term_row`; if so, indent line 0 past the inline link!
+                                        let first_row_base = (term_row as usize) * cols_usize;
+                                        let sc_u = (start_col as usize).min(cols_usize);
+                                        let scan_end = (sc_u + wrap_w).min(cols_usize);
+                                        let mut inline_indent = 0usize;
+                                        if sc_u < scan_end && occupied_cells[first_row_base + sc_u] {
+                                            let mut k = sc_u;
+                                            while k < scan_end {
+                                                if occupied_cells[first_row_base + k] {
+                                                    inline_indent = (k + 2).saturating_sub(sc_u);
+                                                    k += 1;
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        let text_for_wrap = if inline_indent > 0 && inline_indent + 6 < wrap_w {
+                                            format!("{}{}", " ".repeat(inline_indent), span.text)
+                                        } else {
+                                            inline_indent = 0;
+                                            span.text.clone()
+                                        };
+                                        let wrapped_lines = wrap_overlay_text(&text_for_wrap, wrap_w, max_lines);
 
                                         let link_fg = if span.is_input {
                                             Color::new(40, 90, 195)
@@ -1049,20 +1091,29 @@ fn main() -> io::Result<()> {
                                             span.fg
                                         };
 
-                                        for (line_offset, line_text) in wrapped_lines.iter().enumerate() {
+                                        for (line_offset, raw_line_text) in wrapped_lines.iter().enumerate() {
                                             let target_y = term_row + (line_offset as u16);
                                             if target_y >= view_max_y {
                                                 break;
                                             }
-                                            let line_w = display_width(line_text) as u16;
-                                            if line_w == 0 {
+                                            let ( mut draw_col, mut line_text ) = if line_offset == 0 && inline_indent > 0 {
+                                                (
+                                                    start_col.saturating_add(inline_indent as u16).min(cols),
+                                                    raw_line_text.trim_start().to_string(),
+                                                )
+                                            } else {
+                                                (start_col, raw_line_text.clone())
+                                            };
+
+                                            let mut line_w = display_width(&line_text) as u16;
+                                            if line_w == 0 || draw_col >= cols {
                                                 continue;
                                             }
-                                            let line_end_col = start_col.saturating_add(line_w).min(cols);
+                                            let mut line_end_col = draw_col.saturating_add(line_w).min(cols);
                                             let inside_video = video_term_boxes.iter().any(|&(vc0, vr0, vc1, vr1)| {
                                                 target_y >= vr0
                                                     && target_y < vr1
-                                                    && start_col < vc1
+                                                    && draw_col < vc1
                                                     && line_end_col > vc0
                                             });
                                             if inside_video {
@@ -1070,15 +1121,40 @@ fn main() -> io::Result<()> {
                                             }
 
                                             let row_base = (target_y as usize) * cols_usize;
-                                            let check_c0 = (start_col.saturating_sub(1) as usize).min(cols_usize);
-                                            let check_c1 = ((line_end_col + 1) as usize).min(cols_usize);
+                                            let check_c0 = (draw_col as usize).min(cols_usize);
+                                            let check_c1 = (line_end_col as usize).min(cols_usize);
                                             if check_c0 < check_c1
                                                 && occupied_cells[row_base + check_c0..row_base + check_c1]
                                                     .iter()
                                                     .any(|&occ| occ)
                                             {
-                                                // Prevent text spans mapped to the same terminal row from merging
-                                                continue;
+                                                // Scan right on the same row to see if there is unoccupied space after an inline sibling
+                                                let mut last_occ = check_c0;
+                                                for c_idx in check_c0..cols_usize {
+                                                    if occupied_cells[row_base + c_idx] {
+                                                        last_occ = c_idx;
+                                                    } else if c_idx > last_occ + 1 {
+                                                        break;
+                                                    }
+                                                }
+                                                let shifted_col = ((last_occ + 2) as u16).min(cols);
+                                                if shifted_col + 4 <= cols
+                                                    && !occupied_cells[row_base + (shifted_col as usize)..row_base + cols_usize]
+                                                        .iter()
+                                                        .take(4)
+                                                        .any(|&occ| occ)
+                                                {
+                                                    draw_col = shifted_col;
+                                                    let max_rem = (cols - draw_col) as usize;
+                                                    line_text = truncate_by_display_width(&line_text, max_rem);
+                                                    line_w = display_width(&line_text) as u16;
+                                                    if line_w == 0 {
+                                                        continue;
+                                                    }
+                                                    line_end_col = draw_col.saturating_add(line_w).min(cols);
+                                                } else {
+                                                    continue;
+                                                }
                                             }
 
                                             // Suppress underline on colored buttons (e.g. "Sign in"), inputs, popups, and Indic scripts
@@ -1086,20 +1162,20 @@ fn main() -> io::Result<()> {
                                             let should_underline = span.is_link
                                                 && !span.is_input
                                                 && !span.is_popup
-                                                && !has_complex_script(line_text)
+                                                && !has_complex_script(&line_text)
                                                 && span.bg.map_or(true, |b| b.luma_fast() > 215);
 
                                             renderer.put_str_with_existing_bg(
-                                                start_col,
+                                                draw_col,
                                                 target_y,
-                                                line_text,
+                                                &line_text,
                                                 link_fg,
                                                 span.bg,
                                                 span.bold,
                                                 should_underline,
                                             );
 
-                                            let mark_c0 = (start_col as usize).min(cols_usize);
+                                            let mark_c0 = (draw_col as usize).min(cols_usize);
                                             let mark_c1 = (line_end_col as usize).min(cols_usize);
                                             for cell_occ in &mut occupied_cells[row_base + mark_c0..row_base + mark_c1] {
                                                 *cell_occ = true;
@@ -1111,17 +1187,19 @@ fn main() -> io::Result<()> {
                         }
 
                         if is_loading {
-                            let badge = " ⏳ Updating... ";
-                            let bx = cols.saturating_sub(badge.len() as u16 + 2);
-                            renderer.put_str(bx, 1, badge, Color::YELLOW, Color::new(28, 32, 42), true, false);
+                            let badge = " [Updating...] ";
+                            let bx = cols.saturating_sub(badge.len() as u16 + 1);
+                            renderer.put_str(bx, view_start_y, badge, Color::YELLOW, Color::new(28, 32, 42), true, false);
                         }
                     }
                 }
             }
         }
 
-        // Top 1-line Responsive Status & Address Bar
-        let bar_bg = Color::new(28, 32, 42);
+        // ─────────────────────────────────────────────────────────────────────────
+        // ROW 0: Top Status & Controls Header (Pure 1-col ASCII badges, never wraps)
+        // ─────────────────────────────────────────────────────────────────────────
+        let bar_bg = Color::new(24, 28, 38);
         let bar_fg = Color::WHITE;
         let is_compact = cols < 72;
         let zoom_pct = (cdp_engine.zoom * 100.0).round() as u32;
@@ -1168,20 +1246,7 @@ fn main() -> io::Result<()> {
             false
         };
 
-        if input_handler.is_entering_url {
-            // When typing a URL or search query, give the input field the full remaining width of row 0
-            let avail_w = (cols.saturating_sub(addr_x + 1)) as usize;
-            let prefix = if is_compact { " Go: " } else { " Search / URL: " };
-            let max_input_chars = avail_w.saturating_sub(prefix.len() + 1).max(4);
-            let input_chars: Vec<char> = input_handler.url_input_buffer.chars().collect();
-            let visible_input: String = if input_chars.len() > max_input_chars {
-                input_chars[input_chars.len() - max_input_chars..].iter().collect()
-            } else {
-                input_handler.url_input_buffer.clone()
-            };
-            let prompt = format!("{}{}█", prefix, visible_input);
-            renderer.put_str(addr_x, 0, &prompt, Color::CYAN, bar_bg, true, false);
-        } else {
+        if !has_active_banner {
             let mem = cached_mem_mb;
             let scroll_pct = if mode.is_cdp() {
                 cdp_engine.get_scroll_pct()
@@ -1190,13 +1255,12 @@ fn main() -> io::Result<()> {
             } else {
                 100
             };
-            let audio_icon = if cdp_engine.audio_muted { "🔇" } else { "🔊" };
+            // Pure 1-column ASCII audio indicator so terminal wcwidth is always 100% exact
+            let audio_icon = if cdp_engine.audio_muted { "MUTE" } else { "SND" };
             let shield_tag = if cdp_engine.adblock_enabled {
-                if is_compact { "S" } else { "SHIELD" }
-            } else if is_compact {
-                "-"
+                if is_compact { "SHLD" } else { "SHIELD" }
             } else {
-                "NO-AD"
+                "OFF"
             };
             let fps_display = if mode.is_cdp() {
                 if cdp_fps > 0.0 { format!("{:0.0}fps", cdp_fps) } else { "idle".to_string() }
@@ -1236,41 +1300,82 @@ fn main() -> io::Result<()> {
                 )
             };
             let metrics_cols = display_width(&metrics) as u16;
-            let metrics_x = cols.saturating_sub(metrics_cols);
+            let metrics_x = cols.saturating_sub(metrics_cols).max(addr_x);
 
-            if !has_active_banner && metrics_x > addr_x + 2 {
-                let max_url_w = (metrics_x - addr_x) as usize;
-                if input_handler.is_typing_in_page {
-                    let hint = if is_compact {
-                        " [INPUT: Enter/Esc] "
-                    } else {
-                        " [INPUT: typing in page box | Enter=Submit, Esc=Exit] "
-                    };
-                    let truncated_hint =
-                        truncate_by_display_width(hint, max_url_w.saturating_sub(1));
-                    renderer.put_str(addr_x, 0, &truncated_hint, Color::CYAN, bar_bg, true, false);
+            let sr_col_start = metrics_x + 1;
+            let sr_col_end = sr_col_start + (display_width(&sr_part) as u16);
+            let dither_col_end = sr_col_end + (display_width(&dither_part) as u16);
+            let mute_col_start = dither_col_end + (display_width(mute_sep) as u16);
+            let mute_col_end = mute_col_start + (display_width(audio_icon) as u16);
+            input_handler.set_all_status_hit_zones(
+                Some((sr_col_start, sr_col_end)),
+                Some((sr_col_end, dither_col_end)),
+                Some((mute_col_start, mute_col_end)),
+            );
+            let clipped_metrics = truncate_by_display_width(&metrics, (cols.saturating_sub(metrics_x)) as usize);
+            renderer.put_str(metrics_x, 0, &clipped_metrics, Color::LIGHT_GRAY, bar_bg, false, false);
+        } else {
+            input_handler.set_all_status_hit_zones(None, None, None);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────────
+        // ROW 1: Dedicated Separate https:// Address & Search Bar
+        // ─────────────────────────────────────────────────────────────────────────
+        if rows > 4 {
+            let url_bar_bg = Color::new(36, 42, 56);
+            let pill_bg = Color::new(16, 20, 28);
+            renderer.put_str(0, 1, &" ".repeat(cols as usize), Color::WHITE, url_bar_bg, false, false);
+
+            if input_handler.is_entering_url {
+                let prefix = if is_compact { " https:// " } else { " https:// or Search: " };
+                renderer.put_str(0, 1, prefix, Color::new(110, 220, 255), pill_bg, true, false);
+                let input_x = prefix.len() as u16;
+                let avail_w = (cols.saturating_sub(input_x + 1)) as usize;
+                let max_input_chars = avail_w.saturating_sub(2).max(4);
+                let input_chars: Vec<char> = input_handler.url_input_buffer.chars().collect();
+                let visible_input: String = if input_chars.len() > max_input_chars {
+                    input_chars[input_chars.len() - max_input_chars..].iter().collect()
                 } else {
-                    let clean_u = format!(" {}", format_clean_url(&native_engine.current_url));
-                    let truncated_url =
-                        truncate_by_display_width(&clean_u, max_url_w.saturating_sub(1));
-                    renderer.put_str(addr_x, 0, &truncated_url, Color::WHITE, bar_bg, false, false);
-                }
-            }
-
-            if !has_active_banner {
-                let sr_col_start = metrics_x + 1;
-                let sr_col_end = sr_col_start + (display_width(&sr_part) as u16);
-                let dither_col_end = sr_col_end + (display_width(&dither_part) as u16);
-                let mute_col_start = dither_col_end + (display_width(mute_sep) as u16);
-                let mute_col_end = mute_col_start + (display_width(audio_icon) as u16);
-                input_handler.set_all_status_hit_zones(
-                    Some((sr_col_start, sr_col_end)),
-                    Some((sr_col_end, dither_col_end)),
-                    Some((mute_col_start, mute_col_end)),
-                );
-                renderer.put_str(metrics_x, 0, &metrics, Color::LIGHT_GRAY, bar_bg, false, false);
+                    input_handler.url_input_buffer.clone()
+                };
+                let prompt = format!(" {}█", visible_input);
+                renderer.put_str(input_x, 1, &prompt, Color::CYAN, url_bar_bg, true, false);
+            } else if input_handler.is_typing_in_page {
+                let badge = " INPUT ";
+                renderer.put_str(0, 1, badge, Color::BLACK, Color::CYAN, true, false);
+                let hint = if is_compact {
+                    " Typing in page box [Enter=Go | Esc=Exit]"
+                } else {
+                    " Typing in webpage input box [Enter = Submit | Esc = Exit]"
+                };
+                let max_w = (cols.saturating_sub(badge.len() as u16)) as usize;
+                let clipped = truncate_by_display_width(hint, max_w);
+                renderer.put_str(badge.len() as u16, 1, &clipped, Color::CYAN, url_bar_bg, true, false);
             } else {
-                input_handler.set_all_status_hit_zones(None, None, None);
+                let raw_url = if !native_engine.current_url.is_empty() {
+                    native_engine.current_url.as_str()
+                } else {
+                    cdp_engine.current_url.as_str()
+                };
+                let scheme_badge = if raw_url.starts_with("http://") {
+                    " http:// "
+                } else if raw_url.starts_with("about:") {
+                    " about: "
+                } else {
+                    " https:// "
+                };
+                renderer.put_str(0, 1, scheme_badge, Color::new(110, 230, 180), pill_bg, true, false);
+                let url_x = scheme_badge.len() as u16;
+                let hint = if is_compact { " [/]" } else { " [Tap or / to Search] " };
+                let hint_w = hint.len() as u16;
+                let hint_x = cols.saturating_sub(hint_w);
+                if hint_x > url_x + 4 {
+                    renderer.put_str(hint_x, 1, hint, Color::GRAY, url_bar_bg, false, false);
+                }
+                let max_url_w = (hint_x.saturating_sub(url_x)) as usize;
+                let clean_host_path = format!(" {}", format_clean_url(raw_url));
+                let clipped_url = truncate_by_display_width(&clean_host_path, max_url_w);
+                renderer.put_str(url_x, 1, &clipped_url, Color::WHITE, url_bar_bg, true, false);
             }
         }
 
