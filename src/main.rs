@@ -15,7 +15,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
-use engine::{CdpEngine, NativeEngine, RenderMode};
+use engine::{CdpEngine, InlineStyleRun, NativeEngine, RenderMode, RenderedHitbox, TextOverlaySpan};
 use input::{resolve_input_to_url, AppAction, InputHandler};
 use renderer::{
     display_width, has_complex_script, is_combining_char, Color, DiffRenderer, GraphicsProtocol,
@@ -138,6 +138,281 @@ fn wrap_overlay_text(text: &str, max_width: usize, max_lines: usize) -> Vec<Stri
     if lines.is_empty() {
         lines.push(truncate_by_display_width(text, max_w));
     }
+    lines
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StyledSeg {
+    text: String,
+    cols: usize,
+    fg: Color,
+    bold: bool,
+    underline: bool,
+    link_url: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StyledLine {
+    segs: Vec<StyledSeg>,
+    total_cols: usize,
+}
+
+impl StyledLine {
+    fn new() -> Self {
+        Self {
+            segs: Vec::new(),
+            total_cols: 0,
+        }
+    }
+
+    fn push_cluster(
+        &mut self,
+        base: char,
+        comb: &[char],
+        fg: Color,
+        bold: bool,
+        underline: bool,
+        link_url: &Option<String>,
+    ) {
+        if let Some(last) = self.segs.last_mut() {
+            if last.fg == fg
+                && last.bold == bold
+                && last.underline == underline
+                && last.link_url == *link_url
+            {
+                last.text.push(base);
+                for &c in comb {
+                    last.text.push(c);
+                }
+                last.cols += 1;
+                self.total_cols += 1;
+                return;
+            }
+        }
+        let mut text = String::with_capacity(1 + comb.len());
+        text.push(base);
+        for &c in comb {
+            text.push(c);
+        }
+        self.segs.push(StyledSeg {
+            text,
+            cols: 1,
+            fg,
+            bold,
+            underline,
+            link_url: link_url.clone(),
+        });
+        self.total_cols += 1;
+    }
+}
+
+#[derive(Clone)]
+struct StyledCluster {
+    base: char,
+    comb: Vec<char>,
+    is_ws: bool,
+    fg: Color,
+    bold: bool,
+    underline: bool,
+    link_url: Option<String>,
+}
+
+/// Word-wraps a `TextOverlaySpan` preserving inline bold/link/color styling per Unicode codepoint
+/// across wrapped terminal lines so cohesive prose paragraphs flow naturally without colliding or dropping words.
+fn wrap_styled_overlay_lines(
+    span: &TextOverlaySpan,
+    max_width: usize,
+    max_lines: usize,
+    inline_indent: usize,
+) -> Vec<StyledLine> {
+    let max_w = max_width.max(1);
+    let max_l = max_lines.max(1);
+    let mut clusters: Vec<StyledCluster> = Vec::new();
+    let mut run_cursor = 0usize;
+    let has_runs = !span.inline_runs.is_empty();
+    let allow_underline_bg = span.bg.map_or(true, |b| b.luma_fast() > 215);
+
+    for (char_idx, ch) in span.text.chars().enumerate() {
+        if is_combining_char(ch) {
+            if let Some(prev) = clusters.last_mut() {
+                prev.comb.push(ch);
+            }
+            continue;
+        }
+
+        let active_run: Option<&InlineStyleRun> = if has_runs {
+            while run_cursor < span.inline_runs.len()
+                && span.inline_runs[run_cursor].end_char <= char_idx
+            {
+                run_cursor += 1;
+            }
+            span.inline_runs
+                .get(run_cursor)
+                .filter(|r| char_idx >= r.start_char && char_idx < r.end_char)
+        } else {
+            None
+        };
+
+        let is_link = active_run.map_or(span.is_link, |r| r.is_link);
+        let raw_fg = active_run.and_then(|r| r.fg).unwrap_or(span.fg);
+        let bold = active_run.map_or(span.bold, |r| r.bold);
+        let link_url = active_run
+            .and_then(|r| r.link_url.clone())
+            .or_else(|| if is_link { span.link_url.clone() } else { None });
+
+        let fg = if span.is_input {
+            Color::new(40, 90, 195)
+        } else if span.is_popup {
+            Color::new(32, 33, 36)
+        } else if is_link && (raw_fg.luma_fast() < 40 || raw_fg.b <= raw_fg.r.saturating_add(15)) {
+            Color::new(26, 86, 219)
+        } else {
+            raw_fg
+        };
+        let underline = is_link && !span.is_input && !span.is_popup && allow_underline_bg;
+
+        clusters.push(StyledCluster {
+            base: ch,
+            comb: Vec::new(),
+            is_ws: ch.is_whitespace(),
+            fg,
+            bold,
+            underline,
+            link_url,
+        });
+    }
+
+    if clusters.is_empty() {
+        return Vec::new();
+    }
+
+    // Preserve exact spacing/truncation for single-line UI controls and inputs
+    if max_l <= 1 || clusters.len() <= max_w.saturating_sub(inline_indent) {
+        let mut line = StyledLine::new();
+        let cap = if inline_indent > 0 && inline_indent < max_w {
+            max_w - inline_indent
+        } else {
+            max_w
+        };
+        for cl in clusters.into_iter().take(cap) {
+            line.push_cluster(
+                cl.base,
+                &cl.comb,
+                cl.fg,
+                cl.bold,
+                cl.underline,
+                &cl.link_url,
+            );
+        }
+        return if line.total_cols > 0 { vec![line] } else { Vec::new() };
+    }
+
+    let mut lines: Vec<StyledLine> = Vec::with_capacity(max_l.min(16));
+    let mut current = StyledLine::new();
+    let mut line0_cap = if inline_indent > 0 && inline_indent + 6 < max_w {
+        max_w - inline_indent
+    } else {
+        max_w
+    };
+    let mut active_cap = line0_cap;
+    let mut pending_space: Option<StyledCluster> = None;
+
+    let mut idx = 0usize;
+    let n = clusters.len();
+    while idx < n {
+        if clusters[idx].is_ws {
+            if current.total_cols > 0 && pending_space.is_none() {
+                let mut sp = clusters[idx].clone();
+                sp.base = ' ';
+                pending_space = Some(sp);
+            }
+            idx += 1;
+            continue;
+        }
+
+        let start = idx;
+        while idx < n && !clusters[idx].is_ws {
+            idx += 1;
+        }
+        let word = &clusters[start..idx];
+        let word_w = word.len();
+        let space_w = if current.total_cols > 0 && pending_space.is_some() {
+            1
+        } else {
+            0
+        };
+
+        if current.total_cols > 0 && current.total_cols + space_w + word_w <= active_cap {
+            if let Some(sp) = pending_space.take() {
+                let sp_underline = sp.underline && sp.link_url.is_some();
+                current.push_cluster(' ', &[], sp.fg, sp.bold, sp_underline, &sp.link_url);
+            }
+            for cl in word {
+                current.push_cluster(
+                    cl.base,
+                    &cl.comb,
+                    cl.fg,
+                    cl.bold,
+                    cl.underline,
+                    &cl.link_url,
+                );
+            }
+        } else {
+            if current.total_cols > 0 {
+                lines.push(current);
+                if lines.len() >= max_l {
+                    return lines;
+                }
+                current = StyledLine::new();
+                line0_cap = max_w;
+                active_cap = max_w;
+                pending_space = None;
+            }
+            if word_w <= active_cap {
+                for cl in word {
+                    current.push_cluster(
+                        cl.base,
+                        &cl.comb,
+                        cl.fg,
+                        cl.bold,
+                        cl.underline,
+                        &cl.link_url,
+                    );
+                }
+            } else {
+                // Hard-wrap overly long unbroken token across lines
+                let mut pos = 0usize;
+                while pos < word_w {
+                    let rem_cap = active_cap.saturating_sub(current.total_cols).max(1);
+                    let take = rem_cap.min(word_w - pos);
+                    for cl in &word[pos..pos + take] {
+                        current.push_cluster(
+                            cl.base,
+                            &cl.comb,
+                            cl.fg,
+                            cl.bold,
+                            cl.underline,
+                            &cl.link_url,
+                        );
+                    }
+                    pos += take;
+                    if pos < word_w {
+                        lines.push(current);
+                        if lines.len() >= max_l {
+                            return lines;
+                        }
+                        current = StyledLine::new();
+                        active_cap = max_w;
+                    }
+                }
+            }
+        }
+    }
+
+    if current.total_cols > 0 && lines.len() < max_l {
+        lines.push(current);
+    }
+    let _ = line0_cap;
     lines
 }
 
@@ -533,6 +808,7 @@ fn main() -> io::Result<()> {
             if !live.is_empty() && live != "about:blank" && live != native_engine.current_url {
                 native_engine.current_url = live.clone();
                 cdp_engine.current_url = live;
+                input_handler.is_typing_in_page = false;
             }
         }
 
@@ -564,6 +840,7 @@ fn main() -> io::Result<()> {
                         }
                         (RenderMode::CdpHybrid, RenderMode::CdpRaw) => {
                             cdp_engine.set_hide_text(false);
+                            cdp_engine.set_rendered_hitboxes(Vec::new());
                             status_banner = Some((
                                 "Raw Mode: Pure bitmap (Press [m] for sharp text)".to_string(),
                                 Instant::now() + Duration::from_secs(2),
@@ -666,6 +943,7 @@ fn main() -> io::Result<()> {
                 ));
             }
             AppAction::HistoryBack => {
+                input_handler.is_typing_in_page = false;
                 if mode.is_cdp() {
                     cdp_engine.history_back();
                     status_banner = Some((
@@ -683,6 +961,7 @@ fn main() -> io::Result<()> {
                 }
             }
             AppAction::HistoryForward => {
+                input_handler.is_typing_in_page = false;
                 if mode.is_cdp() {
                     cdp_engine.history_forward();
                     status_banner = Some((
@@ -700,6 +979,7 @@ fn main() -> io::Result<()> {
                 }
             }
             AppAction::Navigate(target_url) => {
+                input_handler.is_typing_in_page = false;
                 let resolved = if target_url.starts_with('/') && !native_engine.current_url.is_empty() {
                     if let Ok(base) = url_base(&native_engine.current_url) {
                         format!("{}{}", base, target_url)
@@ -979,19 +1259,21 @@ fn main() -> io::Result<()> {
                         if mode == RenderMode::CdpHybrid {
                             let mut overlays = cdp_engine.get_text_overlays();
                             let rect_masks = cdp_engine.get_rect_masks();
-                            // Prioritize inputs first, then sticky/fixed headers, then bold/navigation/link elements,
-                            // then body text so sticky headers, footers, and search boxes claim their terminal cells first
-                            // and scrolled body text can never overwrite or merge into them.
+                            // Prioritize inputs first, then sticky/fixed headers & popups, then cohesive
+                            // prose blocks in strict top-to-bottom document reading order, then standalone links/text.
                             overlays.sort_by_key(|s| {
-                                if s.is_input {
+                                let prio = if s.is_input {
                                     0u8
-                                } else if s.is_fixed {
+                                } else if s.is_fixed || s.is_popup {
                                     1u8
-                                } else if s.bold || s.is_link {
+                                } else if !s.inline_runs.is_empty() {
                                     2u8
-                                } else {
+                                } else if s.bold || s.is_link {
                                     3u8
-                                }
+                                } else {
+                                    4u8
+                                };
+                                (prio, s.px_y, s.px_x)
                             });
 
                             let pw = vw.max(1) as f32;
@@ -1006,6 +1288,8 @@ fn main() -> io::Result<()> {
                             let cols_usize = cols as usize;
                             occupied_cells.clear();
                             occupied_cells.resize(cols_usize * (rows as usize), false);
+                            let mut rendered_hitboxes: Vec<RenderedHitbox> =
+                                Vec::with_capacity(overlays.len().min(256));
 
                             // Pass 2a: Render base document overlays (!span.is_popup), then apply POPUP_MASK popup
                             // clearing, then render elevated popup/autocomplete suggestion items (span.is_popup) on top.
@@ -1028,39 +1312,55 @@ fn main() -> io::Result<()> {
 
                                 for span in overlays.iter().filter(|s| s.is_popup == pass_popup) {
                                     let eff_px_y = span.effective_px_y(scroll_delta_px);
-                                    if eff_px_y < 0 || eff_px_y >= (vh as i32).saturating_sub(2) {
+                                    let span_px_h = span.px_h.max(12);
+                                    if eff_px_y + span_px_h <= 2
+                                        || eff_px_y >= (vh as i32).saturating_sub(2)
+                                    {
                                         continue;
                                     }
                                     let start_col = ((span.px_x.max(0) as f32 * cols as f32) / pw)
                                         .round()
                                         .min(cols.saturating_sub(1) as f32) as u16;
-                                    let term_row = view_start_y
-                                        + ((eff_px_y as f32 * view_rows) / ph).round() as u16;
+                                    let start_row_i32 = (view_start_y as i32)
+                                        + ((eff_px_y as f32 * view_rows) / ph).round() as i32;
                                     let span_cols = ((span.px_w.max(8) as f32 * cols as f32) / pw)
                                         .round()
                                         .max(1.0) as usize;
-                                    let box_rows = ((span.px_h.max(12) as f32 * view_rows) / ph)
+                                    let box_rows = ((span_px_h as f32 * view_rows) / ph)
                                         .ceil()
                                         .max(1.0) as usize;
 
-                                    if term_row >= view_start_y && term_row < view_max_y && start_col < cols {
-                                        let available_cols = (cols - start_col) as usize;
-                                        let is_multiline = !span.is_input && !span.is_popup && box_rows >= 2 && span.px_h >= 24;
-                                        let text_disp_w = display_width(&span.text);
-                                        let wrap_w = if is_multiline {
-                                            span_cols.min(available_cols).max(8)
-                                        } else {
-                                            span_cols.max(text_disp_w).min(available_cols)
-                                        };
-                                        // Allow up to 18 lines per paragraph so full Wikipedia/article sections render completely
-                                        let max_lines = if is_multiline { box_rows.min(18) } else { 1 };
+                                    if start_col >= cols || start_row_i32 >= view_max_y as i32 {
+                                        continue;
+                                    }
 
-                                        // Check if an inline link (e.g. "India" at the start of "<p><a>India</a> is a country...</p>")
-                                        // already occupies the start of `term_row`; if so, indent line 0 past the inline link!
-                                        let first_row_base = (term_row as usize) * cols_usize;
+                                    let available_cols = (cols - start_col) as usize;
+                                    let has_inline_runs = !span.inline_runs.is_empty();
+                                    let is_multiline = !span.is_input
+                                        && !span.is_popup
+                                        && (has_inline_runs || (box_rows >= 2 && span.px_h >= 24));
+                                    let text_disp_w = display_width(&span.text);
+                                    let wrap_w = if is_multiline {
+                                        span_cols.min(available_cols).max(8)
+                                    } else {
+                                        span_cols.max(text_disp_w).min(available_cols)
+                                    };
+                                    let max_lines = if is_multiline {
+                                        box_rows.max(24).min(32)
+                                    } else {
+                                        1
+                                    };
+
+                                    // For standalone plain text following an inline link sibling on line 0, detect
+                                    // existing occupied cells on `start_row_i32`; cohesive blocks start cleanly on their own block row.
+                                    let mut inline_indent = 0usize;
+                                    if !has_inline_runs
+                                        && start_row_i32 >= view_start_y as i32
+                                        && start_row_i32 < view_max_y as i32
+                                    {
+                                        let first_row_base = (start_row_i32 as usize) * cols_usize;
                                         let sc_u = (start_col as usize).min(cols_usize);
                                         let scan_end = (sc_u + wrap_w).min(cols_usize);
-                                        let mut inline_indent = 0usize;
                                         if sc_u < scan_end && occupied_cells[first_row_base + sc_u] {
                                             let mut k = sc_u;
                                             while k < scan_end {
@@ -1072,118 +1372,159 @@ fn main() -> io::Result<()> {
                                                 }
                                             }
                                         }
-
-                                        let text_for_wrap = if inline_indent > 0 && inline_indent + 6 < wrap_w {
-                                            format!("{}{}", " ".repeat(inline_indent), span.text)
-                                        } else {
+                                        if inline_indent + 6 >= wrap_w {
                                             inline_indent = 0;
-                                            span.text.clone()
-                                        };
-                                        let wrapped_lines = wrap_overlay_text(&text_for_wrap, wrap_w, max_lines);
+                                        }
+                                    }
 
-                                        let link_fg = if span.is_input {
-                                            Color::new(40, 90, 195)
-                                        } else if span.is_popup {
-                                            Color::new(32, 33, 36)
-                                        } else if span.is_link && span.fg.luma_fast() < 40 {
-                                            Color::new(26, 86, 219)
-                                        } else {
-                                            span.fg
-                                        };
+                                    let wrapped_lines = wrap_styled_overlay_lines(
+                                        span,
+                                        wrap_w,
+                                        max_lines,
+                                        inline_indent,
+                                    );
 
-                                        for (line_offset, raw_line_text) in wrapped_lines.iter().enumerate() {
-                                            let target_y = term_row + (line_offset as u16);
-                                            if target_y >= view_max_y {
+                                    // Push cohesive multi-line paragraphs down gently if an earlier paragraph wrapped
+                                    // into slightly more terminal rows than CSS height predicted.
+                                    let mut vertical_push: i32 = 0;
+                                    if has_inline_runs && !span.is_fixed && !span.is_popup && start_row_i32 >= view_start_y as i32 {
+                                        let c0_u = (start_col as usize).min(cols_usize);
+                                        let c1_u = (start_col as usize + wrap_w.min(12)).min(cols_usize);
+                                        while vertical_push < 4 {
+                                            let probe_y = start_row_i32 + vertical_push;
+                                            if probe_y >= view_max_y as i32 {
                                                 break;
                                             }
-                                            let ( mut draw_col, mut line_text ) = if line_offset == 0 && inline_indent > 0 {
-                                                (
-                                                    start_col.saturating_add(inline_indent as u16).min(cols),
-                                                    raw_line_text.trim_start().to_string(),
-                                                )
-                                            } else {
-                                                (start_col, raw_line_text.clone())
-                                            };
-
-                                            let mut line_w = display_width(&line_text) as u16;
-                                            if line_w == 0 || draw_col >= cols {
-                                                continue;
-                                            }
-                                            let mut line_end_col = draw_col.saturating_add(line_w).min(cols);
-                                            let inside_video = video_term_boxes.iter().any(|&(vc0, vr0, vc1, vr1)| {
-                                                target_y >= vr0
-                                                    && target_y < vr1
-                                                    && draw_col < vc1
-                                                    && line_end_col > vc0
-                                            });
-                                            if inside_video {
-                                                continue;
-                                            }
-
-                                            let row_base = (target_y as usize) * cols_usize;
-                                            let check_c0 = (draw_col as usize).min(cols_usize);
-                                            let check_c1 = (line_end_col as usize).min(cols_usize);
-                                            if check_c0 < check_c1
-                                                && occupied_cells[row_base + check_c0..row_base + check_c1]
+                                            let r_base = (probe_y as usize) * cols_usize;
+                                            if c0_u < c1_u
+                                                && occupied_cells[r_base + c0_u..r_base + c1_u]
                                                     .iter()
                                                     .any(|&occ| occ)
                                             {
-                                                // Scan right on the same row to see if there is unoccupied space after an inline sibling
-                                                let mut last_occ = check_c0;
-                                                for c_idx in check_c0..cols_usize {
-                                                    if occupied_cells[row_base + c_idx] {
-                                                        last_occ = c_idx;
-                                                    } else if c_idx > last_occ + 1 {
-                                                        break;
-                                                    }
-                                                }
-                                                let shifted_col = ((last_occ + 2) as u16).min(cols);
-                                                if shifted_col + 4 <= cols
-                                                    && !occupied_cells[row_base + (shifted_col as usize)..row_base + cols_usize]
-                                                        .iter()
-                                                        .take(4)
-                                                        .any(|&occ| occ)
-                                                {
-                                                    draw_col = shifted_col;
-                                                    let max_rem = (cols - draw_col) as usize;
-                                                    line_text = truncate_by_display_width(&line_text, max_rem);
-                                                    line_w = display_width(&line_text) as u16;
-                                                    if line_w == 0 {
-                                                        continue;
-                                                    }
-                                                    line_end_col = draw_col.saturating_add(line_w).min(cols);
-                                                } else {
-                                                    continue;
+                                                vertical_push += 1;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    for (line_offset, styled_line) in wrapped_lines.iter().enumerate() {
+                                        let target_y_i32 =
+                                            start_row_i32 + (line_offset as i32) + vertical_push;
+                                        if target_y_i32 < view_start_y as i32 {
+                                            continue;
+                                        }
+                                        if target_y_i32 >= view_max_y as i32 {
+                                            break;
+                                        }
+                                        let target_y = target_y_i32 as u16;
+                                        let mut draw_col = if line_offset == 0 && inline_indent > 0 {
+                                            start_col.saturating_add(inline_indent as u16).min(cols)
+                                        } else {
+                                            start_col
+                                        };
+                                        if draw_col >= cols || styled_line.total_cols == 0 {
+                                            continue;
+                                        }
+
+                                        let max_rem_cols = (cols - draw_col) as usize;
+                                        let line_w = styled_line.total_cols.min(max_rem_cols) as u16;
+                                        if line_w == 0 {
+                                            continue;
+                                        }
+                                        let mut line_end_col = draw_col.saturating_add(line_w).min(cols);
+
+                                        let inside_video = video_term_boxes.iter().any(|&(vc0, vr0, vc1, vr1)| {
+                                            target_y >= vr0
+                                                && target_y < vr1
+                                                && draw_col < vc1
+                                                && line_end_col > vc0
+                                        });
+                                        if inside_video {
+                                            continue;
+                                        }
+
+                                        let row_base = (target_y as usize) * cols_usize;
+                                        let check_c0 = (draw_col as usize).min(cols_usize);
+                                        let check_c1 = (line_end_col as usize).min(cols_usize);
+                                        if check_c0 < check_c1
+                                            && occupied_cells[row_base + check_c0..row_base + check_c1]
+                                                .iter()
+                                                .any(|&occ| occ)
+                                        {
+                                            if has_inline_runs {
+                                                continue;
+                                            }
+                                            // Scan right on the same row to see if there is unoccupied space after an inline sibling
+                                            let mut last_occ = check_c0;
+                                            for c_idx in check_c0..cols_usize {
+                                                if occupied_cells[row_base + c_idx] {
+                                                    last_occ = c_idx;
+                                                } else if c_idx > last_occ + 1 {
+                                                    break;
                                                 }
                                             }
+                                            let shifted_col = ((last_occ + 2) as u16).min(cols);
+                                            if shifted_col + 4 <= cols
+                                                && !occupied_cells[row_base + (shifted_col as usize)..row_base + cols_usize]
+                                                    .iter()
+                                                    .take(4)
+                                                    .any(|&occ| occ)
+                                            {
+                                                draw_col = shifted_col;
+                                                let rem = (cols - draw_col) as usize;
+                                                line_end_col = draw_col
+                                                    .saturating_add(styled_line.total_cols.min(rem) as u16)
+                                                    .min(cols);
+                                            } else {
+                                                continue;
+                                            }
+                                        }
 
-                                            // Suppress underline on colored buttons (e.g. "Sign in"), inputs, popups, and Indic scripts
-                                            // where terminal underlines slice through subscript vowel matras.
-                                            let should_underline = span.is_link
-                                                && !span.is_input
-                                                && !span.is_popup
-                                                && !has_complex_script(&line_text)
-                                                && span.bg.map_or(true, |b| b.luma_fast() > 215);
-
+                                        let mut cursor_col = draw_col;
+                                        for seg in &styled_line.segs {
+                                            if cursor_col >= cols {
+                                                break;
+                                            }
+                                            let seg_avail = (cols - cursor_col) as usize;
+                                            let clipped_seg = truncate_by_display_width(&seg.text, seg_avail);
+                                            let drawn_w = display_width(&clipped_seg) as u16;
+                                            if drawn_w == 0 {
+                                                continue;
+                                            }
+                                            let should_underline = seg.underline && !has_complex_script(&clipped_seg);
                                             renderer.put_str_with_existing_bg(
-                                                draw_col,
+                                                cursor_col,
                                                 target_y,
-                                                &line_text,
-                                                link_fg,
+                                                &clipped_seg,
+                                                seg.fg,
                                                 span.bg,
-                                                span.bold,
+                                                seg.bold,
                                                 should_underline,
                                             );
-
-                                            let mark_c0 = (draw_col as usize).min(cols_usize);
-                                            let mark_c1 = (line_end_col as usize).min(cols_usize);
-                                            for cell_occ in &mut occupied_cells[row_base + mark_c0..row_base + mark_c1] {
-                                                *cell_occ = true;
+                                            let seg_end = cursor_col.saturating_add(drawn_w).min(cols);
+                                            if span.is_input || seg.link_url.is_some() {
+                                                rendered_hitboxes.push(RenderedHitbox {
+                                                    col_start: cursor_col,
+                                                    col_end: seg_end,
+                                                    row: target_y,
+                                                    link_url: seg.link_url.clone(),
+                                                    is_input: span.is_input,
+                                                });
                                             }
+                                            cursor_col = seg_end;
+                                        }
+
+                                        let mark_c0 = (draw_col as usize).min(cols_usize);
+                                        let mark_c1 = (cursor_col.max(line_end_col) as usize).min(cols_usize);
+                                        for cell_occ in &mut occupied_cells[row_base + mark_c0..row_base + mark_c1] {
+                                            *cell_occ = true;
                                         }
                                     }
                                 }
                             }
+
+                            cdp_engine.set_rendered_hitboxes(rendered_hitboxes);
                         }
 
                         if is_loading {
@@ -1451,5 +1792,84 @@ fn url_base(url: &str) -> Result<String, ()> {
         }
     } else {
         Err(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cohesive_block_wrap_with_inline_runs_and_citations() {
+        let text = "India, officially the Republic of India,[20] is a country in South Asia.";
+        let runs = vec![
+            InlineStyleRun {
+                start_char: 0,
+                end_char: 5,
+                fg: Some(Color::BLACK),
+                bold: true,
+                is_link: false,
+                link_url: None,
+            },
+            InlineStyleRun {
+                start_char: 22,
+                end_char: 39,
+                fg: Some(Color::BLACK),
+                bold: true,
+                is_link: false,
+                link_url: None,
+            },
+            InlineStyleRun {
+                start_char: 40,
+                end_char: 44,
+                fg: Some(Color::new(51, 102, 204)),
+                bold: false,
+                is_link: true,
+                link_url: Some("https://en.wikipedia.org/wiki/India#cite_note-20".to_string()),
+            },
+            InlineStyleRun {
+                start_char: 61,
+                end_char: 71,
+                fg: Some(Color::new(51, 102, 204)),
+                bold: false,
+                is_link: true,
+                link_url: Some("https://en.wikipedia.org/wiki/South_Asia".to_string()),
+            },
+        ];
+        let span = TextOverlaySpan {
+            text: text.to_string(),
+            px_x: 16,
+            px_y: 120,
+            px_w: 328,
+            px_h: 48,
+            fg: Color::BLACK,
+            bg: Some(Color::WHITE),
+            bold: false,
+            is_link: false,
+            is_input: false,
+            link_url: None,
+            is_fixed: false,
+            is_popup: false,
+            inline_runs: runs,
+        };
+
+        let wrapped = wrap_styled_overlay_lines(&span, 34, 8, 0);
+        assert!(wrapped.len() >= 2 && wrapped.len() <= 4);
+
+        let rejoined: String = wrapped
+            .iter()
+            .map(|l| l.segs.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(rejoined.contains("India, officially the"));
+        assert!(rejoined.contains("India,[20]"));
+        assert!(rejoined.contains("South Asia."));
+
+        let all_segs: Vec<&StyledSeg> = wrapped.iter().flat_map(|l| l.segs.iter()).collect();
+        assert!(all_segs.iter().any(|s| s.bold && s.text.contains("India")));
+        assert!(all_segs.iter().any(|s| {
+            s.underline
+                && s.link_url.as_deref() == Some("https://en.wikipedia.org/wiki/South_Asia")
+        }));
     }
 }

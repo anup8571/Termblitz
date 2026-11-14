@@ -48,6 +48,25 @@ impl RenderMode {
 
 pub type EngineMode = RenderMode;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InlineStyleRun {
+    pub start_char: usize,
+    pub end_char: usize,
+    pub fg: Option<Color>,
+    pub bold: bool,
+    pub is_link: bool,
+    pub link_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedHitbox {
+    pub col_start: u16,
+    pub col_end: u16,
+    pub row: u16,
+    pub link_url: Option<String>,
+    pub is_input: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct TextOverlaySpan {
     pub text: String,
@@ -63,6 +82,7 @@ pub struct TextOverlaySpan {
     pub link_url: Option<String>,
     pub is_fixed: bool,
     pub is_popup: bool,
+    pub inline_runs: Vec<InlineStyleRun>,
 }
 
 impl TextOverlaySpan {
@@ -81,6 +101,44 @@ impl TextOverlaySpan {
 }
 
 pub type OverlayItem = TextOverlaySpan;
+
+pub fn parse_inline_runs(raw: &str) -> Vec<InlineStyleRun> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    let mut runs = Vec::new();
+    for rec in raw.split('\x1e') {
+        if rec.is_empty() {
+            continue;
+        }
+        let mut fields = rec.split('\x1f');
+        let start_char = match fields.next().and_then(|s| s.parse::<usize>().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let end_char = match fields.next().and_then(|s| s.parse::<usize>().ok()) {
+            Some(v) if v > start_char => v,
+            _ => continue,
+        };
+        let bold = fields.next() == Some("1");
+        let is_link = fields.next() == Some("1");
+        let fg = fields.next().and_then(parse_color_from_str);
+        let link_url = fields
+            .next()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        runs.push(InlineStyleRun {
+            start_char,
+            end_char,
+            fg,
+            bold,
+            is_link,
+            link_url,
+        });
+    }
+    runs
+}
 
 /// Elevated popup or autocomplete dropdown box (`POPUP_MASK:x,y,w,h,r,g,b` or `RECT_MASK:x,y,w,h,r,g,b`)
 /// emitted by the DOM extractor before suggestion text items so the renderer can wipe stale underlying page text.
@@ -1427,11 +1485,12 @@ impl WsConnection {
 
 const TEXT_EXTRACT_ID: u64 = 55555;
 const SCROLL_SYNC_ID: u64 = 55556;
+const WHEEL_SCROLL_ID: u64 = 55557;
 
 /// Injects mobile reflow CSS, cosmetic ad-blocking rules, YouTube Ad-Shield auto-skipper, audio mute sync,
 /// and non-destructive text transparency (`-webkit-text-fill-color: transparent`).
-/// Defers heavy `setInterval` and throttled `MutationObserver` ad-shield sweeps until `DOMContentLoaded`
-/// (`document.readyState !== 'loading'`) so initial page parsing and layout never stall.
+/// Uses `overflow-x: clip` on `html` and `overflow-x: visible` on `body` so Chromium never traps
+/// document scrolling inside an auto-height `body` scroll box.
 fn build_page_style_js(hide_text: bool, adblock: bool, muted: bool) -> String {
     let raw_flag = if hide_text { "no" } else { "yes" };
     let ad_flag = if adblock { "yes" } else { "no" };
@@ -1475,7 +1534,8 @@ fn build_page_style_js(hide_text: bool, adblock: bool, muted: bool) -> String {
                 s=document.createElement('style');\
                 s.id='termblitz-core-style';\
                 s.textContent='\
-                    html,body{{max-width:100vw!important;overflow-x:hidden!important;box-sizing:border-box!important;word-break:break-word!important;-webkit-text-size-adjust:100%!important;}}\
+                    html{{max-width:100vw!important;overflow-x:clip!important;box-sizing:border-box!important;-webkit-text-size-adjust:100%!important;}}\
+                    body{{max-width:100vw!important;overflow-x:visible!important;box-sizing:border-box!important;word-break:break-word!important;}}\
                     img,video,canvas,svg{{max-width:100%!important;height:auto!important;}}\
                     .collapsible-block,.mf-collapsible-content,[class*=collapsible-block]{{display:block!important;}}\
                     html:not([data-termblitz-raw=yes]) *,html:not([data-termblitz-raw=yes]) *::before,html:not([data-termblitz-raw=yes]) *::after{{-webkit-text-fill-color:transparent!important;text-shadow:none!important;-webkit-text-stroke:0!important;}}\
@@ -1538,11 +1598,106 @@ fn build_page_style_js(hide_text: bool, adblock: bool, muted: bool) -> String {
     )
 }
 
+fn build_scroll_sync_js(pixel_delta: i32, px_x: i32, px_y: i32) -> String {
+    format!(
+        "(function(){{\
+            var dy={0},x={1},y={2},T=String.fromCharCode(9);\
+            function getDocTop(){{return window.scrollY||(document.scrollingElement?document.scrollingElement.scrollTop:0)||document.documentElement.scrollTop||document.body.scrollTop||0;}}\
+            function getCurTop(el){{return (el&&el!==document.body&&el!==document.documentElement)?el.scrollTop:getDocTop();}}\
+            var prevEl=window.__termblitz_scroll_el;\
+            var startTop=(typeof window.__termblitz_last_top==='number')?window.__termblitz_last_top:getCurTop(prevEl);\
+            var curTop=getCurTop(prevEl);\
+            var movedByWheel=curTop-startTop;\
+            var scEl=prevEl||document.scrollingElement||document.documentElement||document.body;\
+            if((dy>0&&movedByWheel<Math.max(4,dy*0.33))||(dy<0&&movedByWheel>Math.min(-4,dy*0.33))){{\
+                var rem=dy-movedByWheel;\
+                function canScroll(el,dir){{\
+                    if(!el)return false;\
+                    if(el.scrollHeight<=el.clientHeight+4)return false;\
+                    var ov=getComputedStyle(el).overflowY;\
+                    if(ov==='hidden'||ov==='clip')return false;\
+                    if(el!==document.documentElement&&el!==document.body&&ov!=='auto'&&ov!=='scroll'&&ov!=='overlay')return false;\
+                    return dir>0?(el.scrollTop+el.clientHeight<el.scrollHeight-1):(el.scrollTop>0);\
+                }}\
+                var scrolled=false;\
+                if(prevEl&&prevEl!==document.body&&prevEl!==document.documentElement&&canScroll(prevEl,rem)){{\
+                    var b0=prevEl.scrollTop;prevEl.scrollTop+=rem;\
+                    if(prevEl.scrollTop!==b0){{scEl=prevEl;scrolled=true;}}\
+                    else{{window.__termblitz_scroll_el=null;}}\
+                }}\
+                if(!scrolled){{\
+                    var doc0=getDocTop();\
+                    try{{window.scrollBy({{top:rem,left:0,behavior:'instant'}});}}catch(_e){{window.scrollBy(0,rem);}}\
+                    var doc1=getDocTop();\
+                    if(doc1===doc0){{\
+                        var se=document.scrollingElement||document.documentElement;\
+                        if(se){{se.scrollTop+=rem;doc1=getDocTop();}}\
+                    }}\
+                    if(doc1===doc0&&document.body){{\
+                        document.body.scrollTop+=rem;doc1=getDocTop();\
+                    }}\
+                    if(doc1!==doc0){{\
+                        scEl=document.scrollingElement||document.documentElement||document.body;\
+                        window.__termblitz_scroll_el=scEl;\
+                        scrolled=true;\
+                    }}\
+                }}\
+                if(!scrolled){{\
+                    var cur=document.elementFromPoint(x,y);\
+                    while(cur&&cur!==document.body&&cur!==document.documentElement){{\
+                        if(canScroll(cur,rem)){{\
+                            var b1=cur.scrollTop;cur.scrollTop+=rem;\
+                            if(cur.scrollTop!==b1){{scEl=cur;window.__termblitz_scroll_el=cur;scrolled=true;break;}}\
+                        }}\
+                        cur=cur.parentElement;\
+                    }}\
+                }}\
+                if(!scrolled){{\
+                    var vh=window.innerHeight||576;\
+                    var bestEl=null,bestArea=0;\
+                    var cand=document.querySelectorAll('main,[role=main],#content,#primary,#mw-content-text,section,article,.scrollable,.feed,[data-scrollable],div');\
+                    for(var ci=0;ci<cand.length;ci++){{\
+                        var cel=cand[ci];\
+                        if(canScroll(cel,rem)){{\
+                            var crc=cel.getBoundingClientRect();\
+                            if(crc.width>80&&crc.height>80&&crc.top<vh&&crc.bottom>0){{\
+                                var area=crc.width*crc.height;\
+                                if(area>bestArea){{bestArea=area;bestEl=cel;}}\
+                            }}\
+                        }}\
+                    }}\
+                    if(bestEl){{\
+                        var b2=bestEl.scrollTop;bestEl.scrollTop+=rem;\
+                        if(bestEl.scrollTop!==b2){{scEl=bestEl;window.__termblitz_scroll_el=bestEl;scrolled=true;}}\
+                    }}\
+                }}\
+            }}else{{\
+                window.__termblitz_scroll_el=scEl;\
+            }}\
+            try{{window.dispatchEvent(new Event('scroll'));}}catch(_e){{}}\
+            if(scEl&&scEl!==document.documentElement){{\
+                try{{scEl.dispatchEvent(new Event('scroll',{{bubbles:true}}));}}catch(_e){{}}\
+            }}\
+            var nowTop=getCurTop(scEl);\
+            window.__termblitz_last_top=nowTop;\
+            var baseTop=window.__termblitz_extract_top||0;\
+            var vh=window.innerHeight||576;\
+            var scH=(scEl&&scEl.scrollHeight>vh)?scEl.scrollHeight:Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0,vh);\
+            var scClient=(scEl&&scEl.clientHeight>0&&scEl.clientHeight<vh)?scEl.clientHeight:vh;\
+            var maxS=Math.max(1,scH-scClient);\
+            var pct=Math.min(100,Math.max(0,Math.round((nowTop*100)/maxS)));\
+            return (~~(nowTop-baseTop))+T+pct;\
+        }})()",
+        pixel_delta, px_x, px_y
+    )
+}
+
 fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
     *seq += 1;
     let js = "(function(){\
-        var T=String.fromCharCode(9),N=String.fromCharCode(10),r=[],items=[];\
+        var T=String.fromCharCode(9),N=String.fromCharCode(10),RS=String.fromCharCode(30),US=String.fromCharCode(31),r=[],items=[];\
         if(!document.body)return '';\
+        function cleanStr(s){if(!s)return '';var o='';for(var ci=0;ci<s.length;ci++){var cc=s.charCodeAt(ci);o+=(cc<32)?' ':s[ci];}return o;}\
         try{\
             var _imgs=document.querySelectorAll('img[loading=lazy],img[data-src],img[data-srcset]');\
             for(var _i=0;_i<_imgs.length;_i++){\
@@ -1565,6 +1720,7 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
         var scEl=window.__termblitz_scroll_el||document.scrollingElement||document.documentElement||document.body;\
         var scTop=(scEl&&scEl!==document.body&&scEl!==document.documentElement&&scEl.scrollTop>0)?scEl.scrollTop:(window.scrollY||document.documentElement.scrollTop||document.body.scrollTop||0);\
         window.__termblitz_extract_top=scTop;\
+        window.__termblitz_last_top=scTop;\
         var scH=(scEl&&scEl.scrollHeight>vh)?scEl.scrollHeight:Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0,vh);\
         var scClient=(scEl&&scEl.clientHeight>0&&scEl.clientHeight<vh)?scEl.clientHeight:vh;\
         var maxS=Math.max(1,scH-scClient);\
@@ -1607,7 +1763,7 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
         }\
         var vHeader=vRects.length?('VIDEO:'+vRects.join(';')):'';\
         var roiHeader=rois.length?('ROI:'+rois.join(';')):'';\
-        r.push('META'+T+vw+T+vh+T+pct+T+(location.href||'')+T+vHeader+T+roiHeader);\
+        r.push('META'+T+vw+T+vh+T+pct+T+cleanStr(location.href||'')+T+vHeader+T+roiHeader);\
         function getBg(el){\
             var bp=el;\
             while(bp&&bp!==document.documentElement){\
@@ -1705,10 +1861,152 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             return false;\
         }\
         var skipTags={SCRIPT:1,STYLE:1,NOSCRIPT:1,TEMPLATE:1,SVG:1,PATH:1,HEAD:1,META:1,TITLE:1,OBJECT:1};\
+        var consumedSet=new Set();\
+        var adSel='[aria-hidden=true],[hidden],ins.adsbygoogle,[data-text-ad],[id^=google_ads],ytd-ad-slot-renderer,ytm-promoted-sparkles-web-renderer,.ytp-ad-overlay-container';\
+        var blockCand=document.querySelectorAll('p,h1,h2,h3,h4,h5,h6,li,blockquote,dd,dt,figcaption,pre,.hatnote,.dablink');\
+        for(var bci=0;bci<blockCand.length&&items.length<450;bci++){\
+            var bel=blockCand[bci];\
+            if(consumedSet.has(bel))continue;\
+            if(bel.closest(adSel))continue;\
+            var bs=getComputedStyle(bel);\
+            if(bs.display==='none'||bs.visibility==='hidden'||parseFloat(bs.opacity)<0.05||parseFloat(bs.fontSize)<2)continue;\
+            if(bs.clip==='rect(1px, 1px, 1px, 1px)'||bs.clipPath==='inset(50%)'||((bel.offsetWidth<=2||bel.offsetHeight<=2)&&bs.overflow==='hidden'))continue;\
+            if(bel.querySelector('p,h1,h2,h3,h4,h5,h6,div,ul,ol,li,table,blockquote,section,article,form,input,textarea,select,button,pre'))continue;\
+            var brc=bel.getBoundingClientRect();\
+            if(!brc||brc.width<16||brc.height<6||brc.bottom<=2||brc.top>=vh-2||brc.right<=2||brc.left>=vw-2)continue;\
+            var bl=brc.left,bt=brc.top,br=brc.right,bb=brc.bottom,bClip=false;\
+            var banc=bel.parentElement;\
+            while(banc&&banc!==document.body&&banc!==document.documentElement){\
+                var bas=getComputedStyle(banc);\
+                if(bas.overflowY!=='visible'||bas.overflowX!=='visible'){\
+                    var barc=banc.getBoundingClientRect();\
+                    if(barc.left>bl)bl=barc.left;\
+                    if(barc.right<br)br=barc.right;\
+                    if(barc.top>bt)bt=barc.top;\
+                    if(barc.bottom<bb)bb=barc.bottom;\
+                    if(br-bl<8||bb-bt<4){bClip=true;break;}\
+                }\
+                banc=banc.parentElement;\
+            }\
+            if(bClip)continue;\
+            var bVisL=Math.max(0,bl),bVisT=Math.max(0,bt),bVisR=Math.min(vw,br),bVisB=Math.min(vh,bb);\
+            if(bVisR-bVisL<8||bVisB-bVisT<4)continue;\
+            var bcx=~~((bVisL+bVisR)/2),bcy=~~((bVisT+bVisB)/2);\
+            var bOpt=bel.closest('[role=option],.sbct,[data-entityname]');\
+            var bPopAnc=bOpt||bel.closest(popSel);\
+            var bInPop=bPopAnc?1:0;\
+            if(!bInPop){\
+                for(var pbi=0;pbi<popBoxes.length;pbi++){\
+                    if(popBoxes[pbi].el.contains(bel)){bInPop=1;break;}\
+                }\
+            }\
+            if(!bInPop&&isOccluded(bel,bcx,bcy))continue;\
+            var outBuf='',charCount=0,runs=[],lastWasSup=false;\
+            function pushSeg(seg,bold,isLink,col,href,isSup){\
+                if(!seg)return;\
+                if(isSup){\
+                    if(outBuf.length>0&&outBuf.charCodeAt(outBuf.length-1)===32){\
+                        outBuf=outBuf.slice(0,-1);if(charCount>0)charCount--;\
+                    }\
+                }else if(lastWasSup){\
+                    var fc=seg.charAt(0);\
+                    if(fc!==' '&&fc!=='.'&&fc!==','&&fc!==';'&&fc!==':'&&fc!=='!'&&fc!=='?'&&fc!==')'&&fc!==']'&&fc!=='['){\
+                        outBuf+=' ';charCount++;\
+                    }\
+                }\
+                var segArr=Array.from(seg);\
+                var startIdx=charCount;\
+                outBuf+=seg;\
+                charCount+=segArr.length;\
+                lastWasSup=!!isSup;\
+                var cHref=cleanStr(href||'');\
+                var cCol=cleanStr(col||'');\
+                var lastR=runs.length?runs[runs.length-1]:null;\
+                if(lastR&&lastR.end===startIdx&&lastR.bold===bold&&lastR.link===isLink&&lastR.href===cHref&&lastR.col===cCol){\
+                    lastR.end=charCount;\
+                }else if(charCount>startIdx){\
+                    runs.push({start:startIdx,end:charCount,bold:bold,link:isLink,col:cCol,href:cHref});\
+                }\
+            }\
+            function normWs(raw,firstCheck){\
+                var cleaned=cleanStr(raw);\
+                var res='',sp=false;\
+                for(var wi=0;wi<cleaned.length;wi++){\
+                    var ch=cleaned[wi];\
+                    if(ch===' '){sp=true;}\
+                    else{\
+                        if(sp&&(res.length>0||(!firstCheck&&outBuf.length>0&&outBuf.charCodeAt(outBuf.length-1)!==32)))res+=' ';\
+                        res+=ch;sp=false;\
+                    }\
+                }\
+                if(sp&&res.length>0)res+=' ';\
+                else if(sp&&!firstCheck&&outBuf.length>0&&outBuf.charCodeAt(outBuf.length-1)!==32)res=' ';\
+                return res;\
+            }\
+            function walkProse(node,curBold,curLink,curCol,curHref){\
+                if(node.nodeType===3){\
+                    var seg=normWs(node.textContent||'',outBuf.length===0);\
+                    if(seg)pushSeg(seg,curBold,curLink,curCol,curHref,false);\
+                    return;\
+                }\
+                if(node.nodeType!==1)return;\
+                if(skipTags[node.tagName])return;\
+                if(node.hasAttribute&&(node.hasAttribute('hidden')||node.getAttribute('aria-hidden')==='true'))return;\
+                var ncs=getComputedStyle(node);\
+                if(ncs.display==='none'||ncs.visibility==='hidden'||parseFloat(ncs.opacity)<0.05)return;\
+                if(node.tagName==='BR'){if(outBuf.length>0&&outBuf.charCodeAt(outBuf.length-1)!==32)pushSeg(' ',0,0,bs.color,'',false);return;}\
+                var isSup=(node.tagName==='SUP'||(node.classList&&(node.classList.contains('reference')||node.classList.contains('cite'))));\
+                if(isSup){\
+                    var rawSup=cleanStr(node.textContent||'').split(' ').join('');\
+                    if(rawSup){\
+                        if(rawSup.charAt(0)!=='['&&/^[0-9a-zA-Z]+$/.test(rawSup))rawSup='['+rawSup+']';\
+                        var sa=node.querySelector('a')||(node.closest?node.closest('a'):null);\
+                        var shref=sa?(sa.href||''):(curHref||'');\
+                        var slink=(sa||curLink)?1:0;\
+                        var scol=sa?getComputedStyle(sa).color:(ncs.color||curCol);\
+                        pushSeg(rawSup,0,slink,scol,shref,true);\
+                    }\
+                    return;\
+                }\
+                var nb=(curBold||node.tagName==='B'||node.tagName==='STRONG'||ncs.fontWeight==='bold'||+ncs.fontWeight>=600)?1:0;\
+                var nl=curLink,nh=curHref,nc=ncs.color||curCol;\
+                if(node.tagName==='A'){nl=1;nh=node.href||nh;}\
+                var chList=node.childNodes;\
+                for(var k=0;k<chList.length;k++)walkProse(chList[k],nb,nl,nc,nh);\
+            }\
+            var bIsHeading=(bel.tagName.length===2&&bel.tagName.charAt(0)==='H');\
+            var bBaseBold=(bIsHeading||bs.fontWeight==='bold'||+bs.fontWeight>=600)?1:0;\
+            var bPrefix=(bel.tagName==='LI'&&bs.listStyleType!=='none')?'• ':(bel.tagName==='BLOCKQUOTE'?'│ ':'');\
+            if(bPrefix)pushSeg(bPrefix,1,0,bs.color,'',false);\
+            var bChildren=bel.childNodes;\
+            for(var bi2=0;bi2<bChildren.length;bi2++)walkProse(bChildren[bi2],bBaseBold,0,bs.color,'');\
+            if(outBuf.length>0&&outBuf.charCodeAt(outBuf.length-1)===32){\
+                outBuf=outBuf.slice(0,-1);\
+                if(runs.length&&runs[runs.length-1].end>Array.from(outBuf).length){runs[runs.length-1].end=Array.from(outBuf).length;}\
+            }\
+            if(!outBuf.trim())continue;\
+            consumedSet.add(bel);\
+            var runStr='';\
+            for(var ri=0;ri<runs.length;ri++){\
+                var rn=runs[ri];\
+                if(rn.end<=rn.start)continue;\
+                if(runStr)runStr+=RS;\
+                runStr+=rn.start+US+rn.end+US+rn.bold+US+rn.link+US+rn.col+US+rn.href;\
+            }\
+            var bw=~~Math.max(16,Math.min(vw,br)-bVisL);\
+            var bh=~~Math.max(8,brc.height);\
+            var bx=~~bVisL,by=~~brc.top;\
+            var bBg=getBg(bel);\
+            if(!bBg&&bInPop)bBg='rgb(255, 255, 255)';\
+            var bFix=(bInPop||isFixed(bel))?1:0;\
+            var bDefLink=(runs.length===1&&runs[0].link)?1:0;\
+            var bDefHref=(runs.length===1)?runs[0].href:'';\
+            items.push({txt:outBuf,l:bx,top:by,w:bw,h:bh,col:bs.color,bold:bBaseBold,link:bDefLink,bg:bBg,inp:0,href:bDefHref,fix:bFix,pop:bInPop,runs:runStr});\
+        }\
         var tw=document.createTreeWalker(document.body,NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT,{\
             acceptNode:function(node){\
                 if(node.nodeType===1){\
-                    if(skipTags[node.tagName])return NodeFilter.FILTER_REJECT;\
+                    if(skipTags[node.tagName]||consumedSet.has(node))return NodeFilter.FILTER_REJECT;\
                     if(node.hasAttribute&&(node.hasAttribute('hidden')||node.getAttribute('aria-hidden')==='true'))return NodeFilter.FILTER_REJECT;\
                     var rect=node.getBoundingClientRect();\
                     if(rect&&(rect.bottom<0||rect.top>vh||rect.right<0||rect.left>vw)){\
@@ -1724,31 +2022,35 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
         while(n=tw.nextNode()){\
             var t=n.textContent;\
             if(!t)continue;\
-            var txt=t.split(T).join(' ').split(N).join(' ').trim();\
+            var txt=cleanStr(t).trim();\
             if(!txt)continue;\
             var p=n.parentElement;\
-            if(!p||skipTags[p.tagName])continue;\
+            if(!p||skipTags[p.tagName]||consumedSet.has(p))continue;\
             var s=getComputedStyle(p);\
             if(s.display==='none'||s.visibility==='hidden'||parseFloat(s.opacity)<0.05||parseFloat(s.fontSize)<2)continue;\
             if(s.clip==='rect(1px, 1px, 1px, 1px)'||s.clipPath==='inset(50%)'||((p.offsetWidth<=2||p.offsetHeight<=2)&&s.overflow==='hidden'))continue;\
-            if(p.closest('[aria-hidden=true],[hidden],ins.adsbygoogle,[data-text-ad],[id^=google_ads],ytd-ad-slot-renderer,ytm-promoted-sparkles-web-renderer,.ytp-ad-overlay-container'))continue;\
+            if(p.closest(adSel))continue;\
             var rng=document.createRange();\
             rng.selectNodeContents(n);\
             var rects=rng.getClientRects();\
             if(!rects||!rects.length)continue;\
-            var minL=99999,minT=99999,maxR=-99999,maxB=-99999,cnt=0;\
+            var minL=99999,minT=99999,maxR=-99999,maxB=-99999,maxT=-99999,firstR=null,cnt=0;\
             for(var i=0;i<rects.length;i++){\
                 var rc=rects[i];\
                 if(rc.bottom<0||rc.top>vh||rc.right<0||rc.left>vw)continue;\
                 if(rc.width>=1&&rc.height>=1){\
+                    if(!firstR)firstR=rc;\
                     if(rc.left<minL)minL=rc.left;\
                     if(rc.top<minT)minT=rc.top;\
+                    if(rc.top>maxT)maxT=rc.top;\
                     if(rc.right>maxR)maxR=rc.right;\
                     if(rc.bottom>maxB)maxB=rc.bottom;\
                     cnt++;\
                 }\
             }\
-            if(!cnt)continue;\
+            if(!cnt||!firstR)continue;\
+            var anchorL=(cnt>1&&(maxT-minT>=8)&&(minL+24<firstR.left))?firstR.left:minL;\
+            var anchorT=(cnt>1&&(maxT-minT>=8))?firstR.top:minT;\
             var optEl=p.closest('[role=option],.sbct,[data-entityname]');\
             var popAnc=optEl||p.closest(popSel);\
             var inPop=popAnc?1:0;\
@@ -1762,21 +2064,21 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
                 var as=getComputedStyle(anc);\
                 if(as.overflowY!=='visible'||as.overflowX!=='visible'){\
                     var arc=anc.getBoundingClientRect();\
-                    if(arc.left>minL)minL=arc.left;\
-                    if(arc.top>minT)minT=arc.top;\
+                    if(arc.left>anchorL)anchorL=arc.left;\
+                    if(arc.top>anchorT)anchorT=arc.top;\
                     if(arc.right<maxR)maxR=arc.right;\
                     if(arc.bottom<maxB)maxB=arc.bottom;\
-                    if(maxR-minL<4||maxB-minT<4){clipped=true;break;}\
+                    if(maxR-anchorL<4||maxB-anchorT<4){clipped=true;break;}\
                 }\
                 anc=anc.parentElement;\
             }\
             if(clipped)continue;\
-            if(minL<0)minL=0;\
-            if(minT<0)minT=0;\
+            if(anchorL<0)anchorL=0;\
+            if(anchorT<0)anchorT=0;\
             if(maxR>vw)maxR=vw;\
             if(maxB>vh)maxB=vh;\
-            var w=~~(maxR-minL),h=~~(maxB-minT),l=~~minL,top=~~minT;\
-            if(w<4||h<4||top>=vh-2||l>=vw-2)continue;\
+            var w=~~Math.max(4,maxR-anchorL),h=~~Math.max(4,maxB-anchorT),l=~~anchorL,top=~~anchorT;\
+            if(top>=vh-2||l>=vw-2)continue;\
             var cx=~~(l+w/2),cy=~~(top+h/2);\
             if(!inPop&&isOccluded(p,cx,cy))continue;\
             var a=p.closest('a');\
@@ -1785,8 +2087,8 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
             if(!bg&&inPop)bg='rgb(255, 255, 255)';\
             var fix=(inPop||isFixed(p))?1:0;\
             var isLink=(a||optEl)?1:0;\
-            items.push({txt:txt,l:l,top:top,w:w,h:h,col:s.color,bold:(s.fontWeight==='bold'||+s.fontWeight>=600?1:0),link:isLink,bg:bg,inp:0,href:href,fix:fix,pop:inPop});\
-            if(items.length>400)break;\
+            items.push({txt:txt,l:l,top:top,w:w,h:h,col:s.color,bold:(s.fontWeight==='bold'||+s.fontWeight>=600?1:0),link:isLink,bg:bg,inp:0,href:href,fix:fix,pop:inPop,runs:''});\
+            if(items.length>700)break;\
         }\
         var inputs=document.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):not([type=submit]):not([type=button]),textarea,[contenteditable=true],[role=searchbox],[role=combobox]');\
         for(var j=0;j<inputs.length;j++){\
@@ -1808,8 +2110,9 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
                     it.top=ity;\
                     it.inp=1;\
                     it.fix=ifix;\
+                    it.runs='';\
                     if(rawVal&&rawVal.trim()){\
-                        it.txt=isFocused?(rawVal+'▏'):rawVal.trim();\
+                        it.txt=cleanStr(isFocused?(rawVal+'▏'):rawVal.trim());\
                     }else if(isFocused){\
                         it.txt='▏';\
                     }\
@@ -1817,45 +2120,45 @@ fn request_text_extraction(ws: &mut WsConnection, seq: &mut u64) {
                 }\
             }\
             if(!matched){\
-                var val=(rawVal||el.placeholder||el.getAttribute('aria-label')||el.getAttribute('title')||'Search or type...').split(T).join(' ').split(N).join(' ').trim();\
+                var val=cleanStr(rawVal||el.placeholder||el.getAttribute('aria-label')||el.getAttribute('title')||'Search or type...').trim();\
                 if(isFocused){\
-                    val=rawVal?(rawVal.split(T).join(' ').split(N).join(' ')+'▏'):'▏';\
+                    val=rawVal?(cleanStr(rawVal)+'▏'):'▏';\
                 }else if(!val){\
                     val='Search or type...';\
                 }\
-                items.push({txt:val,l:~~(erc.left+8),top:ity,w:~~Math.max(16,erc.width-16),h:18,col:es.color,bold:isFocused?1:0,link:0,bg:getBg(el),inp:1,href:'',fix:ifix,pop:0});\
+                items.push({txt:val,l:~~(erc.left+8),top:ity,w:~~Math.max(16,erc.width-16),h:18,col:es.color,bold:isFocused?1:0,link:0,bg:getBg(el),inp:1,href:'',fix:ifix,pop:0,runs:''});\
             }\
         }\
         var btnCand=document.querySelectorAll('button,[role=button],[aria-label*=close],[aria-label*=dismiss]');\
-        for(var bi=0;bi<btnCand.length&&items.length<400;bi++){\
-            var bel=btnCand[bi];\
-            var bs=getComputedStyle(bel);\
-            if(bs.display==='none'||bs.visibility==='hidden'||parseFloat(bs.opacity)<0.1)continue;\
-            var brc=bel.getBoundingClientRect();\
-            if(!brc||brc.width<12||brc.height<12||brc.bottom<=0||brc.top>=vh||brc.right<=0||brc.left>=vw)continue;\
-            var bLabel=(bel.getAttribute('aria-label')||bel.getAttribute('title')||bel.textContent||'').trim();\
+        for(var bi=0;bi<btnCand.length&&items.length<700;bi++){\
+            var bel2=btnCand[bi];\
+            var bs2=getComputedStyle(bel2);\
+            if(bs2.display==='none'||bs2.visibility==='hidden'||parseFloat(bs2.opacity)<0.1)continue;\
+            var brc2=bel2.getBoundingClientRect();\
+            if(!brc2||brc2.width<12||brc2.height<12||brc2.bottom<=0||brc2.top>=vh||brc2.right<=0||brc2.left>=vw)continue;\
+            var bLabel=cleanStr(bel2.getAttribute('aria-label')||bel2.getAttribute('title')||bel2.textContent||'').trim();\
             if(!bLabel)continue;\
-            var bx=~~brc.left,by=~~brc.top,bw=~~brc.width,bh=~~brc.height;\
+            var bx2=~~brc2.left,by2=~~brc2.top,bw2=~~brc2.width,bh2=~~brc2.height;\
             var alr=false;\
             for(var exi=0;exi<items.length;exi++){\
                 var eit=items[exi];\
-                if(Math.abs(eit.l-bx)<12&&Math.abs(eit.top-by)<12){alr=true;break;}\
+                if(Math.abs(eit.l-bx2)<12&&Math.abs(eit.top-by2)<12){alr=true;break;}\
             }\
             if(!alr){\
                 var bText=bLabel.length>22?bLabel.substring(0,22):bLabel;\
-                if(bel.matches('[aria-label*=close],[aria-label*=dismiss]')&&bText.toLowerCase().indexOf('close')===-1){\
+                if(bel2.matches('[aria-label*=close],[aria-label*=dismiss]')&&bText.toLowerCase().indexOf('close')===-1){\
                     bText='[✕ '+bText+']';\
-                }else if(bel.matches('[aria-label*=close]')){\
+                }else if(bel2.matches('[aria-label*=close]')){\
                     bText='[✕ Close]';\
                 }\
-                var bInPop=(bel.closest(popSel)||isFixed(bel))?1:0;\
-                var bBg=getBg(bel)||'rgb(240, 240, 240)';\
-                items.push({txt:bText,l:bx,top:by,w:bw,h:bh,col:bs.color||'rgb(0,0,0)',bold:1,link:1,bg:bBg,inp:0,href:'',fix:isFixed(bel),pop:bInPop});\
+                var bInPop2=(bel2.closest(popSel)||isFixed(bel2))?1:0;\
+                var bBg2=getBg(bel2)||'rgb(240, 240, 240)';\
+                items.push({txt:bText,l:bx2,top:by2,w:bw2,h:bh2,col:bs2.color||'rgb(0,0,0)',bold:1,link:1,bg:bBg2,inp:0,href:'',fix:isFixed(bel2),pop:bInPop2,runs:''});\
             }\
         }\
         for(var m=0;m<items.length;m++){\
             var x=items[m];\
-            r.push(x.txt+T+x.l+T+x.top+T+x.w+T+x.h+T+x.col+T+x.bold+T+x.link+T+x.bg+T+x.inp+T+x.href+T+(x.fix||0)+T+(x.pop||0));\
+            r.push(cleanStr(x.txt)+T+x.l+T+x.top+T+x.w+T+x.h+T+cleanStr(x.col)+T+x.bold+T+x.link+T+cleanStr(x.bg)+T+x.inp+T+cleanStr(x.href)+T+(x.fix||0)+T+(x.pop||0)+T+(x.runs||''));\
         }\
         return r.join(N);\
     })()";
@@ -1894,6 +2197,7 @@ fn spawn_cdp_worker(
     rows: u16,
     shared_buf: Arc<Mutex<PixelBuffer>>,
     shared_overlays: Arc<Mutex<Vec<TextOverlaySpan>>>,
+    shared_hitboxes: Arc<Mutex<Vec<RenderedHitbox>>>,
     shared_rect_masks: Arc<Mutex<Vec<RectMask>>>,
     shared_video_rects: Arc<Mutex<Vec<VideoRect>>>,
     shared_rois: Arc<Mutex<Vec<AssetRoi>>>,
@@ -2059,6 +2363,7 @@ fn spawn_cdp_worker(
         let mut nav_started_at = Instant::now();
         let mut followup_extracts: Vec<Instant> = Vec::with_capacity(4);
         let mut active_until = Instant::now() + Duration::from_secs(3);
+        let mut pending_wheel: Option<(i32, i32, i32, Instant)> = None;
 
         loop {
             let mut coalesced_scroll_delta: i32 = 0;
@@ -2068,10 +2373,12 @@ fn spawn_cdp_worker(
                 match cmd {
                     CdpWorkerCommand::Navigate(new_url) => {
                         coalesced_scroll_delta = 0;
+                        pending_wheel = None;
                         shared_pending_scroll_px.store(0, Ordering::Relaxed);
                         is_loading.store(true, Ordering::Relaxed);
                         frame_counter.store(0, Ordering::Relaxed);
                         shared_overlays.lock().unwrap().clear();
+                        shared_hitboxes.lock().unwrap().clear();
                         shared_rect_masks.lock().unwrap().clear();
                         shared_video_rects.lock().unwrap().clear();
                         shared_rois.lock().unwrap().clear();
@@ -2446,7 +2753,9 @@ fn spawn_cdp_worker(
                     }
                     CdpWorkerCommand::HistoryBack => {
                         coalesced_scroll_delta = 0;
+                        pending_wheel = None;
                         shared_pending_scroll_px.store(0, Ordering::Relaxed);
+                        shared_hitboxes.lock().unwrap().clear();
                         seq += 1;
                         let eval_cmd = format!(
                             r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"history.back()"}}}}"#,
@@ -2460,7 +2769,9 @@ fn spawn_cdp_worker(
                     }
                     CdpWorkerCommand::HistoryForward => {
                         coalesced_scroll_delta = 0;
+                        pending_wheel = None;
                         shared_pending_scroll_px.store(0, Ordering::Relaxed);
+                        shared_hitboxes.lock().unwrap().clear();
                         seq += 1;
                         let eval_cmd = format!(
                             r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"history.forward()"}}}}"#,
@@ -2480,8 +2791,8 @@ fn spawn_cdp_worker(
             }
 
             if coalesced_scroll_delta != 0 {
-                let step_px = 36;
-                let pixel_delta = (coalesced_scroll_delta * step_px).clamp(-180, 180);
+                let step_px = 64;
+                let pixel_delta = (coalesced_scroll_delta * step_px).clamp(-320, 320);
                 let (sc_col, sc_row) = scroll_pointer;
                 let px_x = (((sc_col.min(curr_cols.saturating_sub(1)) as f32 + 0.5) * width_px as f32)
                     / curr_cols.max(1) as f32)
@@ -2492,79 +2803,34 @@ fn spawn_cdp_worker(
                     .round()
                     .clamp(1.0, (height_px.saturating_sub(2)).max(1) as f32) as i32;
 
-                // O(1) Cached Scroll Step + Exact Drift-Free Scroll Offset Readback:
-                // Scrolls once and returns `totalDeltaFromExtract\tpct` without running any DOM TreeWalker!
-                let scroll_js = format!(
-                    "(function(){{\
-                        var dy={0},x={1},y={2},T=String.fromCharCode(9);\
-                        function canScroll(el,dir){{\
-                            if(!el||el===document.documentElement||el===document.body)return false;\
-                            if(el.scrollHeight<=el.clientHeight+4)return false;\
-                            var ov=getComputedStyle(el).overflowY;\
-                            if(ov!=='auto'&&ov!=='scroll'&&ov!=='overlay')return false;\
-                            return dir>0?(el.scrollTop+el.clientHeight<el.scrollHeight-1):(el.scrollTop>0);\
-                        }}\
-                        var scEl=null;\
-                        if(window.__termblitz_scroll_el&&window.__termblitz_scroll_el!==document.body&&window.__termblitz_scroll_el!==document.documentElement&&canScroll(window.__termblitz_scroll_el,dy)){{\
-                            scEl=window.__termblitz_scroll_el;\
-                            scEl.scrollTop+=dy;\
-                        }}else{{\
-                            var root=document.scrollingElement||document.documentElement||document.body;\
-                            var prevY=window.scrollY||(root?root.scrollTop:0)||0;\
-                            window.scrollBy(0,dy);\
-                            var afterY=window.scrollY||(root?root.scrollTop:0)||0;\
-                            if(afterY===prevY&&root){{root.scrollTop+=dy;afterY=root.scrollTop||0;}}\
-                            if(afterY!==prevY){{\
-                                scEl=root;\
-                                window.__termblitz_scroll_el=root;\
-                            }}else{{\
-                                var cur=document.elementFromPoint(x,y);\
-                                while(cur&&cur!==document.body&&cur!==document.documentElement){{\
-                                    if(canScroll(cur,dy)){{scEl=cur;cur.scrollTop+=dy;window.__termblitz_scroll_el=cur;break;}}\
-                                    cur=cur.parentElement;\
-                                }}\
-                                if(!scEl){{\
-                                    var vh=window.innerHeight||576;\
-                                    var cand=document.querySelectorAll('main,[role=main],#content,#primary,section,article,.scrollable,.feed,[data-scrollable],[data-testid],div');\
-                                    for(var ci=0;ci<cand.length;ci++){{\
-                                        var cel=cand[ci];\
-                                        if(canScroll(cel,dy)){{\
-                                            var crc=cel.getBoundingClientRect();\
-                                            if(crc.width>80&&crc.height>80&&crc.top<vh&&crc.bottom>0){{\
-                                                scEl=cel;\
-                                                cel.scrollTop+=dy;\
-                                                window.__termblitz_scroll_el=cel;\
-                                                break;\
-                                            }}\
-                                        }}\
-                                    }}\
-                                }}\
-                                if(!scEl){{scEl=root;}}\
-                            }}\
-                        }}\
-                        if(scEl&&scEl!==document.body&&scEl!==document.documentElement){{\
-                            try{{scEl.dispatchEvent(new Event('scroll',{{bubbles:true}}));}}catch(_e){{}}\
-                        }}\
-                        var nowTop=(scEl&&scEl!==document.body&&scEl!==document.documentElement&&scEl.scrollTop>0)?scEl.scrollTop:(window.scrollY||document.documentElement.scrollTop||document.body.scrollTop||0);\
-                        var baseTop=window.__termblitz_extract_top||0;\
-                        var vh=window.innerHeight||576;\
-                        var scH=(scEl&&scEl.scrollHeight>vh)?scEl.scrollHeight:Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0,vh);\
-                        var scClient=(scEl&&scEl.clientHeight>0&&scEl.clientHeight<vh)?scEl.clientHeight:vh;\
-                        var maxS=Math.max(1,scH-scClient);\
-                        var pct=Math.min(100,Math.max(0,Math.round((nowTop*100)/maxS)));\
-                        return (~~(nowTop-baseTop))+T+pct;\
-                    }})()",
-                    pixel_delta, px_x, px_y
+                // Stage 1: Dispatch native CDP compositor mouseWheel event
+                let wheel_cmd = format!(
+                    r#"{{"id":{},"method":"Input.dispatchMouseEvent","params":{{"type":"mouseWheel","x":{},"y":{},"deltaX":0,"deltaY":{}}}}}"#,
+                    WHEEL_SCROLL_ID, px_x, px_y, pixel_delta
                 );
-                let scroll_cmd = format!(
-                    r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}","returnByValue":true}}}}"#,
-                    SCROLL_SYNC_ID,
-                    json_escape(&scroll_js)
-                );
-                let _ = ws.send_text(&scroll_cmd);
+                let _ = ws.send_text(&wheel_cmd);
+                if let Some((prev_dy, _, _, _)) = pending_wheel {
+                    pending_wheel = Some(((prev_dy + pixel_delta).clamp(-640, 640), px_x, px_y, Instant::now()));
+                } else {
+                    pending_wheel = Some((pixel_delta, px_x, px_y, Instant::now()));
+                }
                 pending_extract = true;
                 last_scroll_instant = Instant::now();
-                active_until = Instant::now() + Duration::from_millis(450);
+                active_until = Instant::now() + Duration::from_millis(500);
+            }
+
+            // Fallback trigger if mouseWheel ACK took >= 30ms without arriving
+            if let Some((wheel_dy, wx, wy, sent_at)) = pending_wheel {
+                if sent_at.elapsed() >= Duration::from_millis(30) {
+                    pending_wheel = None;
+                    let scroll_js = build_scroll_sync_js(wheel_dy, wx, wy);
+                    let scroll_cmd = format!(
+                        r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}","returnByValue":true}}}}"#,
+                        SCROLL_SYNC_ID,
+                        json_escape(&scroll_js)
+                    );
+                    let _ = ws.send_text(&scroll_cmd);
+                }
             }
 
             // Lock-Free Latest-Frame Dropper & Bounded WebSocket Reader:
@@ -2600,6 +2866,19 @@ fn spawn_cdp_worker(
                     let _ = ws.send_text(&eval_cmd);
                     pending_extract = true;
                     active_until = Instant::now() + Duration::from_secs(2);
+                }
+
+                // Stage 2 trigger on mouseWheel ACK (WHEEL_SCROLL_ID = 55557): verifies compositor scroll or runs JS fallback
+                if msg.contains(r#""id":55557"#) || msg.contains(r#""id": 55557"#) {
+                    if let Some((wheel_dy, wx, wy, _)) = pending_wheel.take() {
+                        let scroll_js = build_scroll_sync_js(wheel_dy, wx, wy);
+                        let scroll_cmd = format!(
+                            r#"{{"id":{},"method":"Runtime.evaluate","params":{{"expression":"{}","returnByValue":true}}}}"#,
+                            SCROLL_SYNC_ID,
+                            json_escape(&scroll_js)
+                        );
+                        let _ = ws.send_text(&scroll_cmd);
+                    }
                 }
 
                 // Handle O(1) scroll offset sync response (SCROLL_SYNC_ID = 55556)
@@ -2696,6 +2975,10 @@ fn spawn_cdp_worker(
                                         .map(|s| s.to_string());
                                     let is_fixed = parts.get(11).copied() == Some("1");
                                     let is_popup = parts.get(12).copied() == Some("1");
+                                    let inline_runs = parts
+                                        .get(13)
+                                        .map(|s| parse_inline_runs(s))
+                                        .unwrap_or_default();
                                     spans.push(TextOverlaySpan {
                                         text,
                                         px_x,
@@ -2710,6 +2993,7 @@ fn spawn_cdp_worker(
                                         link_url,
                                         is_fixed,
                                         is_popup,
+                                        inline_runs,
                                     });
                                 }
                             }
@@ -2787,14 +3071,14 @@ fn spawn_cdp_worker(
             });
 
             // Scroll-Gated & Load-Deferred DOM Text Extraction:
-            // Suspend heavy TreeWalker / getComputedStyle calls while actively scrolling (< 160ms)
+            // Suspend heavy TreeWalker / getComputedStyle calls while actively scrolling (< 90ms)
             // or before Page.loadEventFired / DOMContentLoaded so Chromium never stalls.
-            let is_actively_scrolling = last_scroll_instant.elapsed() < Duration::from_millis(160);
+            let is_actively_scrolling = last_scroll_instant.elapsed() < Duration::from_millis(90);
             if !is_actively_scrolling
                 && page_load_ready
                 && (followup_due
                     || ((pending_extract || now < active_until)
-                        && last_text_extract.elapsed() >= Duration::from_millis(100)))
+                        && last_text_extract.elapsed() >= Duration::from_millis(85)))
             {
                 request_text_extraction(&mut ws, &mut seq);
                 last_text_extract = now;
@@ -2813,6 +3097,7 @@ pub struct CdpEngine {
     pub chromium_bin: Option<String>,
     pub frame_buffer: Arc<Mutex<PixelBuffer>>,
     pub text_overlays: Arc<Mutex<Vec<TextOverlaySpan>>>,
+    pub rendered_hitboxes: Arc<Mutex<Vec<RenderedHitbox>>>,
     pub rect_masks: Arc<Mutex<Vec<RectMask>>>,
     pub video_rects: Arc<Mutex<Vec<VideoRect>>>,
     pub active_rois: Arc<Mutex<Vec<AssetRoi>>>,
@@ -2843,6 +3128,7 @@ impl CdpEngine {
             error_message: Arc::new(Mutex::new(None)),
             frame_buffer: Arc::new(Mutex::new(PixelBuffer::new(80, 48, Color::new(246, 246, 239)))),
             text_overlays: Arc::new(Mutex::new(Vec::new())),
+            rendered_hitboxes: Arc::new(Mutex::new(Vec::new())),
             rect_masks: Arc::new(Mutex::new(Vec::new())),
             video_rects: Arc::new(Mutex::new(Vec::new())),
             active_rois: Arc::new(Mutex::new(Vec::new())),
@@ -2866,6 +3152,10 @@ impl CdpEngine {
 
     pub fn get_text_overlays(&self) -> Vec<TextOverlaySpan> {
         self.text_overlays.lock().unwrap().clone()
+    }
+
+    pub fn set_rendered_hitboxes(&self, hitboxes: Vec<RenderedHitbox>) {
+        *self.rendered_hitboxes.lock().unwrap() = hitboxes;
     }
 
     pub fn get_rect_masks(&self) -> Vec<RectMask> {
@@ -2901,6 +3191,20 @@ impl CdpEngine {
     }
 
     pub fn hit_test_overlay(&self, click_x: u16, click_y: u16, cols: u16, rows: u16) -> (Option<String>, bool) {
+        {
+            let hitboxes = self.rendered_hitboxes.lock().unwrap();
+            for hb in hitboxes.iter().rev() {
+                if click_y == hb.row && click_x >= hb.col_start && click_x < hb.col_end {
+                    if hb.is_input {
+                        return (None, true);
+                    }
+                    if let Some(ref u) = hb.link_url {
+                        return (Some(u.clone()), false);
+                    }
+                }
+            }
+        }
+
         let overlays = self.get_text_overlays();
         let scroll_delta_px = self.get_pending_scroll_px();
         let (vw, vh) = self.get_viewport_dims();
@@ -2911,16 +3215,18 @@ impl CdpEngine {
 
         for span in overlays.iter().rev() {
             let eff_y = span.effective_px_y(scroll_delta_px);
-            if eff_y < 0 || eff_y >= vh as i32 {
+            if eff_y + span.px_h.max(14) <= 2 || eff_y >= vh as i32 {
                 continue;
             }
             let start_col = ((span.px_x.max(0) as f32 * cols as f32) / pw).round() as u16;
             let span_cols = ((span.px_w.max(8) as f32 * cols as f32) / pw).round().max(2.0) as u16;
-            let term_row = view_start_y + ((eff_y as f32 * view_rows) / ph).round() as u16;
-            let box_rows = ((span.px_h.max(14) as f32 * view_rows) / ph).ceil().max(1.0) as u16;
+            let start_row_i32 =
+                (view_start_y as i32) + ((eff_y as f32 * view_rows) / ph).round() as i32;
+            let box_rows = ((span.px_h.max(14) as f32 * view_rows) / ph).ceil().max(1.0) as i32;
 
-            if click_y >= term_row
-                && click_y < term_row.saturating_add(box_rows)
+            let cy = click_y as i32;
+            if cy >= start_row_i32
+                && cy < start_row_i32.saturating_add(box_rows)
                 && click_x >= start_col
                 && click_x <= start_col.saturating_add(span_cols)
             {
@@ -3287,6 +3593,7 @@ impl CdpEngine {
                 rows,
                 Arc::clone(&self.frame_buffer),
                 Arc::clone(&self.text_overlays),
+                Arc::clone(&self.rendered_hitboxes),
                 Arc::clone(&self.rect_masks),
                 Arc::clone(&self.video_rects),
                 Arc::clone(&self.active_rois),
@@ -3308,7 +3615,7 @@ impl CdpEngine {
     }
 
     pub fn scroll_at(&mut self, delta: i32, col: u16, row: u16) {
-        let step_px = (delta * 36).clamp(-180, 180);
+        let step_px = (delta * 64).clamp(-320, 320);
         self.pending_scroll_px.fetch_add(step_px, Ordering::Relaxed);
         if let Some(ref tx) = self.command_tx {
             let _ = tx.send(CdpWorkerCommand::Scroll { delta, col, row });
@@ -3518,6 +3825,7 @@ mod tests {
             is_fixed: false,
             is_popup: false,
             link_url: None,
+            inline_runs: Vec::new(),
         };
 
         let cols = 45u16;
@@ -3553,6 +3861,7 @@ mod tests {
             is_fixed: false,
             is_popup: false,
             link_url: None,
+            inline_runs: Vec::new(),
         };
         let fixed_header = TextOverlaySpan {
             text: "Sticky Navbar".to_string(),
@@ -3568,6 +3877,7 @@ mod tests {
             is_fixed: true,
             is_popup: false,
             link_url: None,
+            inline_runs: Vec::new(),
         };
 
         // Scrolling down by +80 CSS pixels shifts body text up to y=160 while sticky header stays at y=12
@@ -3659,6 +3969,7 @@ mod tests {
             link_url: None,
             is_fixed: false,
             is_popup: false,
+            inline_runs: Vec::new(),
         };
         let fixed_item = OverlayItem {
             is_fixed: true,
@@ -3682,6 +3993,49 @@ mod tests {
         assert_eq!(popup_item.effective_px_y(48), 200);
         assert_eq!(roi.shifted(48).y, 152);
         assert_eq!(roi.shifted(-40).y, 240);
+    }
+
+    #[test]
+    fn test_inline_runs_parsing_and_rendered_hitbox_lookup() {
+        let raw = "0\x1f5\x1f1\x1f0\x1frgb(0, 0, 0)\x1f\x1e5\x1f15\x1f0\x1f1\x1frgb(51, 102, 204)\x1fhttps://en.wikipedia.org/wiki/South_Asia";
+        let runs = parse_inline_runs(raw);
+        assert_eq!(runs.len(), 2);
+        assert!(runs[0].bold);
+        assert!(!runs[0].is_link);
+        assert_eq!(runs[1].start_char, 5);
+        assert_eq!(runs[1].end_char, 15);
+        assert!(runs[1].is_link);
+        assert_eq!(
+            runs[1].link_url.as_deref(),
+            Some("https://en.wikipedia.org/wiki/South_Asia")
+        );
+
+        let engine = CdpEngine::new(9299);
+        engine.set_rendered_hitboxes(vec![RenderedHitbox {
+            col_start: 10,
+            col_end: 20,
+            row: 8,
+            link_url: Some("https://en.wikipedia.org/wiki/South_Asia".to_string()),
+            is_input: false,
+        }]);
+        assert_eq!(
+            engine.hit_test_overlay(14, 8, 60, 40),
+            (Some("https://en.wikipedia.org/wiki/South_Asia".to_string()), false)
+        );
+        assert_eq!(engine.hit_test_overlay(25, 8, 60, 40), (None, false));
+    }
+
+    #[test]
+    fn test_css_scroll_unlock_and_dual_scroll_js() {
+        let css_js = build_page_style_js(true, true, false);
+        assert!(css_js.contains("overflow-x:clip!important"));
+        assert!(css_js.contains("overflow-x:visible!important"));
+        assert!(!css_js.contains("html,body{max-width:100vw!important;overflow-x:hidden"));
+
+        let scroll_js = build_scroll_sync_js(64, 180, 240);
+        assert!(scroll_js.contains("document.scrollingElement"));
+        assert!(scroll_js.contains("window.__termblitz_last_top"));
+        assert!(scroll_js.contains("dispatchEvent(new Event('scroll'"));
     }
 }
 

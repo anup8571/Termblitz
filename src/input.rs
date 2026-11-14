@@ -400,6 +400,16 @@ impl InputHandler {
                     self.reset_drag_state();
                     AppAction::Scroll(1)
                 }
+                KeyCode::PageUp => {
+                    self.is_typing_in_page = false;
+                    self.reset_drag_state();
+                    AppAction::PageScroll(-1)
+                }
+                KeyCode::PageDown => {
+                    self.is_typing_in_page = false;
+                    self.reset_drag_state();
+                    AppAction::PageScroll(1)
+                }
                 KeyCode::Char(c) => AppAction::TypeInPage(c.to_string()),
                 _ => AppAction::None,
             }
@@ -470,6 +480,9 @@ impl InputHandler {
                     let dy = (mouse.row as i32 - sy as i32).abs();
                     if dx > 2 || dy > 1 {
                         self.has_dragged = true;
+                        if dy > 1 {
+                            self.is_typing_in_page = false;
+                        }
                     }
                 }
                 if let Some(last_y) = self.last_drag_y {
@@ -477,6 +490,7 @@ impl InputHandler {
                     // Require 2 rows of vertical drag per scroll unit to prevent hyper-sensitive jumps
                     let step = (diff / 2).clamp(-2, 2);
                     if step != 0 {
+                        self.is_typing_in_page = false;
                         self.last_drag_y = Some((last_y as i32 - step * 2).max(0) as u16);
                         return AppAction::Scroll(step);
                     }
@@ -485,6 +499,7 @@ impl InputHandler {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 let start = self.drag_start.take();
+                let last_y = self.last_drag_y;
                 let dragged = self.has_dragged;
                 // Always clear drag state on touch/mouse release so touch_start never stays latched
                 self.reset_drag_state();
@@ -538,16 +553,29 @@ impl InputHandler {
                             return AppAction::Click(mouse.column, mouse.row);
                         }
                     }
+
+                    // Flush any odd/short residual vertical drag delta when finger lifts
+                    if dragged || dy.abs() >= 2 {
+                        self.is_typing_in_page = false;
+                        if let Some(ly) = last_y {
+                            let rem = (ly as i32) - (mouse.row as i32);
+                            if rem != 0 && dx.abs() <= dy.abs() * 2 {
+                                return AppAction::Scroll(rem.clamp(-2, 2));
+                            }
+                        }
+                    }
                 }
                 AppAction::None
             }
             MouseEventKind::ScrollDown => {
                 // Reset any active touch/drag state immediately after emitting ScrollDown
+                self.is_typing_in_page = false;
                 self.reset_drag_state();
                 AppAction::Scroll(1)
             }
             MouseEventKind::ScrollUp => {
                 // Reset any active touch/drag state immediately after emitting ScrollUp
+                self.is_typing_in_page = false;
                 self.reset_drag_state();
                 AppAction::Scroll(-1)
             }
@@ -736,6 +764,41 @@ mod tests {
             handler.process_event_batch(vec![key_s]),
             AppAction::CycleSubCell
         );
+    }
+
+    #[test]
+    fn test_page_scroll_and_short_flick_exit_typing_mode() {
+        let mut handler = InputHandler::new();
+        handler.is_typing_in_page = true;
+
+        let pgdn = Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(handler.process_event_batch(vec![pgdn]), AppAction::PageScroll(1));
+        assert!(!handler.is_typing_in_page);
+
+        // A 3-row touch flick (15 -> 12) emits Scroll(1) on Drag and flushes residual Scroll(1) on Up => Scroll(2)
+        handler.is_typing_in_page = true;
+        let flick = vec![
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 20,
+                row: 15,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 20,
+                row: 12,
+                modifiers: KeyModifiers::NONE,
+            }),
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: 20,
+                row: 12,
+                modifiers: KeyModifiers::NONE,
+            }),
+        ];
+        assert_eq!(handler.process_event_batch(flick), AppAction::Scroll(2));
+        assert!(!handler.is_typing_in_page);
     }
 }
 
