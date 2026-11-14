@@ -332,15 +332,14 @@ pub const CBRT_U16_LUT: [u16; 1025] = build_cbrt_u16_lut();
 /// Zero-division integer cube-root lookup on `[0..=65535]` returning `x^(1/3)` scaled to `0..=65535` via `CBRT_U16_LUT`.
 #[inline(always)]
 pub fn cbrt_lut(x: u32) -> i64 {
-    let clamped = x.min(65535);
-    let idx = (clamped >> 6) as usize;
-    let frac = (clamped & 63) as i64;
-    if idx >= 1024 {
+    if x >= 65535 {
         return 65535;
     }
+    let idx = (x >> 6) as usize;
+    let frac = (x & 63) as i64;
     let v0 = CBRT_U16_LUT[idx] as i64;
     let v1 = CBRT_U16_LUT[idx + 1] as i64;
-    v0 + (((v1 - v0) * frac) >> 6)
+    v0 + (((v1 - v0) * frac + 32) >> 6)
 }
 
 /// Alias for `cbrt_lut` for backwards compatibility.
@@ -1440,7 +1439,7 @@ impl DiffRenderer {
         let cy = (y0 + (h >> 1)).min(px_buf.height - 1);
         let center = data[cy * stride + cx];
 
-        if w <= 2 && h <= 2 {
+        if w == 1 && h == 1 {
             return center;
         }
 
@@ -1942,18 +1941,27 @@ impl DiffRenderer {
         }
 
         let fast_path = self.video_fast_path;
+        let sub_w = target_w * 2;
+        let target_sub_h = if self.subcell_mode == SubCellMode::Sextant2x3 {
+            rows * 3
+        } else {
+            target_h
+        };
+        let already_at_subpixel_res =
+            px_buf.width >= sub_w && px_buf.height >= target_sub_h;
         let is_pixel_art = !fast_path
             && (self.pixel_art_mode
-                || (self.upscale_mode != UpscaleMode::Off
+                || (!already_at_subpixel_res
+                    && self.upscale_mode != UpscaleMode::Off
                     && px_buf.width <= target_w * 2
                     && detect_pixel_art(px_buf)));
 
         // 2. Never upscale a frame whose dimensions are ALREADY >= the terminal subpixel grid `(target_w, target_h)`.
         // Only run pre-downsample spatial upscaling when `px_buf.width < target_w || px_buf.height < target_h`.
-        let sub_w = target_w * 2;
         let upscaled_storage;
         let active_buf = if (self.upscale_mode == UpscaleMode::Off && !self.pixel_art_mode)
             || fast_path
+            || already_at_subpixel_res
             || (px_buf.width >= target_w && px_buf.height >= target_h && !is_pixel_art)
         {
             px_buf
@@ -2753,7 +2761,8 @@ impl DiffRenderer {
                 while x < width {
                     let r_idx = row_offset + x;
                     let c = self.current[r_idx];
-                    if c.bold != run_bold
+                    if (run_len > 0 && c == self.previous[r_idx])
+                        || c.bold != run_bold
                         || c.underline != run_underline
                         || !color_matches(c.fg, run_fg, color_tol)
                         || !color_matches(c.bg, run_bg, color_tol)
@@ -3200,6 +3209,7 @@ mod tests {
         }
 
         let mut renderer = DiffRenderer::new(30, 3);
+        let _ = renderer.build_synchronized_frame();
         renderer.put_str(0, 0, "A", Color::WHITE, Color::BLACK, false, false);
         renderer.put_str(0, 1, "B", Color::WHITE, Color::BLACK, false, false);
         renderer.put_str(15, 1, "C", Color::WHITE, Color::BLACK, false, false);
@@ -3309,6 +3319,7 @@ mod tests {
 
         // 2. Confirm reduced ANSI byte output per frame via relative cursor jumps & SGR delta compression
         let mut renderer = DiffRenderer::new(40, 4);
+        let _ = renderer.build_synchronized_frame();
         let fg = Color::new(220, 230, 240);
         let bg = Color::new(20, 30, 40);
         renderer.put_str(0, 0, "Hello", fg, bg, true, false);
